@@ -612,21 +612,14 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
         batch, num_key_value_heads, n_rep, slen, head_dim
     )
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
-import torch.nn.functional as F
-import math
+
+
+
 class AttentionRouterEntropy(nn.Module):
-    """
-    AttentionRouterEntropy:
-      - 输入 q: [B, S, H, D] 或 pooled_input: [B, 1, H, feat]
-      - 在 seq_len 维度压缩成 num_chunks（adaptive_avg_pool1d）
-      - 在 head_dim D 上计算归一化熵作为信息混乱度指标
-      - 将 pooled features 与 entropy concat 后映射为 2-class logits per head
-      - 训练时返回可微 soft decisions（gumbel_softmax 或 softmax）；推理时返回 hard binary mask
-    """
     def __init__(self,
                  input_dim,
                  num_key_value_heads,
-                 head_dim=None,            # 当你给 q 时需要提供 head_dim D，用于归一化熵
+                 head_dim=None,
                  d_feature=128,
                  num_chunks=4,
                  use_task_emb=False,
@@ -634,6 +627,7 @@ class AttentionRouterEntropy(nn.Module):
                  hard=False,
                  router_type='mlp',
                  entropy_agg='mean',       # 'mean' or 'max' (如何把 chunk-level entropy 聚合成每 head 一个值)
+                 entropy_mode='attn',      # 'attn' (default) or 'feature'
                  eps=1e-8):
         super().__init__()
         self.num_kv = num_key_value_heads
@@ -645,6 +639,7 @@ class AttentionRouterEntropy(nn.Module):
         self.entropy_agg = entropy_agg
         self.eps = eps
         self.head_dim = head_dim  # used for entropy normalization if provided
+        self.entropy_mode = entropy_mode
 
         map_in = input_dim + 1  # concat entropy scalar per head
         if router_type == 'linear':
@@ -657,14 +652,39 @@ class AttentionRouterEntropy(nn.Module):
             )
 
         self.q_projector = nn.Sequential(
-            nn.Linear( (head_dim or input_dim), input_dim ),
+            nn.Linear((head_dim or input_dim), input_dim),
             nn.SiLU(),
             nn.Linear(input_dim, input_dim)
         )
-        
-        self.chunk_queries = nn.Parameter(torch.randn(num_chunks, head_dim) * 0.01)
 
-    def _compute_entropy_per_head(self, chunked_q):
+        # chunk prototype queries used to pool the sequence into chunks (learned)
+        self.chunk_queries = nn.Parameter(torch.randn(num_chunks, head_dim or input_dim) * 0.01)
+
+    def _compute_entropy_per_head_from_attn(self, attn_chunks, seq_len):
+        """
+        attn_chunks: [B, C, H, S]  (C=num_chunks, S=seq_len)
+        returns: [B, H] normalized entropy per head in [0,1]
+        """
+        # clamp for numerical stability
+        p = attn_chunks.clamp(min=self.eps)
+        # entropy per chunk per head: -sum p log p
+        ent_chunk = - (p * p.log()).sum(dim=-1)  # [B, C, H]
+        # normalize by log(S) to get value in [0,1]
+        denom = math.log(max(seq_len, 2))
+        ent_chunk = ent_chunk / denom
+        # aggregate across chunks into a single head-level entropy
+        if self.entropy_agg == 'mean':
+            ent = ent_chunk.mean(dim=1)  # [B, H]
+        else:
+            ent = ent_chunk.max(dim=1).values
+        return ent
+
+    def _compute_entropy_per_head_feature(self, chunked_q):
+        """
+        Fallback: original feature-based entropy (kept for compatibility)
+        chunked_q: [B, C, H, D]
+        returns: [B, H]
+        """
         B, C, H, D = chunked_q.shape
         v = chunked_q.reshape(B*C*H, D)
         a = v.abs()
@@ -674,21 +694,37 @@ class AttentionRouterEntropy(nn.Module):
         return ent.mean(dim=1) if self.entropy_agg == 'mean' else ent.max(dim=1).values
 
     def _compress_seq_to_chunks(self, q):
+        """
+        q: [B, S, H, D]
+        returns:
+          pooled: [B, C, H, D]
+          attn_chunks: [B, C, H, S]  (attention weights used to pool)
+        Implementation: use learned chunk_queries as queries to attend over sequence positions per head.
+        """
         B, S, H, D = q.shape
         q_flat = q.permute(0, 2, 1, 3)  # [B, H, S, D]
 
         # normalize both sides to avoid overflow
         q_norm = F.normalize(q_flat, dim=-1)
-        chunk_q = F.normalize(self.chunk_queries, dim=-1)
+        chunk_q = F.normalize(self.chunk_queries, dim=-1)  # [C, D]
 
+        # expand chunk queries -> [B, H, C, D]
         queries = chunk_q.unsqueeze(0).unsqueeze(0).expand(B, H, -1, -1)
-        sim = (queries @ q_norm.transpose(-1, -2)) / 0.1  # temp=0.1 for stable contrast
-        sim = sim - sim.amax(dim=-1, keepdim=True)  # extra stabilization
+        # compute similarity: [B, H, C, S]
+        sim = (queries @ q_norm.transpose(-1, -2)) / 0.1  # temperature factor for contrast
+        sim = sim - sim.amax(dim=-1, keepdim=True)  # numerical stabilization
 
-        attn_weights = torch.softmax(sim, dim=-1)
-        pooled = attn_weights @ q_flat
+        attn_weights = torch.softmax(sim, dim=-1)  # [B, H, C, S]
+
+        # pooled features: attn_weights @ q_flat -> [B, H, C, D]
+        pooled = (attn_weights @ q_flat)
+        # reorder to [B, C, H, D]
         pooled = pooled.permute(0, 2, 1, 3).contiguous()
-        return pooled
+
+        # reorder attn to [B, C, H, S] to be consistent with entropy function
+        attn_chunks = attn_weights.permute(0, 2, 1, 3).contiguous()
+
+        return pooled, attn_chunks
 
     def forward(self, q=None, pooled_input=None, task_ids=None):
         """
@@ -705,18 +741,15 @@ class AttentionRouterEntropy(nn.Module):
             # q: [B, S, H, D]
             B, S, H, D = q.shape
 
-            # compress seq -> chunks
-            chunked = self._compress_seq_to_chunks(q)  # [B, C, H, D]
-            entropy = self._compute_entropy_per_head(chunked)  # [B, H]
+            # compress seq -> chunks and also get attn weights
+            chunked, attn_chunks = self._compress_seq_to_chunks(q)  # chunked: [B, C, H, D]; attn_chunks: [B, C, H, S]
 
-            # derive a pooled feature per head from chunked q: e.g., mean across chunks and sequence (or use projector)
-            # pooled_feat shape we'll make [B, H, input_dim]
-            # take mean over chunks and D
-            pooled_feat = chunked.mean(dim=1).mean(dim=-1)  # [B, H]  (mean over chunks and D)
-            # project to input_dim
-            pooled_feat = pooled_feat.unsqueeze(-1)  # [B, H, 1]
-            # expand to match expected input_dim via projector (projector accepts D or input_dim)
-            # alternative: we can use q_projector on chunk-mean over D
+            if self.entropy_mode == 'attn':
+                entropy = self._compute_entropy_per_head_from_attn(attn_chunks, seq_len=S)  # [B, H]
+            else:
+                entropy = self._compute_entropy_per_head_feature(chunked)
+
+            # derive a pooled feature per head from chunked q: mean across chunks and D
             q_chunk_mean_over_D = chunked.mean(dim=1)  # [B, H, D]
             pooled_feat_proj = self.q_projector(q_chunk_mean_over_D)  # [B, H, input_dim]
         else:
@@ -734,7 +767,7 @@ class AttentionRouterEntropy(nn.Module):
 
         # Now pooled_feat_proj: [B, H, input_dim]
         B, H, in_dim = pooled_feat_proj.shape
-        # entropy: [B, H] -> normalize (already normalized by log(D) earlier)
+        # entropy: [B, H] -> normalize (already normalized by log(S) earlier for attn mode)
         ent = entropy.unsqueeze(-1)  # [B, H, 1]
 
         # concat features
@@ -837,11 +870,11 @@ class AttentionRouter(nn.Module):
         x = pooled_input.mean(dim=1)
         logits = self.dim_mapping(x) # [b, 1, h, 2]
         if self.router_type == 'gumbel' and self.training:
-            # Gumbel-Softmax: 训练时可微，推理时离散
+            # Gumbel-Softmax
             decisions = F.gumbel_softmax(logits, tau=self.temp, hard=False)
             hard_decisions = F.gumbel_softmax(logits, tau=self.temp, hard=True)
         else:
-            # 标准softmax
+            # softmax
             decisions = F.softmax(logits / self.temp, dim=-1)
             hard_decisions = torch.zeros_like(decisions)
             hard_decisions.scatter_(-1, logits.argmax(dim=-1, keepdim=True), 1.0)
@@ -926,27 +959,27 @@ class Qwen3Attention(nn.Module):
         )  # sigmoid(4.5) ≈ 0.989
         self.threshold_for_deterministic = None
 
-        self.mask_allocator = AttentionRouter(
-            input_dim=self.hidden_size,
-            num_key_value_heads=self.num_key_value_heads,
-            d_feature=self.head_dim,
-            use_task_emb=getattr(config, "use_task_emb_for_mask", False),
-            temp=getattr(config, "mask_temp", 0.5),
-            hard=getattr(config, "mask_hard_sample", False),
-        )
-        
-        # self.mask_allocator = AttentionRouterEntropy(
-        #     input_dim=self.hidden_size,          
-        #     num_key_value_heads=self.num_key_value_heads,  
-        #     head_dim=self.head_dim,               
-        #     d_feature=128,                        
-        #     num_chunks=128,                         
+        # self.mask_allocator = AttentionRouter(
+        #     input_dim=self.hidden_size,
+        #     num_key_value_heads=self.num_key_value_heads,
+        #     d_feature=self.head_dim,
         #     use_task_emb=getattr(config, "use_task_emb_for_mask", False),
-        #     temp=getattr(config, "mask_temp", 0.5),       
-        #     hard=getattr(config, "mask_hard_sample", False),  
-        #     router_type=getattr(config, "mask_router_type", "gumbel"),  # 'mlp' / 'linear' / 'gumbel'
-        #     entropy_agg='mean',                   # 'mean' 或 'max'
+        #     temp=getattr(config, "mask_temp", 0.5),
+        #     hard=getattr(config, "mask_hard_sample", False),
         # )
+        
+        self.mask_allocator = AttentionRouterEntropy(
+            input_dim=self.hidden_size,          
+            num_key_value_heads=self.num_key_value_heads,  
+            head_dim=self.head_dim,               
+            d_feature=128,                        
+            num_chunks=128,                         
+            use_task_emb=getattr(config, "use_task_emb_for_mask", False),
+            temp=getattr(config, "mask_temp", 0.5),       
+            hard=getattr(config, "mask_hard_sample", False),  
+            router_type=getattr(config, "mask_router_type", "gumbel"),  # 'mlp' / 'linear' / 'gumbel'
+            entropy_agg='mean',                   # 'mean' 或 'max'
+        )
         
         # self.mask_allocator = MaskAllocator(
         #     input_dim=self.hidden_size,
@@ -1538,7 +1571,7 @@ class Qwen3Attention(nn.Module):
             # Next: expand z_kv to (num_key_value_heads, num_key_value_groups) and then flatten it to (num_heads)
             z = z_kv.unsqueeze(-1).expand(-1, self.num_key_value_groups).reshape(-1)
         else:
-            target_x = k
+            target_x = v
             if unpadded_lengths is not None:
                 # breakpoint()
                 cu_seqlens, _ = unpadded_lengths
@@ -1642,7 +1675,7 @@ class Qwen3Attention(nn.Module):
         attn_output = attn_output.reshape(
             *attn_output.shape[:-2], self.num_heads * self.head_dim
         )
-        attn_output = self.o_proj(attn_output)
+        attn_output = self.o_proj(attn_output.to(self.o_proj.weight.dtype))
 
         attn_weights = None
 

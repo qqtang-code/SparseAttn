@@ -14,7 +14,7 @@ import os
 import glob
 import logging
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Iterable
+from typing import Optional, List, Dict
 
 import torch
 from torch.utils.data import Dataset, IterableDataset
@@ -24,50 +24,95 @@ from datasets import load_dataset
 logger = logging.getLogger(__name__)
 
 
+# =========================================================
+#  DataArguments
+# =========================================================
 @dataclass
 class DataArguments:
-    single_seq: bool = field(default=False)
-    subsplit_length: Optional[int] = field(default=None)
-    per_device_max_tokens: int = field(default=32768)
-    apply_instruct_masks: bool = field(default=False)
-    prepack: bool = field(
-        default=False,
-        metadata={"help": "Pre-pack dataset offline into fixed-length examples"},
-    )
-    streaming: bool = field(
-        default=False,
-        metadata={"help": "Use streaming dataset (no full in-memory load)"},
-    )
-    min_seq_len: Optional[int] = field(
-        default=1000,
-        metadata={"help": "Minimum sequence length (after tokenization). Shorter samples are filtered out."}
-    )
-    task_type: str = field(
-        default="pretrain",
-        metadata={"help": "Training task type: 'pretrain' or 'sft'."},
-    )
-    use_packing: bool = field(
-        default=False,
-        metadata={
-            "help": "Enable cross-sample packing. If False, use per-sample padding/trunc/drop strategy."
-        },
-    )
+    single_seq: bool = False
+    subsplit_length: Optional[int] = None
+    per_device_max_tokens: int = 32768
+    apply_instruct_masks: bool = False
+    prepack: bool = False
+    streaming: bool = False
+    min_seq_len: Optional[int] = 1000
+    task_type: str = "pretrain"   # <-- unified
+    use_packing: bool = False
 
 
-class ParquetDataset(Dataset):
-    """Random-access dataset backed by datasets (non-streaming).
+# =========================================================
+#  Unified sample processor
+# =========================================================
+def process_sample(item, tokenizer, data_args, max_seq_len):
+    """
+    Unified task router.
 
-    Returns dicts with either `input_ids` (list[int]) or `input_ids_chunks` (List[list[int]]).
+    task_type:
+      - "pretrain"
+      - "sft"
+      - future tasks: reward_model, dpo, preference, rlhf, etc.
+
+    Output format must be consistent:
+      {
+        "input_ids": [...],              # token list
+        "labels": [...],                 # optional
+        "task_type": str,                # keep original
+    }
     """
 
-    def __init__(
-        self,
-        raw_dataset,
-        tokenizer,
-        data_args: DataArguments,
-        max_seq_len: int = 32768,
-        is_training: bool = True,
+    task_type = data_args.task_type
+
+    if task_type == "sft":
+        input_ids, labels = _build_sft_input_and_labels(item, tokenizer, data_args, max_seq_len)
+        meta = item.get("metadata", {}) or {}
+        task = meta.get("task", "default")
+        return {
+            "input_ids": input_ids,
+            "labels": labels,
+            "task_type": task,
+        }
+
+    # -------- pretrain / others --------
+    text = item.get("context") or item.get("text") or item.get("content")
+    if text is None:
+        raise KeyError("Item missing text field")
+
+    tokenized = tokenizer(
+        text, truncation=True, add_special_tokens=True
+    )
+    input_ids = tokenized["input_ids"]
+
+    meta = item.get("metadata", {}) or {}
+    task = meta.get("task", "default")
+
+    # chunking (pretrain only)
+    if (
+        data_args.subsplit_length is not None
+        and not data_args.single_seq
+        and task_type != "sft"
     ):
+        L = data_args.subsplit_length
+        chunks = [
+            input_ids[i : i + L]
+            for i in range(0, len(input_ids), L)
+            if len(input_ids[i : i + L]) > 0
+        ]
+        return {
+            "input_ids_chunks": chunks,
+            "task_type": task,
+        }
+
+    return {
+        "input_ids": input_ids,
+        "task_type": task,
+    }
+
+
+# =========================================================
+#  Datasets
+# =========================================================
+class ParquetDataset(Dataset):
+    def __init__(self, raw_dataset, tokenizer, data_args, max_seq_len, is_training=True):
         self.raw_dataset = raw_dataset
         self.tokenizer = tokenizer
         self.data_args = data_args
@@ -78,53 +123,16 @@ class ParquetDataset(Dataset):
         return len(self.raw_dataset)
 
     def __getitem__(self, idx):
-        item = self.raw_dataset[idx]
-        if self.data_args.task_type == "sft":
-            # build sft input+labels
-            input_ids, labels = _build_sft_input_and_labels(item, self.tokenizer, self.data_args, self.max_seq_len)
-            return {"input_ids": input_ids, "labels": labels}
-        text = item.get("context") or item.get("text") or item.get("content")
-        if text is None:
-            raise KeyError(
-                "dataset item must contain one of 'context','text','content'"
-            )
-
-        tokenized = self.tokenizer(
-            text,
-            truncation=(self.data_args.task_type == "pretrain"),
-            add_special_tokens=True,
+        return process_sample(
+            self.raw_dataset[idx],
+            self.tokenizer,
+            self.data_args,
+            self.max_seq_len,
         )
-        input_ids = tokenized["input_ids"]
-
-        if (
-            self.data_args.subsplit_length is not None
-            and not self.data_args.single_seq
-            and self.data_args.task_type != "sft"
-        ):
-            chunks = []
-            L = self.data_args.subsplit_length
-            for i in range(0, len(input_ids), L):
-                chunk = input_ids[i : i + L]
-                if len(chunk) > 0:
-                    chunks.append(chunk)
-            return {"input_ids_chunks": chunks}
-        else:
-            return {"input_ids": input_ids}
 
 
 class StreamingParquetIterable(IterableDataset):
-    """Iterable dataset using streaming mode from `datasets`.
-
-    Yields the same example shapes as ParquetDataset.
-    """
-
-    def __init__(
-        self,
-        dataset_iterable,
-        tokenizer,
-        data_args: DataArguments,
-        max_seq_len: int = 32768,
-    ):
+    def __init__(self, dataset_iterable, tokenizer, data_args, max_seq_len):
         self.dataset_iterable = dataset_iterable
         self.tokenizer = tokenizer
         self.data_args = data_args
@@ -132,46 +140,19 @@ class StreamingParquetIterable(IterableDataset):
 
     def __iter__(self):
         for item in self.dataset_iterable:
-            if self.data_args.task_type == "sft":
-                input_ids, labels = _build_sft_input_and_labels(item, self.tokenizer, self.data_args, self.max_seq_len)
-                yield {"input_ids": input_ids, "labels": labels}
-                continue
-
-            text = item.get("context") or item.get("text") or item.get("content")
-            if text is None:
-                continue
-            tokenized = self.tokenizer(
-                text,
-                truncation=(self.data_args.task_type == "pretrain"),
-                add_special_tokens=True,
+            yield process_sample(
+                item,
+                self.tokenizer,
+                self.data_args,
+                self.max_seq_len,
             )
-            input_ids = tokenized["input_ids"]
-
-            if (
-                self.data_args.subsplit_length is not None
-                and not self.data_args.single_seq
-                and self.data_args.task_type != "sft"
-            ):
-                L = self.data_args.subsplit_length
-                chunks = [
-                    input_ids[i : i + L]
-                    for i in range(0, len(input_ids), L)
-                    if len(input_ids[i : i + L]) > 0
-                ]
-                yield {"input_ids_chunks": chunks}
-            else:
-                yield {"input_ids": input_ids}
 
 
+# =========================================================
+#  PrepackedDataset
+# =========================================================
 class PrepackedDataset(Dataset):
-    """Offline pre-packed dataset: each item is already a fixed-length packed example.
-
-    This is the most efficient option for training: collator becomes trivial.
-    """
-
-    def __init__(
-        self, packed_input_ids: List[List[int]], tokenizer, max_seq_len: int = 4096
-    ):
+    def __init__(self, packed_input_ids, tokenizer, max_seq_len):
         self.packed_input_ids = packed_input_ids
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
@@ -180,380 +161,261 @@ class PrepackedDataset(Dataset):
         return len(self.packed_input_ids)
 
     def __getitem__(self, idx):
-        inp = self.packed_input_ids[idx]
-        # ensure length
-        if len(inp) > self.max_seq_len:
-            inp = inp[: self.max_seq_len]
-        return {"input_ids": inp}
+        seq = self.packed_input_ids[idx]
+        if len(seq) > self.max_seq_len:
+            seq = seq[: self.max_seq_len]
+        return {"input_ids": seq}
 
 
+# =========================================================
+#  Collator
+# =========================================================
 class PackingDataCollator:
-    """Collator that packs variable-length sequences into fixed-length batches safely.
-
-    - Limits total tokens per batch to per_device_max_tokens to avoid NaN.
-    - Masks first token of each new chunk to prevent cross-chunk leakage.
-    - Works for prepacked datasets and streaming datasets.
-    """
-
-    def __init__(self, tokenizer, data_args: DataArguments, max_seq_len: int = 32768):
+    def __init__(self, tokenizer, data_args, max_seq_len):
         self.tokenizer = tokenizer
         self.data_args = data_args
         self.max_seq_len = max_seq_len
-        assert self.max_seq_len > 0
 
-    def _pack_sequences(self, all_input_ids: list, all_labels: Optional[list] = None) -> (list, list):
-        packed_input_ids = []
+    # packing helper
+    def _pack_sequences(self, seqs, labels=None):
+        packed_ids = []
         packed_labels = []
-        current_seq = []
-        current_labels = []
+        cur_ids = []
+        cur_labels = []
 
-        max_tokens_per_pack = self.data_args.per_device_max_tokens or self.max_seq_len
+        max_tokens = self.data_args.per_device_max_tokens or self.max_seq_len
 
-        for idx, seq in enumerate(all_input_ids):
-            labels_seq = None
-            if all_labels is not None:
-                labels_seq = all_labels[idx]
-            # truncate sequence if longer
+        for idx, seq in enumerate(seqs):
+            lab = labels[idx] if labels is not None else None
+
             if len(seq) > self.max_seq_len:
                 seq = seq[: self.max_seq_len]
-                if labels_seq is not None:
-                    labels_seq = labels_seq[: self.max_seq_len]
+                if lab is not None:
+                    lab = lab[: self.max_seq_len]
 
-            seq_idx = 0
-            while seq_idx < len(seq):
-                remaining_tokens = max_tokens_per_pack - len(current_seq)
-                if remaining_tokens <= 0:
-                    packed_input_ids.append(current_seq)
-                    packed_labels.append(current_labels)
-                    current_seq = []
-                    current_labels = []
-                    remaining_tokens = max_tokens_per_pack
+            pos = 0
+            while pos < len(seq):
+                remain = max_tokens - len(cur_ids)
+                if remain <= 0:
+                    packed_ids.append(cur_ids)
+                    packed_labels.append(cur_labels)
+                    cur_ids, cur_labels = [], []
+                    remain = max_tokens
 
-                take_len = min(len(seq) - seq_idx, remaining_tokens)
-                chunk = seq[seq_idx : seq_idx + take_len]
-                if labels_seq is not None:
-                    lab_chunk = labels_seq[seq_idx : seq_idx + take_len]
+                take = min(len(seq) - pos, remain)
+                chunk = seq[pos : pos + take]
+
+                if lab is not None:
+                    lab_chunk = lab[pos : pos + take]
                 else:
-                    # create labels same as original behavior: mask first token of new chunk
                     lab_chunk = chunk.copy()
-                    if not current_seq:
+                    if not cur_ids:
                         lab_chunk[0] = -100
 
-                # If attaching to non-empty current_seq, we must mask the first token of this chunk
-                # to avoid leakage between samples
-                if current_seq:
+                if cur_ids:
                     lab_chunk[0] = -100
 
-                current_seq.extend(chunk)
-                current_labels.extend(lab_chunk)
+                cur_ids.extend(chunk)
+                cur_labels.extend(lab_chunk)
+                pos += take
 
-                seq_idx += take_len
+                if len(cur_ids) == max_tokens:
+                    packed_ids.append(cur_ids)
+                    packed_labels.append(cur_labels)
+                    cur_ids, cur_labels = [], []
 
-                if len(current_seq) == max_tokens_per_pack:
-                    packed_input_ids.append(current_seq)
-                    packed_labels.append(current_labels)
-                    current_seq = []
-                    current_labels = []
+        if cur_ids:
+            packed_ids.append(cur_ids)
+            packed_labels.append(cur_labels)
 
-        if current_seq:
-            packed_input_ids.append(current_seq)
-            packed_labels.append(current_labels)
+        return packed_ids, packed_labels
 
-        return packed_input_ids, packed_labels
-
-
-    def __call__(self, features: list) -> dict:
-        # gather all sequences
-        all_input_ids = []
+    # main interface
+    def __call__(self, batch):
+        all_ids = []
         all_labels = []
-        labels_provided = False
-        for f in features:
+        all_tasks = []
+        labels_exist = False
+
+        for f in batch:
             if "input_ids_chunks" in f:
-                all_input_ids.extend(f["input_ids_chunks"])
-                # no labels in chunked mode unless SFT provided chunk-level labels
-                if "labels_chunks" in f:
-                    all_labels.extend(f["labels_chunks"])
+                all_ids.extend(f["input_ids_chunks"])
+                all_tasks.append(f.get("task_type", "default"))
+                continue
+
+            all_ids.append(f["input_ids"])
+            all_tasks.append(f.get("task_type", "default"))
+
+            if "labels" in f:
+                labels_exist = True
+                all_labels.append(f["labels"])
             else:
-                all_input_ids.append(f["input_ids"])
-                if "labels" in f:
-                    labels_provided = True
-                    all_labels.append(f["labels"])
-                else:
-                    all_labels.append(None)
+                all_labels.append(None)
 
-        if getattr(self.data_args, "use_packing", False):
-            # detect prepacked
-            prepacked = (
-                all(len(x) == self.max_seq_len for x in all_input_ids)
-                if all_input_ids
-                else False
+        # packing mode
+        if self.data_args.use_packing:
+            packed_ids, packed_labels = self._pack_sequences(
+                all_ids, all_labels if labels_exist else None
             )
-            packed_input_ids, packed_labels = self._pack_sequences(all_input_ids, all_labels if labels_provided else None)
 
+            B = len(packed_ids)
+            ids_t = torch.full((B, self.max_seq_len), self.tokenizer.pad_token_id, dtype=torch.long)
+            lab_t = torch.full((B, self.max_seq_len), -100, dtype=torch.long)
+            mask = torch.zeros((B, self.max_seq_len), dtype=torch.long)
 
-            if prepacked:
-                packed_input_ids = all_input_ids
-                packed_labels = []
-                for seq in packed_input_ids:
-                    lab = seq.copy()
-                    lab[0] = -100
-                    packed_labels.append(lab)
-            else:
-                packed_input_ids, packed_labels = self._pack_sequences(all_input_ids)
-
-            # pad to max_seq_len
-            batch_size = len(packed_input_ids)
-            input_ids_tensor = torch.full(
-                (batch_size, self.max_seq_len),
-                self.tokenizer.pad_token_id,
-                dtype=torch.long,
-            )
-            labels_tensor = torch.full(
-                (batch_size, self.max_seq_len), -100, dtype=torch.long
-            )
-            attention_mask = torch.zeros((batch_size, self.max_seq_len), dtype=torch.long)
-
-            for i, (inp, lab) in enumerate(zip(packed_input_ids, packed_labels)):
+            for i, (inp, lab) in enumerate(zip(packed_ids, packed_labels)):
                 L = len(inp)
-                input_ids_tensor[i, :L] = torch.tensor(inp, dtype=torch.long)
-                labels_tensor[i, :L] = torch.tensor(lab, dtype=torch.long)
-                attention_mask[i, :L] = 1
+                ids_t[i, :L] = torch.tensor(inp)
+                lab_t[i, :L] = torch.tensor(lab)
+                mask[i, :L] = 1
 
             return {
-                "input_ids": input_ids_tensor,
-                "labels": labels_tensor,
-                "attention_mask": attention_mask,
+                "input_ids": ids_t,
+                "labels": lab_t,
+                "attention_mask": mask,
+                "task_type": all_tasks,
             }
-            
-        # No packing: apply per-sample truncation/drop strategy
-        kept_inputs = []
-        kept_labels = []
 
-        is_sft = getattr(self.data_args, "task_type", "pretrain") == "sft"
-        for seq in all_input_ids:
+        # no packing
+        kept_ids = []
+        kept_labels = []
+        is_sft = self.data_args.task_type == "sft"
+
+        for seq, lab in zip(all_ids, all_labels):
             if len(seq) > self.max_seq_len:
                 if is_sft:
                     continue
-                else:
-                    seq = seq[: self.max_seq_len]
+                seq = seq[: self.max_seq_len]
 
-            labels = seq.copy()
-            if labels:
-                labels[0] = -100
+            if lab is None:
+                lab = seq.copy()
+                if lab:
+                    lab[0] = -100
 
-            kept_inputs.append(seq)
-            kept_labels.append(labels)
+            kept_ids.append(seq)
+            kept_labels.append(lab)
 
-        batch_size = len(kept_inputs)
+        B = len(kept_ids)
+        ids_t = torch.full((B, self.max_seq_len), self.tokenizer.pad_token_id, dtype=torch.long)
+        lab_t = torch.full((B, self.max_seq_len), -100, dtype=torch.long)
+        mask = torch.zeros((B, self.max_seq_len), dtype=torch.long)
 
-        input_ids_tensor = torch.full(
-            (batch_size, self.max_seq_len),
-            self.tokenizer.pad_token_id,
-            dtype=torch.long,
-        )
-        labels_tensor = torch.full((batch_size, self.max_seq_len), -100, dtype=torch.long)
-        attention_mask = torch.zeros((batch_size, self.max_seq_len), dtype=torch.long)
-
-        for i, (inp, lab) in enumerate(zip(kept_inputs, kept_labels)):
+        for i, (inp, lab) in enumerate(zip(kept_ids, kept_labels)):
             L = len(inp)
-            if L > 0:
-                input_ids_tensor[i, :L] = torch.tensor(inp, dtype=torch.long)
-                labels_tensor[i, :L] = torch.tensor(lab, dtype=torch.long)
-                attention_mask[i, :L] = 1
+            ids_t[i, :L] = torch.tensor(inp)
+            lab_t[i, :L] = torch.tensor(lab)
+            mask[i, :L] = 1
 
         return {
-            "input_ids": input_ids_tensor,
-            "labels": labels_tensor,
-            "attention_mask": attention_mask,
+            "input_ids": ids_t,
+            "labels": lab_t,
+            "attention_mask": mask,
+            "task_type": all_tasks,
         }
+
+
+# =========================================================
+#  SFT builder
+# =========================================================
 def _build_sft_input_and_labels(item, tokenizer, data_args, max_seq_len):
-    """
-    Given an item in your SFT JSON format, produce (input_ids, labels) where:
-    - input_ids: token ids of prompt+answer
-    - labels: same length, prompt tokens => -100, answer tokens => token ids
-    metadata.flag: "0" => context+question are separate; "1" => merged in question
-    We will join with spaces by default; you can customize separators.
-    """
     ctx = item.get("context", "") or ""
     q = item.get("question", "") or ""
     a = item.get("answer", "") or ""
     meta = item.get("metadata", {}) or {}
     flag = str(meta.get("flag", "0"))
 
-    # Decide how to join prompt parts
     if flag == "1":
-        # already merged into question
         prompt_text = q
-        if ctx:
-            # if both present but flagged merged, prefer q as prompt (user note)
-            prompt_text = q
     else:
-        # default: join context and question with a separator
         if ctx and q:
             prompt_text = ctx.rstrip() + "\n" + q.lstrip()
         else:
             prompt_text = (ctx or q)
 
-    # Combine prompt + separator + answer
-    # You may choose different separators depending on your dataset conventions
-    separator = "\n\n"  # you can change to " " or tokenizer.eos_token
-    full_text = prompt_text + separator + a if a else prompt_text
+    separator = "\n\n"
+    full = prompt_text + separator + a if a else prompt_text
 
-    tokenized = tokenizer(
-        full_text,
-        truncation=False,  # we'll manually enforce length below
-        add_special_tokens=True,
-    )
-    input_ids = tokenized["input_ids"]
+    ids = tokenizer(full, truncation=False, add_special_tokens=True)["input_ids"]
+    prompt_ids = tokenizer(prompt_text, add_special_tokens=True)["input_ids"]
+    prompt_len = len(prompt_ids)
 
-    # Now build labels: mask prompt tokens
-    # To identify prompt length we tokenize prompt_text separately
-    tokenized_prompt = tokenizer(prompt_text, add_special_tokens=True, truncation=False)
-    prompt_len = len(tokenized_prompt["input_ids"])
-
-    labels = [-100] * len(input_ids)
-    # If answer exists, fill labels for answer tokens
+    labels = [-100] * len(ids)
     if a:
-        # answer starts at prompt_len + separator_tokens
-        # compute tokenized separator length:
-        tokenized_separator = tokenizer(separator, add_special_tokens=False)
-        sep_len = len(tokenized_separator["input_ids"]) if tokenized_separator["input_ids"] else 0
-        answer_start = prompt_len + sep_len
-        # clamp
-        if answer_start < len(input_ids):
-            for i in range(answer_start, len(input_ids)):
-                labels[i] = input_ids[i]
+        sep_len = len(tokenizer(separator, add_special_tokens=False)["input_ids"])
+        start = prompt_len + sep_len
+        for i in range(start, len(ids)):
+            labels[i] = ids[i]
 
-    # enforce max_seq_len
-    if len(input_ids) > max_seq_len:
-        input_ids = input_ids[:max_seq_len]
+    if len(ids) > max_seq_len:
+        ids = ids[:max_seq_len]
         labels = labels[:max_seq_len]
 
-    return input_ids, labels
+    return ids, labels
 
 
-def build_dataset(
-    paths,
-    data_args: DataArguments,
-    tokenizer=None,
-    is_training: bool = True,
-    model_name_or_path: str = None,
-) -> Dataset:
-    """Build dataset. Options:
-    - streaming: return IterableDataset (useful for extremely large corpora)
-    - prepack: will create PrepackedDataset by scanning and packing all sequences into fixed-length chunks
-
-    Returns a PyTorch Dataset or IterableDataset.
-    """
+# =========================================================
+#  Dataset builder
+# =========================================================
+def build_dataset(paths, data_args, tokenizer=None, is_training=True, model_name_or_path=None):
 
     if isinstance(paths, str):
-        path_list = [paths]
-    else:
-        path_list = paths
+        paths = [paths]
 
     parquet_files = []
-    for p in path_list:
+    for p in paths:
         if os.path.isdir(p):
-            files = glob.glob(os.path.join(p, "*.parquet"))
-            parquet_files.extend(files)
+            parquet_files.extend(glob.glob(os.path.join(p, "*.parquet")))
         elif os.path.isfile(p) and p.endswith(".parquet"):
             parquet_files.append(p)
         else:
-            raise ValueError(f"Invalid data path: {p}")
+            raise ValueError(f"Invalid path: {p}")
 
     if not parquet_files:
-        raise ValueError("No parquet files found in provided paths")
+        raise ValueError("No parquet files found")
 
-    logger.info(f"Loading {len(parquet_files)} parquet files")
-    # Tokenizer
     if tokenizer is None:
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_name_or_path, use_fast=True, trust_remote_code=True
-        )
+        tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, use_fast=True, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Determine max_seq_len
-    max_seq_len = (
-        int(data_args.per_device_max_tokens)
-        if data_args.per_device_max_tokens
-        else 32768
-    )
-    if max_seq_len > 1_000_000:
-        max_seq_len = 4096
+    max_len = data_args.per_device_max_tokens or 32768
+    max_len = min(max_len, 4096*250)  # hard clamp for safety
 
-    # Load dataset
+    # streaming
     if data_args.streaming:
-        ds = load_dataset(
-            "parquet", data_files=parquet_files, split="train", streaming=True
-        )
-        return StreamingParquetIterable(
-            ds, tokenizer, data_args, max_seq_len=max_seq_len
-        )
+        ds = load_dataset("parquet", data_files=parquet_files, split="train", streaming=True)
+        return StreamingParquetIterable(ds, tokenizer, data_args, max_len)
 
-    raw_dataset = load_dataset("parquet", data_files=parquet_files, split="train")
+    raw = load_dataset("parquet", data_files=parquet_files, split="train")
 
-    if data_args.min_seq_len is not None and not data_args.streaming and not data_args.prepack:
-        logger.info(f"Filtering out samples with tokenized length <= {data_args.min_seq_len - 1}")
-
-        def filter_fn(item):
-            text = item.get("context") or item.get("text") or item.get("content")
+    # filter short samples
+    if data_args.min_seq_len is not None and not data_args.prepack:
+        def filter_fn(x):
+            text = x.get("context") or x.get("text") or x.get("content")
             if text is None:
                 return False
-            tokenized = tokenizer(
-                text,
-                truncation=False,  # we want full length to judge
-                add_special_tokens=True,
-            )
-            length = len(tokenized["input_ids"])
-            return length > data_args.min_seq_len
+            l = len(tokenizer(text, add_special_tokens=True, truncation=False)["input_ids"])
+            return l > data_args.min_seq_len
+        raw = raw.filter(filter_fn, num_proc=os.cpu_count())
+        logger.info(f"Filtered dataset size: {len(raw)}")
 
-        raw_dataset = raw_dataset.filter(filter_fn, num_proc=os.cpu_count())
-
-        logger.info(f"After filtering: {len(raw_dataset)} samples remain.")
-        
+    # prepack mode
     if data_args.prepack:
-        logger.info(
-            "Prepacking dataset into fixed-length sequences. This may take time but speeds up training."
-        )
-        # Extract all tokenized sequences
-        all_input_ids = []
-        for item in raw_dataset:
-            text = item.get("context") or item.get("text") or item.get("content")
-            if text is None:
-                continue
-            tokenized = tokenizer(
-                text, truncation=(data_args.task_type == "pretrain"), add_special_tokens=True
-            )
-            input_ids = tokenized["input_ids"]
-            if (
-                data_args.subsplit_length
-                and not data_args.single_seq
-                and data_args.task_type != "sft"
-            ):
-                L = data_args.subsplit_length
-                for i in range(0, len(input_ids), L):
-                    chunk = input_ids[i : i + L]
-                    if len(chunk) > 0:
-                        all_input_ids.append(chunk)
+        all_ids = []
+        for item in raw:
+            r = process_sample(item, tokenizer, data_args, max_len)
+            if "input_ids_chunks" in r:
+                all_ids.extend(r["input_ids_chunks"])
             else:
-                all_input_ids.append(input_ids)
+                all_ids.append(r["input_ids"])
 
-        collator = PackingDataCollator(tokenizer, data_args, max_seq_len=max_seq_len)
-        packed_input_ids, _ = collator._pack_sequences(all_input_ids)
-        logger.info(
-            f"Prepacked into {len(packed_input_ids)} examples of max len {max_seq_len}"
-        )
-        return PrepackedDataset(packed_input_ids, tokenizer, max_seq_len)
+        collator = PackingDataCollator(tokenizer, data_args, max_len)
+        packed, _ = collator._pack_sequences(all_ids)
+        logger.info(f"Prepacked into {len(packed)} sequences.")
+        return PrepackedDataset(packed, tokenizer, max_len)
 
-    # Default: random-access dataset
-    return ParquetDataset(
-        raw_dataset=raw_dataset,
-        tokenizer=tokenizer,
-        data_args=data_args,
-        max_seq_len=max_seq_len,
-        is_training=is_training,
-    )
+    return ParquetDataset(raw, tokenizer, data_args, max_len, is_training)
+
 
 
 # -----------------------
@@ -562,24 +424,24 @@ def build_dataset(
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-
+    model_path = "/root/.cache/modelscope/hub/models/LLM-Research/Llama-3.2-1B-Instruct"
     data_args = DataArguments(
-        subsplit_length=16000,
-        per_device_max_tokens=32768,
+        subsplit_length=None,
+        per_device_max_tokens=1024,
         prepack=False,
         streaming=False,
     )
     dataset = build_dataset(
-        ["/data1/public_data/Long-Data-Collections_Pre_filter"],
+        ["/data1/public_data/Pre_filter"],
         data_args=data_args,
         is_training=True,
-        model_name_or_path="/data1/hf_model/Qwen3-4B",
+        model_name_or_path=model_path,
     )
     # Example: use DataLoader
     from torch.utils.data import DataLoader
 
     tokenizer = AutoTokenizer.from_pretrained(
-        "/data1/hf_model/Qwen3-4B", use_fast=True, trust_remote_code=True
+        model_path, use_fast=True, trust_remote_code=True
     )
     collator = PackingDataCollator(
         tokenizer, data_args, max_seq_len=data_args.per_device_max_tokens

@@ -914,6 +914,7 @@ def Xattention_prefill(
     # print(f"approximated prefilling Computation: {approx_simple_mask.sum() / num_to_compute}")
     del approx_simple_mask, attn_sums
     return attn_output
+
 from sparseattn.src.utils import *
 import torch
 import math
@@ -925,73 +926,78 @@ import triton.language as tl
 # ... (previous Triton kernels and functions are expected to be above in the same file) 
 
 if __name__ == "__main__":
-    torch.manual_seed(42)
+    
+    #帮我写一个while true的循环，随机采样0-1
+    while True:
+        import random
+        # 方法1：使用randint (包含0和1000)
+        num = random.randint(0, 16000)
+        # 配置
+        batch_size = 1
+        num_heads = 32
+        q_len = num
+        kv_len = num
+        head_dim = 128
 
-    # 配置
-    batch_size = 1
-    num_heads = 32
-    q_len = 502
-    kv_len = 502
-    head_dim = 128
 
-    # 选择设备
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if device.type == "cpu":
-        print("警告：当前未检测到 CUDA。Triton 内核将无法运行，测试可能失败或速度极慢。")
+        # 选择设备
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if device.type == "cpu":
+            print("警告：当前未检测到 CUDA。Triton 内核将无法运行，测试可能失败或速度极慢。")
 
-    # 随机输入（注意 dtype 用 float16/float32 以匹配实际模型）
-    dtype = torch.float16 if device.type == "cuda" else torch.float32
-    query = torch.randn((batch_size, num_heads, q_len, head_dim), dtype=dtype, device=device)
-    key = torch.randn((batch_size, num_heads, kv_len, head_dim), dtype=dtype, device=device)
-    value = torch.randn((batch_size, num_heads, kv_len, head_dim), dtype=dtype, device=device)
+        # 随机输入（注意 dtype 用 float16/float32 以匹配实际模型）
+        dtype = torch.float16 if device.type == "cuda" else torch.float32
+        query = torch.randn((batch_size, num_heads, q_len, head_dim), dtype=dtype, device=device)
+        key = torch.randn((batch_size, num_heads, kv_len, head_dim), dtype=dtype, device=device)
+        value = torch.randn((batch_size, num_heads, kv_len, head_dim), dtype=dtype, device=device)
 
-    # Xattention_prefill 参数
-    stride = 16
-    norm = 1
-    threshold = 0.9
-    block_size = 128
-    use_triton = True if device.type == "cuda" else False
-    causal = True
-    kdb = 1
-    chunk_size = 16384
-    keep_sink = False
-    keep_recent = False
+        # Xattention_prefill 参数
+        stride = 16
+        norm = 1
+        threshold = 0.9
+        block_size = 128
+        use_triton = True if device.type == "cuda" else False
+        causal = True
+        kdb = 1
+        chunk_size = 16384
+        keep_sink = False
+        keep_recent = False
 
-    print(f"Running Xattention_prefill on device={device}, use_triton={use_triton}")
+        print(f"Running Xattention_prefill on device={device}, use_triton={use_triton}")
 
-    try:
-        out = Xattention_prefill(
-            query_states=query,
-            key_states=key,
-            value_states=value,
-            stride=stride,
-            norm=norm,
-            threshold=threshold,
-            block_size=block_size,
-            use_triton=use_triton,
-            causal=causal,
-            kdb=kdb,
-            chunk_size=chunk_size,
-            keep_sink=keep_sink,
-            keep_recent=keep_recent,
-        )
-
-        print("Xattention_prefill 返回: ")
-        print(f"  类型: {type(out)}")
         try:
-            print(f"  形状: {out.shape}")
-            print(f"  dtype: {out.dtype}, device: {out.device}")
-            # 打印少量元素以作 sanity check
-            flat = out.detach().cpu()
-            print(f"  少量元素 (前 8): {flat.flatten()[:8]}")
-        except Exception:
-            print("无法读取返回张量的详细信息（可能为自定义对象或未成功计算）")
+            out = Xattention_prefill(
+                query_states=query,
+                key_states=key,
+                value_states=value,
+                stride=stride,
+                norm=norm,
+                threshold=threshold,
+                block_size=block_size,
+                use_triton=use_triton,
+                causal=causal,
+                kdb=kdb,
+                chunk_size=chunk_size,
+                keep_sink=keep_sink,
+                keep_recent=keep_recent,
+            )
 
-    except Exception as e:
-        import traceback
+            print("Xattention_prefill 返回: ")
+            print(f"  类型: {type(out)}")
+            try:
+                print(f"  形状: {out.shape}")
+                print(f"  dtype: {out.dtype}, device: {out.device}")
+                # 打印少量元素以作 sanity check
+                flat = out.detach().cpu()
+                print(f"  少量元素 (前 8): {flat.flatten()[:8]}")
+            except Exception:
+                print("无法读取返回张量的详细信息（可能为自定义对象或未成功计算）")
 
-        print("调用 Xattention_prefill 出现异常:")
-        traceback.print_exc()
-        print("请检查 Triton/CUDA 环境、block_size 与输入长度是否匹配，以及可能的显存限制。")
+        except Exception as e:
+            import traceback
 
-    print("测试结束。")
+            print("调用 Xattention_prefill 出现异常:")
+            traceback.print_exc()
+            print("请检查 Triton/CUDA 环境、block_size 与输入长度是否匹配，以及可能的显存限制。")
+
+        print("测试结束。")

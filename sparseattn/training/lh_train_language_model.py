@@ -21,7 +21,7 @@ from .modeling_flash_llama import PawLlamaForCausalLM, PawLlamaConfig
 from .modeling_flash_qwen import PawQwen3ForCausalLM, PawQwen3Config
 from .modeling_flash_phi import PawPhi3ForCausalLM, PawPhi3Config
 from .lh_trainer import Trainer
-from .lh_trainer_nsa import Trainer as NSATrainer
+# from .lh_trainer_nsa import Trainer as NSATrainer
 
 # from .dataset import build_dataset, DataCollator, DataArguments
 from .dataset_batch import build_dataset, PackingDataCollator, DataArguments
@@ -188,27 +188,27 @@ def main():
                 use_auth_token=True if script_args.use_auth_token else None,
                 torch_dtype=torch.bfloat16,
             )
-            config = model.config
-            config._attn_implementation = "flash_attention_2"
-            config.compress_type = "linear"#"avgpool","weightedpool"
-            config.kernel_size = 32
-            config.kernel_stride = 16
-            config.block_size = 64
-            config.topk = 8
-            config.init_blocks = 1
-            config.local_blocks = 2
-            config.window_size = 500
-            for i, layer in enumerate(model.model.layers):
-                original_attn = layer.self_attn
+            # config = model.config
+            # config._attn_implementation = "flash_attention_2"
+            # config.compress_type = "linear"#"avgpool","weightedpool"
+            # config.kernel_size = 32
+            # config.kernel_stride = 16
+            # config.block_size = 64
+            # config.topk = 8
+            # config.init_blocks = 1
+            # config.local_blocks = 2
+            # config.window_size = 500
+            # for i, layer in enumerate(model.model.layers):
+            #     original_attn = layer.self_attn
 
-                original_dtype = next(original_attn.parameters()).dtype
-                device = next(original_attn.parameters()).device
+            #     original_dtype = next(original_attn.parameters()).dtype
+            #     device = next(original_attn.parameters()).device
 
-                new_attn = LlamaNSA(config, layer_idx=original_attn.layer_idx)
-                new_attn.load_state_dict(original_attn.state_dict(), strict=False)
-                new_attn = new_attn.to(device).to(original_dtype)
+            #     new_attn = LlamaNSA(config, layer_idx=original_attn.layer_idx)
+            #     new_attn.load_state_dict(original_attn.state_dict(), strict=False)
+            #     new_attn = new_attn.to(device).to(original_dtype)
 
-                layer.self_attn = new_attn
+            #     layer.self_attn = new_attn
 
         elif "qwen" in script_args.model_name_or_path.lower():
             model = PawQwen3ForCausalLM.from_pretrained(
@@ -360,15 +360,16 @@ def main():
 
     # Initialize our Trainer
     if training_args.attention_type is not None and "nsa" in training_args.attention_type :
-        trainer = NSATrainer(
-            model=model,
-            args=training_args,
-            train_dataset=train_dataset if training_args.do_train else None,
-            eval_dataset=eval_dataset if training_args.do_eval else None,
-            tokenizer=tokenizer,
-            data_collator=data_collator,
-            log_loss=script_args.should_log_loss,
-        )
+        # trainer = NSATrainer(
+        #     model=model,
+        #     args=training_args,
+        #     train_dataset=train_dataset if training_args.do_train else None,
+        #     eval_dataset=eval_dataset if training_args.do_eval else None,
+        #     tokenizer=tokenizer,
+        #     data_collator=data_collator,
+        #     log_loss=script_args.should_log_loss,
+        # )
+        pass
     else:
         trainer = Trainer(
             model=model,

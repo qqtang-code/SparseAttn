@@ -286,6 +286,16 @@ class Trainer(HFTrainer):
         self.num_sparsity_warmup_steps = math.ceil(
             self.sparsity_warmup_ratio * self.args.max_steps
         )
+        
+        self.task_sparsity_config = {
+            "default": {"start": self.start_head_sparsity, "end": self.end_head_sparsity},
+            "Code": {"start": 0.1, "end": 0.7},
+            "Math": {"start": 0.0, "end": 0.6},
+            "MutiHop QA": {"start": 0.2, "end": 0.5},
+            "Single QA": {"start": 0.1, "end": 0.7},
+            "Summarization": {"start": 0.3, "end": 0.6},
+        }
+
 
         if not dist.is_initialized() or args.seq_parallel_size == dist.get_world_size():
             logger.info(f"Using world as sequence parallel group")
@@ -303,30 +313,34 @@ class Trainer(HFTrainer):
         except ValueError:
             logger.warning("Couldn't remove PrinterCallback")
 
-    def get_current_target_sparsity(self, global_step):
-        if global_step < self.num_sparsity_warmup_steps:
-            if self.warmup_type == "linear":
-                return (
-                    self.start_head_sparsity
-                    + (self.end_head_sparsity - self.start_head_sparsity)
-                    * global_step
-                    / self.num_sparsity_warmup_steps
-                )
-            elif self.warmup_type == "logarithmic":
-                log_one_minus_sparsity = (
-                    math.log(1 - self.start_head_sparsity)
-                    + (
-                        math.log(1 - self.end_head_sparsity)
-                        - math.log(1 - self.start_head_sparsity)
+    def get_current_target_sparsity(self, global_step: int, tasks: List[str]) -> torch.Tensor:
+        """
+        Returns: torch.Tensor of shape [len(tasks)], device=cpu (will be moved later)
+        """
+        sparsities = []
+        for task in tasks:
+            cfg = self.task_sparsity_config.get(task, self.task_sparsity_config["default"])
+            start_sp = cfg["start"]
+            end_sp = cfg["end"]
+            
+            if global_step < self.num_sparsity_warmup_steps:
+                if self.warmup_type == "linear":
+                    sp = start_sp + (end_sp - start_sp) * global_step / self.num_sparsity_warmup_steps
+                elif self.warmup_type == "logarithmic":
+                    log_one_minus_start = math.log(1 - start_sp)
+                    log_one_minus_end = math.log(1 - end_sp)
+                    log_one_minus_sp = (
+                        log_one_minus_start
+                        + (log_one_minus_end - log_one_minus_start) * global_step / self.num_sparsity_warmup_steps
                     )
-                    * global_step
-                    / self.num_sparsity_warmup_steps
-                )
-                return 1 - math.exp(log_one_minus_sparsity)
+                    sp = 1 - math.exp(log_one_minus_sp)
+                else:
+                    raise ValueError(f"Unknown warmup_type: {self.warmup_type}")
             else:
-                raise ValueError(f"Unknown warmup type: {self.warmup_type}")
-        else:
-            return self.end_head_sparsity
+                sp = end_sp
+            sparsities.append(sp)
+        
+        return torch.tensor(sparsities, dtype=torch.float32)  # shape: [B]
 
     def get_sequence_parallel_inputs(self, inputs):
         seq_parallel_world_size = (
@@ -421,13 +435,22 @@ class Trainer(HFTrainer):
 
         Subclass and override for custom behavior.
         """
+        tasks = inputs.get("task_type", ["default"] * inputs["input_ids"].size(0))
+        # tasks = ["default"] * inputs["input_ids"].size(0)
+        target_sparsity = self.get_current_target_sparsity(self.state.global_step, tasks)
+        target_sparsity = target_sparsity.to(model.device)  # [B]
+        
         inputs = self.get_sequence_parallel_inputs(inputs)
-        target_sparsity = self.get_current_target_sparsity(self.state.global_step)
+        # target_sparsity = self.get_current_target_sparsity(self.state.global_step)
+        
+        if self.state.global_step % 100 == 0:
+            unique_tasks = list(set(tasks))
+            mean_spars = {t: target_sparsity[i].item() for i, t in enumerate(tasks[:3])}
+            print(f"[Step {self.state.global_step}] Sample tasks: {tasks[:3]} → sparsity: {[f'{s:.3f}' for s in target_sparsity[:3].tolist()]}")
         attn_mask = inputs["attention_mask"]
         valid_tokens = attn_mask.sum(dim=1)
         print(f"Rank {torch.distributed.get_rank() if torch.distributed.is_initialized() else 0}: "
             f"valid tokens per sample = {valid_tokens.tolist()}, total = {valid_tokens.sum().item()}")
-
         try:
             outputs = model(**inputs, use_cache=False, target_sparsity=target_sparsity)
         except Exception as e:
@@ -528,7 +551,7 @@ class Trainer(HFTrainer):
 
             logger.info(
                 f"@ {self.state.global_step} | Loss: {loss.item():.4f} | LM: {lm_loss.item():.4f} | Reg: {reg_loss.item():.4f} | "
-                f"Target: {target_sparsity:.4f} | Sparsity: {model_sparsity:.4f}"
+                f"Target: {target_sparsity.item():.4f} | Sparsity: {model_sparsity.item():.4f}"
                 + (" | " + " | ".join(extra) if len(extra) else "")
             )
 
@@ -692,7 +715,6 @@ class Trainer(HFTrainer):
                         p.requires_grad = False
                     else:
                         optimizer_1_group.append(p)
-
             optimizer_grouped_parameters = []
             if not self.freeze_non_mask_parameters:
                 optimizer_grouped_parameters.append(
