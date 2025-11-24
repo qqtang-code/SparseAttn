@@ -317,6 +317,41 @@ class PackingDataCollator:
 # =========================================================
 #  SFT builder
 # =========================================================
+# def _build_sft_input_and_labels(item, tokenizer, data_args, max_seq_len):
+#     ctx = item.get("context", "") or ""
+#     q = item.get("question", "") or ""
+#     a = item.get("answer", "") or ""
+#     meta = item.get("metadata", {}) or {}
+#     flag = str(meta.get("flag", "0"))
+
+#     if flag == "1":
+#         prompt_text = q
+#     else:
+#         if ctx and q:
+#             prompt_text = ctx.rstrip() + "\n" + q.lstrip()
+#         else:
+#             prompt_text = (ctx or q)
+
+#     separator = "\n\n"
+#     full = prompt_text + separator + a if a else prompt_text
+
+#     ids = tokenizer(full, truncation=False, add_special_tokens=True)["input_ids"]
+#     prompt_ids = tokenizer(prompt_text, add_special_tokens=True)["input_ids"]
+#     prompt_len = len(prompt_ids)
+
+#     labels = [-100] * len(ids)
+#     if a:
+#         sep_len = len(tokenizer(separator, add_special_tokens=False)["input_ids"])
+#         start = prompt_len + sep_len
+#         for i in range(start, len(ids)):
+#             labels[i] = ids[i]
+
+#     if len(ids) > max_seq_len:
+#         ids = ids[:max_seq_len]
+#         labels = labels[:max_seq_len]
+
+
+#     return ids, labels
 def _build_sft_input_and_labels(item, tokenizer, data_args, max_seq_len):
     ctx = item.get("context", "") or ""
     q = item.get("question", "") or ""
@@ -324,6 +359,7 @@ def _build_sft_input_and_labels(item, tokenizer, data_args, max_seq_len):
     meta = item.get("metadata", {}) or {}
     flag = str(meta.get("flag", "0"))
 
+    # -------- 构造 full 文本 --------
     if flag == "1":
         prompt_text = q
     else:
@@ -333,24 +369,29 @@ def _build_sft_input_and_labels(item, tokenizer, data_args, max_seq_len):
             prompt_text = (ctx or q)
 
     separator = "\n\n"
-    full = prompt_text + separator + a if a else prompt_text
+    full_text = prompt_text + separator + a if a else prompt_text
 
-    ids = tokenizer(full, truncation=False, add_special_tokens=True)["input_ids"]
-    prompt_ids = tokenizer(prompt_text, add_special_tokens=True)["input_ids"]
-    prompt_len = len(prompt_ids)
+    # -------- tokenize --------
+    encoding = tokenizer(
+        full_text,
+        truncation=True,
+        max_length=max_seq_len,
+        padding="max_length",
+        add_special_tokens=True,
+        return_tensors=None,  # 返回 list，如你原代码
+    )
+    input_ids = encoding["input_ids"]
+    attention_mask = encoding["attention_mask"]
 
-    labels = [-100] * len(ids)
-    if a:
-        sep_len = len(tokenizer(separator, add_special_tokens=False)["input_ids"])
-        start = prompt_len + sep_len
-        for i in range(start, len(ids)):
-            labels[i] = ids[i]
+    labels = input_ids.copy()
 
-    if len(ids) > max_seq_len:
-        ids = ids[:max_seq_len]
-        labels = labels[:max_seq_len]
+    # Mask padding tokens to -100 (PyTorch ignore_index)
+    labels = [
+        label if mask == 1 else -100
+        for label, mask in zip(labels, attention_mask)
+    ]
 
-    return ids, labels
+    return input_ids, labels
 
 
 # =========================================================
@@ -415,46 +456,3 @@ def build_dataset(paths, data_args, tokenizer=None, is_training=True, model_name
         return PrepackedDataset(packed, tokenizer, max_len)
 
     return ParquetDataset(raw, tokenizer, data_args, max_len, is_training)
-
-
-
-# -----------------------
-# Example usage
-# -----------------------
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    model_path = "/root/.cache/modelscope/hub/models/LLM-Research/Llama-3.2-1B-Instruct"
-    data_args = DataArguments(
-        subsplit_length=None,
-        per_device_max_tokens=1024,
-        prepack=False,
-        streaming=False,
-    )
-    dataset = build_dataset(
-        ["/data1/public_data/Pre_filter"],
-        data_args=data_args,
-        is_training=True,
-        model_name_or_path=model_path,
-    )
-    # Example: use DataLoader
-    from torch.utils.data import DataLoader
-
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_path, use_fast=True, trust_remote_code=True
-    )
-    collator = PackingDataCollator(
-        tokenizer, data_args, max_seq_len=data_args.per_device_max_tokens
-    )
-
-    loader = DataLoader(
-        dataset, batch_size=8, collate_fn=collator, num_workers=4, pin_memory=True
-    )
-    for batch in loader:
-        # batch contains tensors ready to feed model
-        print(
-            batch["input_ids"][0],
-            batch["labels"][0],
-            batch["attention_mask"][0],
-        )
-        breakpoint()

@@ -476,14 +476,14 @@ class Trainer(HFTrainer):
         if self.optimizer is None:
             decay_parameters = self.get_decay_parameter_names(opt_model)
 
-            optimizer_nsa_group = []
+            optimizer_moba_group = []
             for p in opt_model.parameters():
                 p.requires_grad = False
 
             for n, p in opt_model.named_parameters():
-                if "self_attn.gate" in n or "compress_key" in n or "compress_value" in n : 
+                if "self_attn.q_proj" in n or "self_attn.k_proj" in n or "self_attn.v_proj" in n : 
                     p.requires_grad = True  # 解冻该参数
-                    optimizer_nsa_group.append(p)
+                    optimizer_moba_group.append(p)
                 elif "lm_head" in n or "embed_tokens" in n:
                     p.requires_grad = True
 
@@ -491,7 +491,7 @@ class Trainer(HFTrainer):
 
             optimizer_grouped_parameters.append(
                 {
-                    "params": optimizer_nsa_group,
+                    "params": optimizer_moba_group,
                     "weight_decay": self.args.weight_decay,
                     "lr": 1e-4,
                 }

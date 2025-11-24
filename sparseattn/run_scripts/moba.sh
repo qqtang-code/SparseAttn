@@ -1,11 +1,5 @@
 # Model and training configuration
-#model=${MODEL:-"/data1/lcm_lab/yy/checkpoint/nsa-llama3-8b"}
-model=${MODEL:-"/data1/hf_model/Meta-Llama-3.1-8B-Instruct"}
-#model=${MODEL:-"/root/.cache/modelscope/hub/models/LLM-Research/Llama-3.2-1B-Instruct"}
-#origin_model_path=${MODEL:-"/root/.cache/modelscope/hub/models/LLM-Research/Llama-3.2-1B-Instruct"}
-#model=${MODEL:-"/data1/lcm_lab/yy/checkpoint/NSALlama-3.2-1B-Instruct"}
-#model=${MODEL:-"/data1/lcm_lab/yy/checkpoint/Meta-NSALlama-3.1-8B-Instruct"}
-
+model=${MODEL:-"/data1/hf_model/Qwen3-4B"}
 
 bsz=${BSZ:-8}
 seq=${SEQ:-1}
@@ -15,7 +9,7 @@ save_steps=${SAVE:-500}
 warmup=${WARMUP:-0.1}
 suffix=${SUFFIX:-""}
 overrides=${OVERRIDES:-""}
-min_lr_ratio=${MIN_LR_RATIO:-1e-7}
+min_lr_ratio=${MIN_LR_RATIO:-0.01}
 seq_parallel_size=${SEQ_PARALLEL_SIZE:-1}
 
 # FSDP configuration
@@ -23,20 +17,21 @@ seq_parallel_size=${SEQ_PARALLEL_SIZE:-1}
 fsdp=${FSDP:-"0"}
 gc=${GC:-"1"}
 
-
+# PruLong-specific arguments
+# max_toks=${MAX_TOKS:-32768}
 max_toks=${MAX_TOKS:-32768}
 
 
-attn_type=${ATTN_TYPE:-"nsa"}
+attn_type=${ATTN_TYPE:-"moba"}
 
 # Dataset configuration
+# dataset=${DATASET:-"/data/lcm_lab/qqt/project/SparseAttn/sparseattn/data"}
 dataset=${DATASET:-"/data1/public_data/Pre_filter"}
 
-
 # Create run name
-extra_name="update_compress_key_compress_value_gate_only_blocksize_128_topk_64"
+extra_name="update_qkv_only_blocksize_1024_topk_8"
 
-run_name="nsa_llama_$(basename $model)_bsz${bsz}_steps${steps}_lr${lr}_warmup${warmup}_${extra_name}${suffix}"
+run_name="moba_qwen3_$(basename $model)_bsz${bsz}_steps${steps}_lr${lr}_warmup${warmup}_${extra_name}${suffix}"
 
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 out_dir="checkpoints/$run_name"
@@ -68,7 +63,7 @@ if [ $num_nodes -gt 1 ]; then
     --rdzv-endpoint=$master_addr:56321 \
     --nnodes=$num_nodes \
     --nproc-per-node=$num_gpus \
-    -m training.nsa_train"
+    -m training.moba_train"
 else
     master_port=$(comm -23 <(seq 49152 65535 | sort) <(ss -Htan | awk '{print $4}' | cut -d':' -f2 | sort -u) | shuf | head -n 1)
 
@@ -77,7 +72,7 @@ else
     --rdzv-endpoint=localhost:$master_port \
     --nnodes=1 \
     --nproc-per-node=$num_gpus \
-    -m training.nsa_train"
+    -m training.moba_train"
 fi
 
 # accu=$(($bsz / $seq / $num_gpus / $num_nodes))
@@ -87,7 +82,7 @@ echo "num_nodes=${num_nodes} master_addr=${master_addr} master_port=${master_por
 
 # Environment variables
 export OMP_NUM_THREADS=$num_gpus
-export SWANLAB_API_KEY="t0PmOeLpVom1LRBDAKHaA"
+export SWANLAB_API_KEY="g5vUmp1WaDMSV9FNveypn"
 export SWANLAB_LOG_DIR=$out_dir
 export SWANLAB_MODE="cloud"
 export TOKENIZERS_PARALLELISM=true
@@ -137,6 +132,7 @@ base_arguments=(
     --tokenized_mds_train $dataset
 
     --attention_type $attn_type
+
     --deepspeed "/data1/lcm_lab/yy/checkpoint/ds_config_stage2.json"
 )
 

@@ -1,11 +1,4 @@
 # Model and training configuration
-#model=${MODEL:-"/data1/lcm_lab/yy/checkpoint/nsa-llama3-8b"}
-#model=${MODEL:-"/data1/hf_model/Meta-Llama-3.1-8B-Instruct"}
-#model=${MODEL:-"/root/.cache/modelscope/hub/models/LLM-Research/Llama-3.2-1B-Instruct"}
-#origin_model_path=${MODEL:-"/root/.cache/modelscope/hub/models/LLM-Research/Llama-3.2-1B-Instruct"}
-#model=${MODEL:-"/data1/lcm_lab/yy/checkpoint/NSALlama-3.2-1B-Instruct"}
-#model=${MODEL:-"/data1/lcm_lab/yy/checkpoint/Meta-NSALlama-3.1-8B-Instruct"}
-
 model=${MODEL:-"/data1/hf_model/Qwen3-4B"}
 
 bsz=${BSZ:-8}
@@ -36,7 +29,7 @@ attn_type=${ATTN_TYPE:-"nsa"}
 dataset=${DATASET:-"/data1/public_data/Pre_filter"}
 
 # Create run name
-extra_name="update_compress_key_compress_value_gate_only_v0.0.1"
+extra_name="update_compress_key_compress_value_gate_only_blocksize_128_topk_64"
 
 run_name="nsa_qwen3_$(basename $model)_bsz${bsz}_steps${steps}_lr${lr}_warmup${warmup}_${extra_name}${suffix}"
 

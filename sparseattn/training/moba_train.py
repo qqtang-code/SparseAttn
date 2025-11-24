@@ -19,7 +19,7 @@ import torch
 from transformers import LlamaForCausalLM, AutoTokenizer, AutoModelForCausalLM, Qwen3ForCausalLM
 from .modeling_nsa_llama import NSALlamaForCausalLM
 
-from .lh_trainer_nsa import Trainer as NSATrainer
+from .lh_trainer_moba import Trainer as MoBATrainer
 
 # from .dataset import build_dataset, DataCollator, DataArguments
 from .dataset_batch import build_dataset, PackingDataCollator, DataArguments
@@ -46,9 +46,6 @@ def main():
     parser = HfArgumentParser((ScriptArguments, TrainingArguments, DataArguments))
 
     script_args, training_args, data_args = parser.parse_args_into_dataclasses()
-    # print("script_args", script_args)
-    # print("data_args", data_args)
-    # print("training_args", training_args)
 
     # Setup logging
     logging.basicConfig(
@@ -85,72 +82,22 @@ def main():
     # Set seed before initializing model.
     set_seed(training_args.seed)
     tokenizer = AutoTokenizer.from_pretrained(script_args.model_name_or_path)
-    #tokenizer = AutoTokenizer.from_pretrained(origin_model_path)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token  # 或手动设置为其他 token
-    if training_args.attention_type is not None and "nsa" in training_args.attention_type :
-        if "Llama" in script_args.model_name_or_path:
-            model = LlamaForCausalLM.from_pretrained(
-                script_args.model_name_or_path,
-                from_tf=bool(".ckpt" in script_args.model_name_or_path),
-                cache_dir=script_args.cache_dir,
-                revision=script_args.model_revision,
-                use_auth_token=True if script_args.use_auth_token else None,
-                torch_dtype=torch.bfloat16,
-                use_cache=False
-            )
-            config = model.config
-            config._attn_implementation = "flash_attention_2"
-            config.compress_type = "linear"#"avgpool","weightedpool"
-            config.kernel_size = 32
-            config.kernel_stride = 16
-            config.block_size = 64
-            config.topk = 128
-            config.init_blocks = 1
-            config.local_blocks = 2
-            config.window_size = 512
-            for i, layer in enumerate(model.model.layers):
-                original_attn = layer.self_attn
 
-                original_dtype = next(original_attn.parameters()).dtype
-                device = next(original_attn.parameters()).device
-
-                new_attn = LlamaNSA(config, layer_idx=original_attn.layer_idx)
-                new_attn.load_state_dict(original_attn.state_dict(), strict=False)
-                new_attn = new_attn.to(device).to(original_dtype)
-
-                layer.self_attn = new_attn
-        elif "Qwen3" in script_args.model_name_or_path:
-            model = Qwen3ForCausalLM.from_pretrained(
-                script_args.model_name_or_path,
-                from_tf=bool(".ckpt" in script_args.model_name_or_path),
-                cache_dir=script_args.cache_dir,
-                revision=script_args.model_revision,
-                use_auth_token=True if script_args.use_auth_token else None,
-                torch_dtype=torch.bfloat16,
-                use_cache=False
-            )
-            config = model.config
-            config._attn_implementation = "flash_attention_2"
-            config.compress_type = "linear"#"avgpool","weightedpool"
-            config.kernel_size = 32
-            config.kernel_stride = 16
-            config.block_size = 64
-            config.topk = 128
-            config.init_blocks = 1
-            config.local_blocks = 2
-            config.window_size = 512
-            for i, layer in enumerate(model.model.layers):
-                original_attn = layer.self_attn
-
-                original_dtype = next(original_attn.parameters()).dtype
-                device = next(original_attn.parameters()).device
-
-                new_attn = Qwen3NSA(config, layer_idx=original_attn.layer_idx)
-                new_attn.load_state_dict(original_attn.state_dict(), strict=False)
-                new_attn = new_attn.to(device).to(original_dtype)
-
-                layer.self_attn = new_attn
+    from .MoBA.moba import register_moba, MoBAConfig
+    moba_chunk_size = 1024
+    moba_topk = 8
+    attn = "moba"
+    register_moba(MoBAConfig(moba_chunk_size, moba_topk))
+    model = AutoModelForCausalLM.from_pretrained(
+        script_args.model_name_or_path,
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
+        attn_implementation=attn,
+        use_cache=False
+    )
+            
 
     if (
         script_args.tokenizer_name is not None
@@ -206,17 +153,16 @@ def main():
     data_collator = PackingDataCollator(tokenizer, data_args, max_seq_len=data_args.per_device_max_tokens)
     assert training_args.max_steps is not None, "max_steps must be set!"
 
-    # Initialize our Trainer
-    if training_args.attention_type is not None and "nsa" in training_args.attention_type :
-        trainer = NSATrainer(
-            model=model,
-            args=training_args,
-            train_dataset=train_dataset if training_args.do_train else None,
-            eval_dataset=eval_dataset if training_args.do_eval else None,
-            tokenizer=tokenizer,
-            data_collator=data_collator,
-            log_loss=script_args.should_log_loss,
-        )
+
+    trainer = MoBATrainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset if training_args.do_train else None,
+        eval_dataset=eval_dataset if training_args.do_eval else None,
+        tokenizer=tokenizer,
+        data_collator=data_collator,
+        log_loss=script_args.should_log_loss,
+    )
 
 
     if trainer.is_fsdp_enabled:

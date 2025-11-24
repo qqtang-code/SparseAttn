@@ -3,7 +3,7 @@
 import math
 import torch
 import torch.nn as nn
-from transformers.models.qwen3.modeling_qwen3 import Qwen3PreTrainedModel, Qwen3Model, QWEN3_INPUTS_DOCSTRING, _CONFIG_FOR_DOC
+from transformers.models.qwen3.modeling_qwen3 import Qwen3PreTrainedModel, Qwen3Model, QWEN3_INPUTS_DOCSTRING, _CONFIG_FOR_DOC,KwargsForCausalLM
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.generation import GenerationMixin
 from typing import Optional, Tuple, Union
@@ -29,8 +29,7 @@ from transformers.utils import (
 from transformers.utils.deprecation import deprecate_kwarg
 
 
-from .block_sparse_attention_triton.native_sparse_attention.module.qwen3_nsa import Qwen3NSA
-
+from .block_sparse_attention_triton.native_sparse_attention.module.qwen3_nsa import Qwen3NSA, Qwen3NSA_prefill
 
 
 class NSAQwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
@@ -49,14 +48,14 @@ class NSAQwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         config.kernel_size = 32
         config.kernel_stride = 16
         config.block_size = 64
-        config.topk = 8
+        config.topk = 128
         config.init_blocks = 1
         config.local_blocks = 2
-        config.window_size = 500
+        config.window_size = 512
 
         for layer_idx, layer in enumerate(self.model.layers):
              # Create new NSA layer with same config
-            new_attn = Qwen3NSA(
+            new_attn = Qwen3NSA_prefill(
                 config=config,
                 layer_idx=layer_idx # Pass layer index
             )

@@ -1,7 +1,8 @@
 # load_and_verify_model.py
 
 from sparseattn.training.modeling_nsa_llama import NSALlamaForCausalLM # 确保路径正确
-from transformers import AutoTokenizer, LlamaForCausalLM
+from sparseattn.training.modeling_nsa_qwen3 import NSAQwen3ForCausalLM
+from transformers import AutoTokenizer, LlamaForCausalLM, Qwen3ForCausalLM
 import torch
 
 def print_model_summary(model):
@@ -33,7 +34,7 @@ def compare_models_weights(current_model_path, original_model_path, tolerance=1e
 
     # Load the original model
     print("Loading original Llama model...")
-    original_model = LlamaForCausalLM.from_pretrained(
+    original_model = Qwen3ForCausalLM.from_pretrained(
         original_model_path,
         torch_dtype=torch.bfloat16, # Use the same dtype as your custom model
         # device_map="cpu", # Load on CPU to avoid memory issues during comparison if needed
@@ -42,7 +43,7 @@ def compare_models_weights(current_model_path, original_model_path, tolerance=1e
 
     # Load the current custom model
     print("Loading current NSALlama model...")
-    current_model = NSALlamaForCausalLM.from_pretrained(
+    current_model = NSAQwen3ForCausalLM.from_pretrained(
         current_model_path,
         torch_dtype=torch.bfloat16,
         # device_map="cpu", # Load on CPU to avoid memory issues during comparison if needed
@@ -273,8 +274,10 @@ def load_and_verify_model(saved_model_path, original_model_path):
 
 
 if __name__ == "__main__":
-    original_model_path = "/data1/hf_model/Meta-Llama-3.1-8B-Instruct"
+    #original_model_path = "/data1/hf_model/Meta-Llama-3.1-8B-Instruct"
+    original_model_path = "/data1/hf_model/Qwen3-4B"
     #saved_model_path = "/data1/lcm_lab/yy/checkpoint/Meta-NSALlama-3.1-8B-Instruct"
-    saved_model_path = "/data1/lcm_lab/qqt/SparseAttn/sparseattn/checkpoints/llama_nsa_Meta-Llama-3.1-8B-Instruct_bsz8_steps1000_lr1e-5_warmup0.1_debug11.5"
+    #saved_model_path = "/data1/lcm_lab/qqt/SparseAttn/sparseattn/checkpoints/llama_nsa_Meta-Llama-3.1-8B-Instruct_bsz8_steps1000_lr1e-5_warmup0.1_debug11.5"
     #saved_model_path = "/data1/lcm_lab/yy/checkpoint/NSALlama-3.2-1B-Instruct" # 你第一步保存模型的路径
+    saved_model_path = "/data1/lcm_lab/qqt/SparseAttn/sparseattn/checkpoints/nsa_qwen3_Qwen3-4B_bsz8_steps1000_lr1e-5_warmup0.1_update_compress_key_compress_value_gate_only_v0.0.1"
     load_and_verify_model(saved_model_path, original_model_path)

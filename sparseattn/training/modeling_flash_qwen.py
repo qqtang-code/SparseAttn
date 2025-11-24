@@ -1571,7 +1571,7 @@ class Qwen3Attention(nn.Module):
             # Next: expand z_kv to (num_key_value_heads, num_key_value_groups) and then flatten it to (num_heads)
             z = z_kv.unsqueeze(-1).expand(-1, self.num_key_value_groups).reshape(-1)
         else:
-            target_x = v
+            target_x = q
             if unpadded_lengths is not None:
                 # breakpoint()
                 cu_seqlens, _ = unpadded_lengths

@@ -30,7 +30,7 @@ from transformers.utils import (
 from transformers.utils.deprecation import deprecate_kwarg
 
 
-from .block_sparse_attention_triton.native_sparse_attention.module.llama_nsa import LlamaNSA
+from .block_sparse_attention_triton.native_sparse_attention.module.llama_nsa import LlamaNSA, LlamaNSA_prefill
 
 
 class NSALlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
@@ -49,15 +49,15 @@ class NSALlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         config.kernel_size = 32
         config.kernel_stride = 16
         config.block_size = 64
-        config.topk = 8
+        config.topk = 128
         config.init_blocks = 1
         config.local_blocks = 2
-        config.window_size = 500
+        config.window_size = 512
 
         # --- CRITICAL: Replace attention layers with LlamaNSA ---
         for layer_idx, layer in enumerate(self.model.layers):
              # Create new NSA layer with same config
-            new_attn = LlamaNSA(
+            new_attn = LlamaNSA_prefill(
                 config=config,
                 layer_idx=layer_idx # Pass layer index
             )
