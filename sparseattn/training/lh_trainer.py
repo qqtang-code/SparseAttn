@@ -295,6 +295,14 @@ class Trainer(HFTrainer):
             "Single QA": {"start": 0.1, "end": 0.7},
             "Summarization": {"start": 0.3, "end": 0.6},
         }
+        # self.task_sparsity_config = {
+        #     "default": {"start": self.start_head_sparsity, "end": self.end_head_sparsity},
+        #     "Code": {"start": 0.0, "end": 0.1},
+        #     "Math": {"start": 0.0, "end": 0.1},
+        #     "MultiHop QA": {"start": 0.0, "end": 0.1},
+        #     "Single QA": {"start": 0.0, "end": 0.5},
+        #     "Summarization": {"start": 0.0, "end": 0.1},
+        # }
 
 
         if not dist.is_initialized() or args.seq_parallel_size == dist.get_world_size():
@@ -500,7 +508,7 @@ class Trainer(HFTrainer):
         loss = lm_loss + reg_loss
         task = tasks[0]  # because batch size = 1
         model_sparsity = outputs["model_sparsity"]
-        print(f"Rank {torch.distributed.get_rank() if torch.distributed.is_initialized() else 0}: "f"[Step {self.state.global_step}] Task={task} | model_sparsity={model_sparsity.item():.4f} ｜ reg_loss={reg_loss.item():.4f}")
+        print(f"Rank {torch.distributed.get_rank() if torch.distributed.is_initialized() else 0}: "f"[Step {self.state.global_step}] Task={task} | model_sparsity={model_sparsity.item()} ｜ reg_loss={reg_loss.item()}")
 
         if self.log_loss and self.accelerator.is_main_process:
             model_sparsity = (

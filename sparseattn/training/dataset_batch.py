@@ -378,7 +378,7 @@ def _build_sft_input_and_labels(item, tokenizer, data_args, max_seq_len):
         max_length=max_seq_len,
         padding="max_length",
         add_special_tokens=True,
-        return_tensors=None,  # 返回 list，如你原代码
+        return_tensors=None,
     )
     input_ids = encoding["input_ids"]
     attention_mask = encoding["attention_mask"]
