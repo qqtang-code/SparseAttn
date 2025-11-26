@@ -21,6 +21,8 @@ from torch.utils.data import Dataset, IterableDataset
 from transformers import AutoTokenizer
 from datasets import load_dataset
 
+import ast
+
 logger = logging.getLogger(__name__)
 
 
@@ -63,13 +65,14 @@ def process_sample(item, tokenizer, data_args, max_seq_len):
     task_type = data_args.task_type
 
     if task_type == "sft":
-        input_ids, labels = _build_sft_input_and_labels(item, tokenizer, data_args, max_seq_len)
+        input_ids, labels, attention_mask = _build_sft_input_and_labels(item, tokenizer, data_args, max_seq_len)
         meta = item.get("metadata", {}) or {}
         task = meta.get("task", "default")
         return {
             "input_ids": input_ids,
             "labels": labels,
             "task_type": task,
+            "attention_mask": attention_mask
         }
 
     # -------- pretrain / others --------
@@ -235,83 +238,92 @@ class PackingDataCollator:
         all_ids = []
         all_labels = []
         all_tasks = []
-        labels_exist = False
+        # labels_exist = False
 
-        for f in batch:
-            if "input_ids_chunks" in f:
-                all_ids.extend(f["input_ids_chunks"])
-                all_tasks.append(f.get("task_type", "default"))
-                continue
-
-            all_ids.append(f["input_ids"])
-            all_tasks.append(f.get("task_type", "default"))
-
-            if "labels" in f:
-                labels_exist = True
-                all_labels.append(f["labels"])
-            else:
-                all_labels.append(None)
-
-        # packing mode
-        if self.data_args.use_packing:
-            packed_ids, packed_labels = self._pack_sequences(
-                all_ids, all_labels if labels_exist else None
-            )
-
-            B = len(packed_ids)
-            ids_t = torch.full((B, self.max_seq_len), self.tokenizer.pad_token_id, dtype=torch.long)
-            lab_t = torch.full((B, self.max_seq_len), -100, dtype=torch.long)
-            mask = torch.zeros((B, self.max_seq_len), dtype=torch.long)
-
-            for i, (inp, lab) in enumerate(zip(packed_ids, packed_labels)):
-                L = len(inp)
-                ids_t[i, :L] = torch.tensor(inp)
-                lab_t[i, :L] = torch.tensor(lab)
-                mask[i, :L] = 1
-
-            return {
-                "input_ids": ids_t,
-                "labels": lab_t,
-                "attention_mask": mask,
-                "task_type": all_tasks,
-            }
-
-        # no packing
-        kept_ids = []
-        kept_labels = []
-        is_sft = self.data_args.task_type == "sft"
-
-        for seq, lab in zip(all_ids, all_labels):
-            if len(seq) > self.max_seq_len:
-                if is_sft:
-                    continue
-                seq = seq[: self.max_seq_len]
-
-            if lab is None:
-                lab = seq.copy()
-                if lab:
-                    lab[0] = -100
-
-            kept_ids.append(seq)
-            kept_labels.append(lab)
-
-        B = len(kept_ids)
-        ids_t = torch.full((B, self.max_seq_len), self.tokenizer.pad_token_id, dtype=torch.long)
-        lab_t = torch.full((B, self.max_seq_len), -100, dtype=torch.long)
-        mask = torch.zeros((B, self.max_seq_len), dtype=torch.long)
-
-        for i, (inp, lab) in enumerate(zip(kept_ids, kept_labels)):
-            L = len(inp)
-            ids_t[i, :L] = torch.tensor(inp)
-            lab_t[i, :L] = torch.tensor(lab)
-            mask[i, :L] = 1
-
-        return {
-            "input_ids": ids_t,
-            "labels": lab_t,
-            "attention_mask": mask,
+        all_ids = torch.cat([item['input_ids'] for item in batch], dim=0)
+        all_labels = torch.cat([item['labels'] for item in batch], dim=0)
+        all_tasks = [item.get("task_type", "default") for item in batch]
+        attention_mask = torch.cat([item['attention_mask'] for item in batch], dim=0)
+        
+        res = {
+            "input_ids": all_ids,
+            "labels": all_labels,
+            "attention_mask": attention_mask,
             "task_type": all_tasks,
         }
+        
+        return res
+        
+        # for f in batch:
+        #     if "input_ids_chunks" in f:
+        #         all_ids.extend(f["input_ids_chunks"])
+        #         all_tasks.append(f.get("task_type", "default"))
+        #         continue
+        #     all_ids.append(f["input_ids"])
+        #     all_tasks.append(f.get("task_type", "default"))
+
+        #     if "labels" in f:
+        #         labels_exist = True
+        #         all_labels.append(f["labels"])
+        #     else:
+        #         all_labels.append(None)
+
+        # # packing mode
+        # if self.data_args.use_packing:
+        #     packed_ids, packed_labels = self._pack_sequences(
+        #         all_ids, all_labels if labels_exist else None
+        #     )
+
+        #     B = len(packed_ids)
+        #     ids_t = torch.full((B, self.max_seq_len), self.tokenizer.pad_token_id, dtype=torch.long)
+        #     lab_t = torch.full((B, self.max_seq_len), -100, dtype=torch.long)
+        #     mask = torch.zeros((B, self.max_seq_len), dtype=torch.long)
+
+        #     for i, (inp, lab) in enumerate(zip(packed_ids, packed_labels)):
+        #         L = len(inp)
+        #         ids_t[i, :L] = torch.tensor(inp)
+        #         lab_t[i, :L] = torch.tensor(lab)
+        #         mask[i, :L] = 1
+
+        #     return {
+        #         "input_ids": ids_t,
+        #         "labels": lab_t,
+        #         "attention_mask": mask,
+        #         "task_type": all_tasks,
+        #     }
+
+        # # no packing
+        # kept_ids = []
+        # kept_labels = []
+        # is_sft = self.data_args.task_type == "sft"
+        
+        # breakpoint()
+
+        # for seq, lab in zip(all_ids, all_labels):
+        #     if len(seq) > self.max_seq_len:
+        #         # if is_sft:
+        #         #     continue
+        #         seq = seq[: self.max_seq_len]
+
+        #     if lab is None:
+        #         lab = seq.copy()
+        #         if lab:
+        #             lab[0] = -100
+
+        #     kept_ids.append(seq)
+        #     kept_labels.append(lab)
+
+        # B = len(kept_ids)
+        # ids_t = torch.full((B, self.max_seq_len), self.tokenizer.pad_token_id, dtype=torch.long)
+        # lab_t = torch.full((B, self.max_seq_len), -100, dtype=torch.long)
+        # mask = torch.zeros((B, self.max_seq_len), dtype=torch.long)
+        # for i, (inp, lab) in enumerate(zip(kept_ids, kept_labels)):
+        #     L = len(inp)
+        #     L_label= sum(l != -100 for l in lab)
+        #     ids_t[i, :L] = inp
+        #     lab_t[i, :L] = lab
+        #     mask[i, :L_label] = 1
+        
 
 
 # =========================================================
@@ -359,15 +371,35 @@ def _build_sft_input_and_labels(item, tokenizer, data_args, max_seq_len):
     meta = item.get("metadata", {}) or {}
     flag = str(meta.get("flag", "0"))
 
+    task_type = "Other"
+    try:
+        meta_dict = ast.literal_eval(meta) if isinstance(meta, str) else meta
+        task_type = meta_dict.get('task', 'Other')
+    except Exception:
+        pass
+
+    if task_type == 'Single QA':
+        task_token = '[TASK_SQA]'
+    elif task_type == 'MultiHop QA': # 注意检查数据里的具体拼写，如 "Multi-hop QA"
+        task_token = '[TASK_MHQA]'
+    elif task_type == 'Summarization':
+        task_token = '[TASK_SUM]'
+    elif task_type == 'Code':
+        task_token = '[TASK_CODE]'
+    else:
+        task_token = '[TASK_OTHER]'
     # -------- 构造 full 文本 --------
     if flag == "1":
-        prompt_text = q
+        prompt_content = q
     else:
         if ctx and q:
-            prompt_text = ctx.rstrip() + "\n" + q.lstrip()
+            prompt_content = ctx.rstrip() + "\n" + q.lstrip()
         else:
-            prompt_text = (ctx or q)
+            prompt_content = (ctx or q)
 
+    # Construct prompt_text
+    prompt_text = task_token + "\n" + prompt_content.lstrip()
+    
     separator = "\n\n"
     full_text = prompt_text + separator + a if a else prompt_text
 
@@ -378,20 +410,19 @@ def _build_sft_input_and_labels(item, tokenizer, data_args, max_seq_len):
         max_length=max_seq_len,
         padding="max_length",
         add_special_tokens=True,
-        return_tensors=None,
+        return_tensors="pt",
     )
-    input_ids = encoding["input_ids"]
-    attention_mask = encoding["attention_mask"]
+    
+    input_ids, attention_mask = encoding["input_ids"], encoding["attention_mask"]
+    labels = torch.where(attention_mask == 1, input_ids, -100)
 
-    labels = input_ids.copy()
+    # labels = [-100] * len(input_ids)
 
-    # Mask padding tokens to -100 (PyTorch ignore_index)
-    labels = [
-        label if mask == 1 else -100
-        for label, mask in zip(labels, attention_mask)
-    ]
-
-    return input_ids, labels
+    # labels = [
+    #     label if mask == 1 else -100
+    #     for label, mask in zip(labels, attention_mask)
+    # ]
+    return input_ids, labels, attention_mask
 
 
 # =========================================================

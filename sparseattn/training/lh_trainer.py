@@ -287,22 +287,22 @@ class Trainer(HFTrainer):
             self.sparsity_warmup_ratio * self.args.max_steps
         )
         
-        self.task_sparsity_config = {
-            "default": {"start": self.start_head_sparsity, "end": self.end_head_sparsity},
-            "Code": {"start": 0.1, "end": 0.7},
-            "Math": {"start": 0.0, "end": 0.6},
-            "MultiHop QA": {"start": 0.2, "end": 0.5},
-            "Single QA": {"start": 0.1, "end": 0.7},
-            "Summarization": {"start": 0.3, "end": 0.6},
-        }
         # self.task_sparsity_config = {
         #     "default": {"start": self.start_head_sparsity, "end": self.end_head_sparsity},
-        #     "Code": {"start": 0.0, "end": 0.1},
-        #     "Math": {"start": 0.0, "end": 0.1},
-        #     "MultiHop QA": {"start": 0.0, "end": 0.1},
-        #     "Single QA": {"start": 0.0, "end": 0.5},
-        #     "Summarization": {"start": 0.0, "end": 0.1},
+        #     "Code": {"start": 0.1, "end": 0.7},
+        #     "Math": {"start": 0.0, "end": 0.6},
+        #     "MultiHop QA": {"start": 0.2, "end": 0.5},
+        #     "Single QA": {"start": 0.1, "end": 0.7},
+        #     "Summarization": {"start": 0.3, "end": 0.6},
         # }
+        self.task_sparsity_config = {
+            "default": {"start": self.start_head_sparsity, "end": self.end_head_sparsity},
+            "Code": {"start": 0.0, "end": 0.2},
+            "Math": {"start": 0.0, "end": 0.1},
+            "MultiHop QA": {"start": 0.0, "end": 0.4},
+            "Single QA": {"start": 0.0, "end": 0.3},
+            "Summarization": {"start": 0.0, "end": 0.7},
+        }
 
 
         if not dist.is_initialized() or args.seq_parallel_size == dist.get_world_size():
@@ -453,8 +453,8 @@ class Trainer(HFTrainer):
         unique_tasks = list(set(tasks))
         mean_spars = {t: target_sparsity[i].item() for i, t in enumerate(tasks[:3])}
         print(f"[Step {self.state.global_step}] Sample tasks: {tasks[:3]} → sparsity: {[f'{s:.3f}' for s in target_sparsity[:3].tolist()]}")
-        attn_mask = inputs["attention_mask"]
-        valid_tokens = attn_mask.sum(dim=1)
+        attention_mask = inputs.get("attention_mask")
+        valid_tokens = attention_mask.sum(dim=1)
         print(f"Rank {torch.distributed.get_rank() if torch.distributed.is_initialized() else 0}: "
             f"valid tokens per sample = {valid_tokens.tolist()}, total = {valid_tokens.sum().item()}")
         try:
@@ -1320,74 +1320,74 @@ class Trainer(HFTrainer):
 
         return metrics
 
-    def get_train_dataloader(self):
-        """
-        Because streaming handles the distributed data parallel by itself, we don't need special data loader.
-        The plainest data loader is enough.
-        """
-        if not isinstance(self.train_dataset, StreamingParquetIterable):
-            return super().get_train_dataloader()
+    # def get_train_dataloader(self):
+    #     """
+    #     Because streaming handles the distributed data parallel by itself, we don't need special data loader.
+    #     The plainest data loader is enough.
+    #     """
+    #     if not isinstance(self.train_dataset, StreamingParquetIterable):
+    #         return super().get_train_dataloader()
 
-        if not self.args.streaming_dataset:
-            return super().get_train_dataloader()
+    #     if not self.args.streaming_dataset:
+    #         return super().get_train_dataloader()
 
-        logger.warning("Use streaming dataloader for train")
+    #     logger.warning("Use streaming dataloader for train")
 
-        if self.train_dataset is None:
-            raise ValueError("Trainer: training requires a train_dataset.")
+    #     if self.train_dataset is None:
+    #         raise ValueError("Trainer: training requires a train_dataset.")
 
-        train_dataset = self.train_dataset
-        data_collator = self.data_collator
-        data_collator = self._get_collator_with_removed_columns(
-            data_collator, description="training"
-        )
+    #     train_dataset = self.train_dataset
+    #     data_collator = self.data_collator
+    #     data_collator = self._get_collator_with_removed_columns(
+    #         data_collator, description="training"
+    #     )
 
-        dataloader_params = {
-            "batch_size": self._train_batch_size,
-            "collate_fn": data_collator,
-            "num_workers": self.args.dataloader_num_workers,
-            "pin_memory": self.args.dataloader_pin_memory,
-            "persistent_workers": self.args.dataloader_persistent_workers,
-        }
+    #     dataloader_params = {
+    #         "batch_size": self._train_batch_size,
+    #         "collate_fn": data_collator,
+    #         "num_workers": self.args.dataloader_num_workers,
+    #         "pin_memory": self.args.dataloader_pin_memory,
+    #         "persistent_workers": self.args.dataloader_persistent_workers,
+    #     }
 
-        # Streaming is iterable so no need to set sampler etc.
+    #     # Streaming is iterable so no need to set sampler etc.
 
-        # Instead of use accelerate to prepare the dataloader, we just return a plain dataloader
-        self.train_dataloader = DataLoader(train_dataset, **dataloader_params)
-        # This actually uses the dataset first dimension......
+    #     # Instead of use accelerate to prepare the dataloader, we just return a plain dataloader
+    #     self.train_dataloader = DataLoader(train_dataset, **dataloader_params)
+    #     # This actually uses the dataset first dimension......
 
-        return self.train_dataloader
+    #     return self.train_dataloader
 
-    def get_eval_dataloader(self, eval_dataset):
-        """
-        Because streaming handles the distributed data parallel by itself, we don't need special data loader.
-        The plainest data loader is enough.
-        """
-        if not self.args.streaming_dataset:
-            return super().get_eval_dataloader()
+    # def get_eval_dataloader(self, eval_dataset):
+    #     """
+    #     Because streaming handles the distributed data parallel by itself, we don't need special data loader.
+    #     The plainest data loader is enough.
+    #     """
+    #     if not self.args.streaming_dataset:
+    #         return super().get_eval_dataloader()
 
-        logger.warning("Use streaming dataloader for val")
+    #     logger.warning("Use streaming dataloader for val")
 
-        if eval_dataset is None and self.eval_dataset is None:
-            raise ValueError("Trainer: evaluation requires an eval_dataset.")
-        eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
-        data_collator = self.data_collator
-        data_collator = self._get_collator_with_removed_columns(
-            data_collator, description="evaluation"
-        )
+    #     if eval_dataset is None and self.eval_dataset is None:
+    #         raise ValueError("Trainer: evaluation requires an eval_dataset.")
+    #     eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
+    #     data_collator = self.data_collator
+    #     data_collator = self._get_collator_with_removed_columns(
+    #         data_collator, description="evaluation"
+    #     )
 
-        dataloader_params = {
-            "batch_size": self.args.eval_batch_size,
-            "collate_fn": data_collator,
-            "num_workers": self.args.dataloader_num_workers,
-            "pin_memory": self.args.dataloader_pin_memory,
-            "persistent_workers": self.args.dataloader_persistent_workers,
-        }
+    #     dataloader_params = {
+    #         "batch_size": self.args.eval_batch_size,
+    #         "collate_fn": data_collator,
+    #         "num_workers": self.args.dataloader_num_workers,
+    #         "pin_memory": self.args.dataloader_pin_memory,
+    #         "persistent_workers": self.args.dataloader_persistent_workers,
+    #     }
 
-        # Streaming is iterable so no need to set sampler etc.
+    #     # Streaming is iterable so no need to set sampler etc.
 
-        # Instead of use accelerate to prepare the dataloader, we just return a plain dataloader
-        return StreamingDataLoader(eval_dataset, **dataloader_params)
+    #     # Instead of use accelerate to prepare the dataloader, we just return a plain dataloader
+    #     return StreamingDataLoader(eval_dataset, **dataloader_params)
 
     def _save_checkpoint(self, model, trial, metrics=None):
         # A wrapper around the original _save_checkpoint function to save streaming dataset state

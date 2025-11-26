@@ -1065,7 +1065,6 @@ class MaskAllocator(nn.Module):
 #         # ---- chunk-level compression ----
 #         pooled, attn_chunks = self._compress_seq_to_chunks(pooled_input)  # [B, C, H, D]
 
-#         # breakpoint()
 #         x = pooled.mean(dim=1)  # [B, H, D]
 #         logits = self.dim_mapping(x)  # [B, H, 2]
 #         logits = torch.tanh(logits) * 5.0
@@ -1231,7 +1230,11 @@ class AttentionRouter(nn.Module):
         if use_task_emb:
             self.task_emb = nn.Parameter(torch.randn(1, d_feature) * 0.02)
 
-        self.register_buffer("log_temp", torch.log(torch.tensor(temp)))
+        # ---- learnable temperature ----
+        if learnable_temp:
+            self.log_temp = nn.Parameter(torch.log(torch.tensor(temp)))
+        else:
+            self.register_buffer("log_temp", torch.log(torch.tensor(temp)))
 
     def forward(self, pooled_input):
         """
@@ -1246,7 +1249,8 @@ class AttentionRouter(nn.Module):
         """
         B, S, H, D = pooled_input.shape
 
-        x = pooled_input.mean(dim=1)  # [B, H, D]
+        # 采用第一个Special Token 作为输入
+        x = pooled_input[:, 0, :, :]  # [B, H, D]
 
         if self.use_task_emb:
             x = x + self.task_emb
@@ -1262,12 +1266,8 @@ class AttentionRouter(nn.Module):
         if self.training:
             eps = 1e-8
             logits = logits + eps * torch.randn_like(logits)
-            print(f"logits: {logits.mean()}, tau: {tau}")
             decisions = F.gumbel_softmax(logits, tau=tau, hard=False)
-            print(f"decisions: {decisions}")
             hard_decisions = F.gumbel_softmax(logits, tau=tau, hard=True)
-            print(f"hard_decisions: {hard_decisions}")
-            # breakpoint()
         else:
             decisions = F.softmax(logits / tau, dim=-1)
             hard_decisions = torch.zeros_like(decisions)
@@ -1720,6 +1720,7 @@ class Qwen3Attention(nn.Module):
             )
 
         if self.toggle_type == "streaming" or self.toggle_type == "triangle":
+            # breakpoint()
             if unpadded_lengths is not None:
                 cu_seqlens, max_seqlen = unpadded_lengths
                 cw_attn_output = streaming_attn_varlen_kvpacked_func(
@@ -1921,9 +1922,9 @@ class Qwen3Attention(nn.Module):
         else:
             raise ValueError(f"Unknown toggle type: {self.toggle_type}")
 
-        effective_attn_output = attn_output * z.unsqueeze(-1) + cw_attn_output * (
+        effective_attn_output = attn_output * z[:,None,:,None] + cw_attn_output * (
             1 - z
-        ).unsqueeze(-1)
+        )[:,None,:,None]
 
         return effective_attn_output
 
@@ -1960,7 +1961,6 @@ class Qwen3Attention(nn.Module):
         else:
             target_x = q
             if unpadded_lengths is not None:
-                # breakpoint()
                 cu_seqlens, _ = unpadded_lengths
                 B = cu_seqlens.numel() - 1
                 pooled_list = []
@@ -2538,6 +2538,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
             if target_sparsity is None:
                 z_loss = None
             else:
+                
                 z_loss = (
                     self.sparsity_lambda_1.reshape([])
                     * (model_sparsity - target_sparsity)
@@ -2864,9 +2865,9 @@ class PawQwen3ForCausalLM(Qwen3PreTrainedModel):
                 )
             else:
                 bsz = input_ids.size(0)
-                input_ids, unpad_indices, cu_seqlens, max_seqlen = unpad_input(
-                    input_ids.unsqueeze(-1), attention_mask
-                )
+                tmp = input_ids.unsqueeze(-1)
+                input_ids, unpad_indices, cu_seqlens, max_seqlen = unpad_input(tmp, attention_mask)
+                max_seqlen_for_pad_seq = attention_mask.size(-1)
                 input_ids = input_ids.squeeze(-1)
             unpadded_lengths = (cu_seqlens, max_seqlen)
         else:
@@ -2888,20 +2889,17 @@ class PawQwen3ForCausalLM(Qwen3PreTrainedModel):
             target_sparsity=target_sparsity,
         )
         hidden_states = outputs[0]
-
         if seq_lengths is None and unpadded_lengths is not None:
-            hidden_states = pad_input(hidden_states, unpad_indices, bsz, max_seqlen)
-
+            hidden_states = pad_input(hidden_states, unpad_indices, bsz, max_seqlen_for_pad_seq)
         if labels is not None or shifted_labels is not None:
             if shifted_labels is not None:
                 labels = shifted_labels.reshape(-1)
                 hidden_states = hidden_states.reshape(-1, hidden_states.size(-1))
             else:
-                labels = labels[..., 1:].reshape(-1)
+                labels = labels[..., 1:].reshape(-1).contiguous()
                 hidden_states = hidden_states[..., :-1, :].reshape(
                     -1, hidden_states.size(-1)
-                )
-
+                ).contiguous()
             if self.logit_block_size > 0:
                 num_valid_labels = (labels != -100).sum()
                 hidden_states = torch.split(hidden_states, self.logit_block_size, dim=0)
