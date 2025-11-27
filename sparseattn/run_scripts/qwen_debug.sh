@@ -1,7 +1,7 @@
 # Model and training configuration
 model=${MODEL:-"/data1/hf_model/Qwen3-4B"}
 bsz=${BSZ:-16}
-seq=${SEQ:-1}
+seq=${SEQ:-2}
 lr=${LR:-1e-5}
 steps=${STEPS:-1000}
 save_steps=${SAVE:-500}
@@ -49,7 +49,7 @@ layerwise_sparsity_weight=${LAYERWISE_SPARSITY_WEIGHT:-1.0}
 erank_analysis_path="/"
 
 # Dataset configuration
-dataset=${DATASET:-"/data1/public_data/mix_sft_64k"}
+dataset=${DATASET:-"/data1/public_data/for_debug_mix_sft_64k"}
 # dataset=${DATASET:-"/data1/public_data/Pre_filter"}
 task_type="sft" # pretrain or sft
 
@@ -193,6 +193,8 @@ base_arguments=(
     --layerwise_sparsity_power $layerwise_sparsity_power
     --layerwise_sparsity_weight $layerwise_sparsity_weight
     --erank_analysis_path $erank_analysis_path
+
+    --data_cache_dir "data_cache/sft"
 )
 
 # FSDP configuration

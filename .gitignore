@@ -205,3 +205,4 @@ htmlcov/
 
 # Test results
 pytest_cache/
+sparseattn/data_cache
