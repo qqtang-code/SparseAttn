@@ -64,6 +64,7 @@ from .attention_mask import (
     sample_z_from_log_alpha,
     cdf_stretched_concrete,
 )
+from sparseattn.src.Xattention import Xattention_prefill_dim3, Xattention_prefill_dim4
 
 logger = logging.get_logger(__name__)
 
@@ -1863,49 +1864,59 @@ class Qwen3Attention(nn.Module):
             #     pdb.set_trace()
             # set_pdb_trace(0)
             if not self.training :
-                _, seq_len, _, _ = q.size()         
+                _, seq_len, _, _ = q.size()       
             if self.training or seq_len != 1:
-                if q.dim() == 3:
-                    q = q.unsqueeze(0)
-                    k = k.unsqueeze(0)
-                    v = v.unsqueeze(0)
-                k = k.repeat_interleave(self.num_key_value_groups, dim=2)
-                v = v.repeat_interleave(self.num_key_value_groups, dim=2)
-                q, k, v = q.transpose(1,2).contiguous(), k.transpose(1,2).contiguous(), v.transpose(1,2).contiguous()  # B,H,T,D
+
+                is_vlen_input = (q.dim() == 3) and (unpadded_lengths is not None)
+
+                if is_vlen_input:
+                    k = k.repeat_interleave(self.num_key_value_groups, dim=1)
+                    v = v.repeat_interleave(self.num_key_value_groups, dim=1)
+                    q, k, v = q.transpose(0, 1).contiguous(), k.transpose(0, 1).contiguous(), v.transpose(0, 1).contiguous() 
+                else:
+                    k = k.repeat_interleave(self.num_key_value_groups, dim=2)
+                    v = v.repeat_interleave(self.num_key_value_groups, dim=2)
+                    q, k, v = q.transpose(1, 2).contiguous(), k.transpose(1, 2).contiguous(), v.transpose(1, 2).contiguous() 
+                    
                 stride = self.xattn_params["stride"]
                 threshold = self.xattn_params["threshold"]
                 norm = self.xattn_params["norm"]
-                from sparseattn.src.Xattention import Xattention_prefill
-                try:
-                    if unpadded_lengths is not None:
-                        # varlen, ignore padding tokens, efficient for large batch with many paddings
-                        cu_seqlens, max_seqlen = unpadded_lengths
-                        cw_attn_output = Xattention_prefill(
-                            q,
-                            k,
-                            v,
-                            stride,
-                            cu_seqlens,
-                            norm,
-                            threshold,
-                            use_triton=True,
-                        ).transpose(1,2)  # B,T,H,D
-                    else:
-                        cw_attn_output = Xattention_prefill(
-                            q,
-                            k,
-                            v,
-                            stride,
-                            
-                            norm,
-                            threshold,
-                            use_triton=True,
-                        ).transpose(1,2)  # B,T,H,D
-                except Exception as e:
-                    print("==================================================\n")
-                    print(f"q.shape{q.shape},k.shape{k.shape},v.shape{v.shape}")
-                    print("==================================================\n")
-                    raise e
+
+                if unpadded_lengths is not None:
+                    cu_seqlens, max_seqlen = unpadded_lengths
+                    cw_attn_output = Xattention_prefill_dim3(
+                        q,
+                        k,
+                        v,
+                        stride,
+                        cu_seqlens,
+                        norm,
+                        threshold,
+                        use_triton=True,
+                    )
+
+                else:
+                    bsz,_,seqlen,_ = q.size()
+                    if not torch.is_tensor(seqlen):
+                        seqlen = torch.tensor(seqlen, dtype=torch.int32, device=q.device)
+                    max_seqlen = torch.max(seqlen).item()
+
+                    cu_seqlens = torch.arange(
+                        0, (bsz + 1) * seqlen, step=seqlen, dtype=torch.int32, device=q.device
+                    )
+                    unpadded_lengths = (cu_seqlens, max_seqlen)
+
+                    cu_seqlens, max_seqlen = unpadded_lengths
+                    cw_attn_output = Xattention_prefill_dim4(
+                        q,
+                        k,
+                        v,
+                        stride,
+                        cu_seqlens,
+                        norm,
+                        threshold,
+                        use_triton=True,
+                    ).transpose(1, 2)  # B, T, H, D
             else:
                 if unpadded_lengths is not None:
                     # varlen, ignore padding tokens, efficient for large batch with many paddings
@@ -2071,11 +2082,8 @@ class Qwen3Attention(nn.Module):
             kwargs = {}
 
         attn_output = attention_func(q, kv, k, v, unpadded_lengths, z, **kwargs)
-        if k.dim() == 3:
-            attn_output = attn_output.squeeze(0)
-        attn_output = attn_output.reshape(
-            *attn_output.shape[:-2], self.num_heads * self.head_dim
-        )
+
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output.to(self.o_proj.weight.dtype))
 
         attn_weights = None
