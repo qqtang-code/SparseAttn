@@ -38,7 +38,7 @@ class DataArguments:
     prepack: bool = False
     streaming: bool = False
     min_seq_len: Optional[int] = 1000
-    task_type: str = "pretrain"   # <-- unified
+    task_type: str = "pretrain" 
     use_packing: bool = False
     data_cache_dir: Optional[str] = None
 

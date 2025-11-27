@@ -6,7 +6,7 @@ import numpy as np
 
 # --- 1. 配置路径和目标稀疏度 ---
 # 将此变量设置为您的日志文件路径
-log_file_path = "/data1/lcm_lab/qqt/SparseAttn/sparseattn/checkpoints/masksonly_Qwen3-4B_bsz16_steps1000_lr1e-5_warmup0.1_sp0.3_cw2048_mlr1.0_rlr1.0sft3_pretrain_64k_task_xattn_entropy_5reg_nolinear_11.21_wfrozen/log.out"
+log_file_path = "/data1/lcm_lab/qqt/SparseAttn/sparseattn/checkpoints/masksonly_Qwen3-4B_bsz16_steps1000_lr1e-5_warmup0.1_sp0.3_cw2048_mlr1.0_rlr1.0sft3_64k_pretrain_xattn_adarouter_20reg_nolinear_specialtoken_newtasksparsity_11.25_wfrozen/log.out"
 
 # 您提供的目标稀疏度配置
 TASK_SPARSITY_CONFIG = {
