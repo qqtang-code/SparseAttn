@@ -35,7 +35,8 @@ For more information, visit: https://github.com/qqtang-code/SparseAttn
 
 # Core sparse attention implementations
 from .src import (
-    Xattention_prefill,
+    Xattention_prefill_dim3,
+    Xattention_prefill_dim4,
     Flexprefill_prefill,
     Minference_prefill,
     Full_prefill,
@@ -53,7 +54,7 @@ from .threshold import (
 from .training import DistributedAttention
 
 # For backward compatibility and ease of use
-Xattention = Xattention_prefill
+Xattention = Xattention_prefill_dim4
 FlexPrefill = Flexprefill_prefill
 Minference = Minference_prefill
 FullPrefill = Full_prefill

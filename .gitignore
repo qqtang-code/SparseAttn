@@ -20,6 +20,7 @@ eval/RULER/.vscode/
 sparseattn/eval/outputs/
 output/*
 sparseattn/eval/data/
+sparseattn/data_cache/
 
 sparseattn/scripts/
 output/*

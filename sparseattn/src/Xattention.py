@@ -810,11 +810,12 @@ def xattn_estimate(
     return attn_sums, simple_masks
 
 
-def Xattention_prefill(
+def Xattention_prefill_dim4(
     query_states: torch.Tensor,
     key_states: torch.Tensor,
     value_states: torch.Tensor,
     stride,
+    cu_seq_lens,
     norm=1,
     threshold=0.8,
     block_size=128,
@@ -825,36 +826,92 @@ def Xattention_prefill(
     keep_sink=False,
     keep_recent=False,
 ):
-    batch_size, num_heads, k_len, head_dim = key_states.shape
-    _, _, q_len, _ = query_states.shape
+    batch_size, num_heads, max_q_len, head_dim = query_states.shape
+    _, _, max_k_len, _ = key_states.shape
+    
+    # 计算每个batch的有效长度
+    valid_lengths = cu_seq_lens[1:] - cu_seq_lens[:-1]
+    
+    max_q_blocks_of_return = 0#表示返回的mask.shape[2]
+    max_k_blocks_of_return = 0#表示返回的mask.shape[3]
 
-    q_block_num = (q_len + block_size - 1) // block_size
-    k_block_num = (k_len + block_size - 1) // block_size
-    if chunk_size is None:
-        chunk_size = int(
-            max(
-                min(
-                    max(2048, 1 << (k_len - 1).bit_length()),
-                    128 * 1024 * 2048 // (1 << (k_len - 1).bit_length()),
-                ),
-                2048,
+    # 存储每个batch的结果
+    approx_simple_mask_list = []
+
+    # 对每个batch单独处理
+    for i in range(batch_size):
+        valid_len = valid_lengths[i]
+        
+        # 截取当前batch的有效token部分
+        current_query = query_states[i:i+1, :, :valid_len, :]  # [1, num_heads, valid_len, head_dim]
+        current_key = key_states[i:i+1, :, :valid_len, :]      # [1, num_heads, valid_len, head_dim]
+        
+        _, _, current_k_len, _ = current_key.shape
+        current_q_len = current_k_len
+        #这个chunk_size是什么意思？为什么是16384？16384=128*128
+        if chunk_size is None:
+            chunk_size = int(
+                max(
+                    min(
+                        max(2048, 1 << (current_k_len - 1).bit_length()),
+                        128 * 1024 * 2048 // (1 << (current_k_len - 1).bit_length()),
+                    ),
+                    2048,
+                )
             )
+        
+        # 调用xattn_estimate
+        attn_sum, approx_mask = xattn_estimate(
+            current_query,
+            current_key,
+            block_size=block_size,
+            stride=stride,
+            norm=norm,
+            threshold=threshold,
+            select_mode="inverse",
+            use_triton=use_triton,
+            causal=causal,
+            chunk_size=chunk_size,
+            kdb=kdb,
+            keep_sink=keep_sink,
+            keep_recent=keep_recent,
         )
-    attn_sums, approx_simple_mask = xattn_estimate(
-        query_states,
-        key_states,
-        block_size=block_size,
-        stride=stride,
-        norm=norm,
-        threshold=threshold,
-        select_mode="inverse",
-        use_triton=use_triton,
-        causal=causal,
-        chunk_size=chunk_size,
-        kdb=kdb,
-        keep_sink=keep_sink,
-        keep_recent=keep_recent,
-    )
+        
+        #用于后续填充
+        _, _, q_blocks_of_return, k_blocks_of_return = approx_mask.shape
+        
+        max_q_blocks_of_return = max(max_q_blocks_of_return, q_blocks_of_return)
+        max_k_blocks_of_return = max(max_k_blocks_of_return, k_blocks_of_return)
+  
+        # 计算有效的block数量
+        valid_q_blocks = (valid_len + block_size - 1) // block_size
+        valid_k_blocks = (valid_len + block_size - 1) // block_size
+        
+        approx_mask[:, :, valid_q_blocks:, :] = False
+        approx_mask[:, :, :, valid_k_blocks:] = False
+        
+        
+        approx_simple_mask_list.append(approx_mask)
+    # 填充approx_simple_mask_list中的approx_mask到[1, num_heads, max_q_blocks_of_return, max_k_blocks_of_return]
+    padded_mask_list = []
+    for approx_mask in approx_simple_mask_list:
+        _, _, current_q_blocks, current_k_blocks = approx_mask.shape
+        
+        # 创建填充后的mask
+        padded_mask = torch.zeros(
+            (1, num_heads, max_q_blocks_of_return, max_k_blocks_of_return),
+            dtype=approx_mask.dtype,
+            device=approx_mask.device
+        )
+        
+        # 将原始mask数据复制到填充后的mask中
+        padded_mask[:, :, :current_q_blocks, :current_k_blocks] = approx_mask
+        
+        padded_mask_list.append(padded_mask)
+    
+    # 合并所有batch的结果
+    approx_simple_mask = torch.cat(padded_mask_list, dim=0)  # [batch_size, num_heads, max_q_blocks, max_k_blocks]
+    
     if query_states.device != key_states.device:
         key_states = key_states.to(query_states.device)
     if query_states.device != value_states.device:
@@ -863,56 +920,274 @@ def Xattention_prefill(
         approx_simple_mask = approx_simple_mask.to(query_states.device)
 
     ####################
-    # assert block_size == 128
-    # assert batch_size == 1
-    query_states = query_states.transpose(1, 2).view(q_len, num_heads, head_dim)
-    key_states = key_states.transpose(1, 2).view(k_len, num_heads, head_dim)
-    value_states = value_states.transpose(1, 2).view(k_len, num_heads, head_dim)
-    q_cu_seq_lens = torch.tensor(
-        [0, q_len], dtype=torch.int32, device=query_states.device
+    # 根据 cu_seq_lens 转换为去填充格式
+    total_seq_len = cu_seq_lens[-1].item()  # 总的有效token数
+    
+    # 创建去填充的张量
+    unpadded_query_states = torch.zeros(
+        (total_seq_len, num_heads, head_dim), 
+        dtype=query_states.dtype, 
+        device=query_states.device
     )
-    k_cu_seq_lens = torch.tensor(
-        [0, k_len], dtype=torch.int32, device=query_states.device
+    unpadded_key_states = torch.zeros(
+        (total_seq_len, num_heads, head_dim), 
+        dtype=key_states.dtype, 
+        device=key_states.device
     )
+    unpadded_value_states = torch.zeros(
+        (total_seq_len, num_heads, head_dim), 
+        dtype=value_states.dtype, 
+        device=value_states.device
+    )
+    
+    # 填充数据
+    for i in range(batch_size):
+        start_idx = cu_seq_lens[i].item()
+        end_idx = cu_seq_lens[i + 1].item()
+        seq_len_i = end_idx - start_idx
+        
+        # 获取当前batch的有效token数
+        actual_seq_len = seq_len_i
+        
+        # 转换维度并复制数据
+        # query_states形状: [batch_size, num_heads, q_len, head_dim]
+        unpadded_query_states[start_idx:start_idx + actual_seq_len] = (
+            query_states[i, :, :actual_seq_len, :].transpose(0, 1)  # [actual_seq_len, num_heads, head_dim]
+        )
+        unpadded_key_states[start_idx:start_idx + actual_seq_len] = (
+            key_states[i, :, :actual_seq_len, :].transpose(0, 1)    # [actual_seq_len, num_heads, head_dim]
+        )
+        unpadded_value_states[start_idx:start_idx + actual_seq_len] = (
+            value_states[i, :, :actual_seq_len, :].transpose(0, 1)  # [actual_seq_len, num_heads, head_dim]
+        )
+    
+
+    query_states = unpadded_query_states
+    key_states = unpadded_key_states
+    value_states = unpadded_value_states
+    
     head_mask_type = torch.tensor(
         [1 for _ in range(num_heads)], device=query_states.device, dtype=torch.int32
     )
     assert head_mask_type.device == query_states.device
-    assert q_cu_seq_lens.device == query_states.device
-    assert k_cu_seq_lens.device == query_states.device
+    assert cu_seq_lens.device == query_states.device
     assert key_states.device == query_states.device
     assert value_states.device == query_states.device
     assert approx_simple_mask.device == query_states.device
-    try:
-        attn_output = block_sparse_attn_func(
-            query_states,
-            key_states,
-            value_states,
-            q_cu_seq_lens,
-            k_cu_seq_lens,
-            head_mask_type,
-            None,
-            approx_simple_mask[:, :, :q_block_num, :k_block_num].contiguous(),
-            q_len,
-            k_len,
-            p_dropout=0.0,
-            deterministic=True,
-            is_causal=causal,
-        )
-    except Exception as e:
-        print("+++++++++++++++++++++++++++++++++++++++++++++\n")
-        print(f"q.shape{query_states.shape},k.shape{key_states.shape},v.shape{value_states.shape}, approx_simple_mask:{approx_simple_mask.shape},q_block_num:{q_block_num},k_block_num:{k_block_num},approx_simple_mask[:, :, :q_block_num, :k_block_num]:{approx_simple_mask[:, :, :q_block_num, :k_block_num].shape}")
-        print("+++++++++++++++++++++++++++++++++++++++++++++\n")
-    attn_output = attn_output.view(batch_size, q_len, num_heads, head_dim).transpose(
-        1, 2
+    
+    max_q_block_num = (max_q_len + block_size - 1) // block_size
+    max_k_block_num = (max_k_len + block_size - 1) // block_size
+    attn_output = block_sparse_attn_func(
+        query_states,
+        key_states,
+        value_states,
+        cu_seq_lens,
+        cu_seq_lens,
+        head_mask_type,
+        None,
+        approx_simple_mask[:, :, :max_q_block_num, :max_k_block_num].contiguous(),
+        max_q_len,
+        max_k_len, 
+        p_dropout=0.0,
+        deterministic=True,
+        is_causal=causal,
     )
+    
+    # 将输出转换回批处理格式
+    attn_output_batch = []
+    for i in range(batch_size):
+        start_idx = cu_seq_lens[i].item()
+        end_idx = cu_seq_lens[i + 1].item()
+        seq_len_i = end_idx - start_idx
+        actual_seq_len = min(seq_len_i, max_q_len)
+        
+        # 获取当前batch的输出并转换维度
+        batch_output = attn_output[start_idx:start_idx + actual_seq_len]  # [actual_seq_len, num_heads, head_dim]
+        batch_output = batch_output.transpose(0, 1).unsqueeze(0)  # [1, num_heads, actual_seq_len, head_dim]
+        
+        # 如果需要填充到原始长度
+        if actual_seq_len < max_q_len:
+            pad_size = max_q_len - actual_seq_len
+            batch_output = F.pad(batch_output, (0, 0, 0, pad_size, 0, 0, 0, 0))
+        
+        attn_output_batch.append(batch_output)
+    
+    attn_output = torch.cat(attn_output_batch, dim=0)
     ################################
 
     del query_states
-    num_to_compute = (k_block_num + 1) * k_block_num / 2 * num_heads
+    # num_to_compute = (k_block_num + 1) * k_block_num / 2 * num_heads
 
     # print(f"approximated prefilling Computation: {approx_simple_mask.sum() / num_to_compute}")
-    del approx_simple_mask, attn_sums
+    del approx_simple_mask
+    return attn_output
+
+#此时处理的是unpadded的query_states
+def Xattention_prefill_dim3(
+    query_states: torch.Tensor,
+    key_states: torch.Tensor,
+    value_states: torch.Tensor,
+    stride,
+    cu_seq_lens,
+    norm=1,
+    threshold=0.8,
+    block_size=128,
+    use_triton=True,
+    causal=True,
+    kdb=1,
+    chunk_size=None,
+    keep_sink=False,
+    keep_recent=False,
+):  
+    num_heads, total_len, head_dim = query_states.shape
+    # 计算每个batch的有效长度
+    valid_lengths = cu_seq_lens[1:] - cu_seq_lens[:-1]
+    batch_size = valid_lengths.shape[-1]
+    
+    max_q_blocks_of_return = 0#表示返回的mask.shape[2]
+    max_k_blocks_of_return = 0#表示返回的mask.shape[3]
+
+    # 存储每个batch的结果
+    approx_simple_mask_list = []
+
+    # 对每个batch单独处理
+    for i in range(batch_size):
+        
+        start = cu_seq_lens[i].item()
+        end = cu_seq_lens[i+1].item()
+        valid_len = end - start
+        
+        # 截取当前batch的有效token部分
+        current_query = query_states[:, start: end, :].unsqueeze(0).contiguous() #[1, num_heads, seq_len, head_dim]
+        current_key = key_states[:, start: end, :].unsqueeze(0).contiguous() #[1, num_heads, seq_len, head_dim]
+        
+        _, _, current_k_len, _ = current_key.shape
+        current_q_len = current_k_len
+        #这个chunk_size是什么意思？为什么是16384？16384=128*128
+        if chunk_size is None:
+            chunk_size = int(
+                max(
+                    min(
+                        max(2048, 1 << (current_k_len - 1).bit_length()),
+                        128 * 1024 * 2048 // (1 << (current_k_len - 1).bit_length()),
+                    ),
+                    2048,
+                )
+            )
+        
+        # 调用xattn_estimate
+        attn_sum, approx_mask = xattn_estimate(
+            current_query,
+            current_key,
+            block_size=block_size,
+            stride=stride,
+            norm=norm,
+            threshold=threshold,
+            select_mode="inverse",
+            use_triton=use_triton,
+            causal=causal,
+            chunk_size=chunk_size,
+            kdb=kdb,
+            keep_sink=keep_sink,
+            keep_recent=keep_recent,
+        )
+        
+        #用于后续填充
+        _, _, q_blocks_of_return, k_blocks_of_return = approx_mask.shape
+        
+        max_q_blocks_of_return = max(max_q_blocks_of_return, q_blocks_of_return)
+        max_k_blocks_of_return = max(max_k_blocks_of_return, k_blocks_of_return)
+  
+        # 计算有效的block数量
+        valid_q_blocks = (valid_len + block_size - 1) // block_size
+        valid_k_blocks = (valid_len + block_size - 1) // block_size
+        
+        approx_mask[:, :, valid_q_blocks:, :] = False
+        approx_mask[:, :, :, valid_k_blocks:] = False
+        
+        
+        approx_simple_mask_list.append(approx_mask)
+    # 填充approx_simple_mask_list中的approx_mask到[1, num_heads, max_q_blocks_of_return, max_k_blocks_of_return]
+    padded_mask_list = []
+    for approx_mask in approx_simple_mask_list:
+        _, _, current_q_blocks, current_k_blocks = approx_mask.shape
+        
+        # 创建填充后的mask
+        padded_mask = torch.zeros(
+            (1, num_heads, max_q_blocks_of_return, max_k_blocks_of_return),
+            dtype=approx_mask.dtype,
+            device=approx_mask.device
+        )
+        
+        # 将原始mask数据复制到填充后的mask中
+        padded_mask[:, :, :current_q_blocks, :current_k_blocks] = approx_mask
+        
+        padded_mask_list.append(padded_mask)
+    # 合并所有batch的结果
+    approx_simple_mask = torch.cat(padded_mask_list, dim=0)  # [batch_size, num_heads, max_q_blocks, max_k_blocks]
+    
+    if query_states.device != key_states.device:
+        key_states = key_states.to(query_states.device)
+    if query_states.device != value_states.device:
+        value_states = value_states.to(query_states.device)
+    if approx_simple_mask.device != query_states.device:
+        approx_simple_mask = approx_simple_mask.to(query_states.device)
+
+    ####################
+    head_mask_type = torch.tensor(
+        [1 for _ in range(num_heads)], device=query_states.device, dtype=torch.int32
+    )
+    assert head_mask_type.device == query_states.device
+    assert cu_seq_lens.device == query_states.device
+    assert key_states.device == query_states.device
+    assert value_states.device == query_states.device
+    assert approx_simple_mask.device == query_states.device
+    
+    max_q_len = valid_lengths.max().item()
+    max_k_len = max_q_len
+    max_q_block_num = (max_q_len + block_size - 1) // block_size
+    max_k_block_num = (max_k_len + block_size - 1) // block_size
+
+    attn_output = block_sparse_attn_func(
+        query_states.transpose(0, 1).contiguous(),
+        key_states.transpose(0, 1).contiguous(),
+        value_states.transpose(0, 1).contiguous(),
+        cu_seq_lens,
+        cu_seq_lens,
+        head_mask_type,
+        None,
+        approx_simple_mask[:, :, :max_q_block_num, :max_k_block_num].contiguous(),
+        max_q_len,
+        max_k_len, 
+        p_dropout=0.0,
+        deterministic=True,
+        is_causal=causal,
+    )
+
+    # 将输出转换回批处理格式
+    # attn_output_batch = []
+    # for i in range(batch_size):
+    #     start_idx = cu_seq_lens[i].item()
+    #     end_idx = cu_seq_lens[i + 1].item()
+    #     seq_len_i = end_idx - start_idx
+    #     actual_seq_len = min(seq_len_i, max_q_len)
+        
+    #     # 获取当前batch的输出并转换维度
+    #     batch_output = attn_output[start_idx:start_idx + actual_seq_len]  # [actual_seq_len, num_heads, head_dim]
+    #     batch_output = batch_output.transpose(0, 1).unsqueeze(0)  # [1, num_heads, actual_seq_len, head_dim]
+        
+    #     # 如果需要填充到原始长度
+    #     if actual_seq_len < max_q_len:
+    #         pad_size = max_q_len - actual_seq_len
+    #         batch_output = F.pad(batch_output, (0, 0, 0, pad_size, 0, 0, 0, 0))
+        
+    #     attn_output_batch.append(batch_output)
+    
+    # attn_output = torch.cat(attn_output_batch, dim=0)
+    ################################
+
+    del query_states
+    del approx_simple_mask
     return attn_output
 
 from sparseattn.src.utils import *
@@ -927,77 +1202,142 @@ import triton.language as tl
 
 if __name__ == "__main__":
     
-    #帮我写一个while true的循环，随机采样0-1
-    while True:
-        import random
-        # 方法1：使用randint (包含0和1000)
-        num = random.randint(0, 16000)
-        # 配置
-        batch_size = 1
-        num_heads = 32
-        q_len = num
-        kv_len = num
-        head_dim = 128
+    #case1
+    batch_size = 2
+    num_heads = 32
+    q_len = 32768
+    kv_len = 32768
+    head_dim = 128
 
 
-        # 选择设备
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        if device.type == "cpu":
-            print("警告：当前未检测到 CUDA。Triton 内核将无法运行，测试可能失败或速度极慢。")
+    # 选择设备
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cpu":
+        print("警告：当前未检测到 CUDA。Triton 内核将无法运行，测试可能失败或速度极慢。")
 
-        # 随机输入（注意 dtype 用 float16/float32 以匹配实际模型）
-        dtype = torch.float16 if device.type == "cuda" else torch.float32
-        query = torch.randn((batch_size, num_heads, q_len, head_dim), dtype=dtype, device=device)
-        key = torch.randn((batch_size, num_heads, kv_len, head_dim), dtype=dtype, device=device)
-        value = torch.randn((batch_size, num_heads, kv_len, head_dim), dtype=dtype, device=device)
+    # 随机输入（注意 dtype 用 float16/float32 以匹配实际模型）
+    dtype = torch.float16 if device.type == "cuda" else torch.float32
+    cu_seq_lens = torch.tensor([0, 1024, 33792], device=device, dtype=torch.int32)
+    query = torch.randn((batch_size, num_heads, q_len, head_dim), dtype=dtype, device=device)
+    key = torch.randn((batch_size, num_heads, kv_len, head_dim), dtype=dtype, device=device)
+    value = torch.randn((batch_size, num_heads, kv_len, head_dim), dtype=dtype, device=device)
 
-        # Xattention_prefill 参数
-        stride = 16
-        norm = 1
-        threshold = 0.9
-        block_size = 128
-        use_triton = True if device.type == "cuda" else False
-        causal = True
-        kdb = 1
-        chunk_size = 16384
-        keep_sink = False
-        keep_recent = False
+    # Xattention_prefill 参数
+    stride = 16
+    norm = 1
+    threshold = 0.9
+    block_size = 128
+    use_triton = True if device.type == "cuda" else False
+    causal = True
+    kdb = 1
+    chunk_size = 16384
+    keep_sink = False
+    keep_recent = False
 
-        print(f"Running Xattention_prefill on device={device}, use_triton={use_triton}")
+    print(f"Running Xattention_prefill on device={device}, use_triton={use_triton}")
 
+    try:
+        out = Xattention_prefill_dim4(
+            query_states=query,
+            key_states=key,
+            value_states=value,
+            stride=stride,
+            cu_seq_lens=cu_seq_lens,
+            norm=norm,
+            threshold=threshold,
+            block_size=block_size,
+            use_triton=use_triton,
+            causal=causal,
+            kdb=kdb,
+            chunk_size=chunk_size,
+            keep_sink=keep_sink,
+            keep_recent=keep_recent,
+        )
+
+        print("Xattention_prefill 返回: ")
+        print(f"  类型: {type(out)}")
         try:
-            out = Xattention_prefill(
-                query_states=query,
-                key_states=key,
-                value_states=value,
-                stride=stride,
-                norm=norm,
-                threshold=threshold,
-                block_size=block_size,
-                use_triton=use_triton,
-                causal=causal,
-                kdb=kdb,
-                chunk_size=chunk_size,
-                keep_sink=keep_sink,
-                keep_recent=keep_recent,
-            )
+            print(f"  形状: {out.shape}")
+            print(f"  dtype: {out.dtype}, device: {out.device}")
+            # 打印少量元素以作 sanity check
+            flat = out.detach().cpu()
+            print(f"  少量元素 (前 8): {flat.flatten()[:8]}")
+        except Exception:
+            print("无法读取返回张量的详细信息（可能为自定义对象或未成功计算）")
 
-            print("Xattention_prefill 返回: ")
-            print(f"  类型: {type(out)}")
-            try:
-                print(f"  形状: {out.shape}")
-                print(f"  dtype: {out.dtype}, device: {out.device}")
-                # 打印少量元素以作 sanity check
-                flat = out.detach().cpu()
-                print(f"  少量元素 (前 8): {flat.flatten()[:8]}")
-            except Exception:
-                print("无法读取返回张量的详细信息（可能为自定义对象或未成功计算）")
+    except Exception as e:
+        import traceback
 
-        except Exception as e:
-            import traceback
+        print("调用 Xattention_prefill 出现异常:")
+        traceback.print_exc()
+        print("请检查 Triton/CUDA 环境、block_size 与输入长度是否匹配，以及可能的显存限制。")
 
-            print("调用 Xattention_prefill 出现异常:")
-            traceback.print_exc()
-            print("请检查 Triton/CUDA 环境、block_size 与输入长度是否匹配，以及可能的显存限制。")
+    print("测试结束。")
+    #case2
+    num_heads = 32
+    head_dim = 128
+    total_len = 1024+32768
 
-        print("测试结束。")
+    # 选择设备
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cpu":
+        print("警告：当前未检测到 CUDA。Triton 内核将无法运行，测试可能失败或速度极慢。")
+
+    # 随机输入（注意 dtype 用 float16/float32 以匹配实际模型）
+    dtype = torch.float16 if device.type == "cuda" else torch.float32
+    cu_seq_lens = torch.tensor([0, 1024, 33792], device=device, dtype=torch.int32)
+    query = torch.randn((num_heads, total_len, head_dim), dtype=dtype, device=device)
+    key = torch.randn((num_heads, total_len, head_dim), dtype=dtype, device=device)
+    value = torch.randn((num_heads, total_len, head_dim), dtype=dtype, device=device)
+
+    # Xattention_prefill 参数
+    stride = 16
+    norm = 1
+    threshold = 0.9
+    block_size = 128
+    use_triton = True if device.type == "cuda" else False
+    causal = True
+    kdb = 1
+    chunk_size = 16384
+    keep_sink = False
+    keep_recent = False
+
+    print(f"Running Xattention_prefill on device={device}, use_triton={use_triton}")
+
+    try:
+        out = Xattention_prefill_dim3(
+            query_states=query,
+            key_states=key,
+            value_states=value,
+            stride=stride,
+            cu_seq_lens=cu_seq_lens,
+            norm=norm,
+            threshold=threshold,
+            block_size=block_size,
+            use_triton=use_triton,
+            causal=causal,
+            kdb=kdb,
+            chunk_size=chunk_size,
+            keep_sink=keep_sink,
+            keep_recent=keep_recent,
+        )
+
+        print("Xattention_prefill 返回: ")
+        print(f"  类型: {type(out)}")
+        try:
+            print(f"  形状: {out.shape}")
+            print(f"  dtype: {out.dtype}, device: {out.device}")
+            # 打印少量元素以作 sanity check
+            flat = out.detach().cpu()
+            print(f"  少量元素 (前 8): {flat.flatten()[:8]}")
+        except Exception:
+            print("无法读取返回张量的详细信息（可能为自定义对象或未成功计算）")
+
+    except Exception as e:
+        import traceback
+
+        print("调用 Xattention_prefill 出现异常:")
+        traceback.print_exc()
+        print("请检查 Triton/CUDA 环境、block_size 与输入长度是否匹配，以及可能的显存限制。")
+
+    print("测试结束。")

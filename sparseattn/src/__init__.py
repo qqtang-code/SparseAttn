@@ -10,7 +10,7 @@ Core sparse attention implementations:
 - FullPrefill: Complete prefill implementation based on FlashInfer
 """
 
-from .Xattention import Xattention_prefill
+from .Xattention import Xattention_prefill_dim3, Xattention_prefill_dim4
 from .Flexprefill import Flexprefill_prefill
 from .Minference import Minference_prefill
 from .Fullprefill import Full_prefill
