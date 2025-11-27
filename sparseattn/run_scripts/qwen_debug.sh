@@ -1,5 +1,5 @@
 # Model and training configuration
-model=${MODEL:-"/data1/hf_model/Qwen3-4B"}
+model=${MODEL:-"/data2/hf_model/Qwen3-4B"}
 bsz=${BSZ:-16}
 seq=${SEQ:-2}
 lr=${LR:-1e-5}
@@ -194,7 +194,7 @@ base_arguments=(
     --layerwise_sparsity_weight $layerwise_sparsity_weight
     --erank_analysis_path $erank_analysis_path
 
-    --data_cache_dir "data_cache/sft"
+    --data_cache_dir "/data2/public_data/data_cache"
 )
 
 # FSDP configuration
