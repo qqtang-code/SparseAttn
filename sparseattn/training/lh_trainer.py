@@ -506,7 +506,6 @@ class Trainer(HFTrainer):
             outputs["sparsity_loss"] if isinstance(outputs, dict) else outputs[-1]
         )
         loss = lm_loss + 20 * reg_loss
-        task = tasks[0]  # because batch size = 1
         model_sparsity = outputs["model_sparsity"]
         print(f"Rank {torch.distributed.get_rank() if torch.distributed.is_initialized() else 0}: "f"[Step {self.state.global_step}] Task={task} | model_sparsity={model_sparsity} ｜ reg_loss={reg_loss}")
 
