@@ -40,6 +40,7 @@ class DataArguments:
     min_seq_len: Optional[int] = 1000
     task_type: str = "pretrain"   # <-- unified
     use_packing: bool = False
+    data_cache_dir: Optional[str] = None
 
 
 # =========================================================
@@ -253,77 +254,6 @@ class PackingDataCollator:
         }
         
         return res
-        
-        # for f in batch:
-        #     if "input_ids_chunks" in f:
-        #         all_ids.extend(f["input_ids_chunks"])
-        #         all_tasks.append(f.get("task_type", "default"))
-        #         continue
-        #     all_ids.append(f["input_ids"])
-        #     all_tasks.append(f.get("task_type", "default"))
-
-        #     if "labels" in f:
-        #         labels_exist = True
-        #         all_labels.append(f["labels"])
-        #     else:
-        #         all_labels.append(None)
-
-        # # packing mode
-        # if self.data_args.use_packing:
-        #     packed_ids, packed_labels = self._pack_sequences(
-        #         all_ids, all_labels if labels_exist else None
-        #     )
-
-        #     B = len(packed_ids)
-        #     ids_t = torch.full((B, self.max_seq_len), self.tokenizer.pad_token_id, dtype=torch.long)
-        #     lab_t = torch.full((B, self.max_seq_len), -100, dtype=torch.long)
-        #     mask = torch.zeros((B, self.max_seq_len), dtype=torch.long)
-
-        #     for i, (inp, lab) in enumerate(zip(packed_ids, packed_labels)):
-        #         L = len(inp)
-        #         ids_t[i, :L] = torch.tensor(inp)
-        #         lab_t[i, :L] = torch.tensor(lab)
-        #         mask[i, :L] = 1
-
-        #     return {
-        #         "input_ids": ids_t,
-        #         "labels": lab_t,
-        #         "attention_mask": mask,
-        #         "task_type": all_tasks,
-        #     }
-
-        # # no packing
-        # kept_ids = []
-        # kept_labels = []
-        # is_sft = self.data_args.task_type == "sft"
-        
-        # breakpoint()
-
-        # for seq, lab in zip(all_ids, all_labels):
-        #     if len(seq) > self.max_seq_len:
-        #         # if is_sft:
-        #         #     continue
-        #         seq = seq[: self.max_seq_len]
-
-        #     if lab is None:
-        #         lab = seq.copy()
-        #         if lab:
-        #             lab[0] = -100
-
-        #     kept_ids.append(seq)
-        #     kept_labels.append(lab)
-
-        # B = len(kept_ids)
-        # ids_t = torch.full((B, self.max_seq_len), self.tokenizer.pad_token_id, dtype=torch.long)
-        # lab_t = torch.full((B, self.max_seq_len), -100, dtype=torch.long)
-        # mask = torch.zeros((B, self.max_seq_len), dtype=torch.long)
-        # for i, (inp, lab) in enumerate(zip(kept_ids, kept_labels)):
-        #     L = len(inp)
-        #     L_label= sum(l != -100 for l in lab)
-        #     ids_t[i, :L] = inp
-        #     lab_t[i, :L] = lab
-        #     mask[i, :L_label] = 1
-        
 
 
 # =========================================================
@@ -454,11 +384,10 @@ def build_dataset(paths, data_args, tokenizer=None, is_training=True, model_name
     max_len = min(max_len, 4096*250)  # hard clamp for safety
 
     # streaming
-    if data_args.streaming:
-        ds = load_dataset("parquet", data_files=parquet_files, split="train", streaming=True)
-        return StreamingParquetIterable(ds, tokenizer, data_args, max_len)
-
-    raw = load_dataset("parquet", data_files=parquet_files, split="train")
+    # if data_args.streaming:
+    #     ds = load_dataset("parquet", data_files=parquet_files, split="train", streaming=True)
+    #     return StreamingParquetIterable(ds, tokenizer, data_args, max_len)
+    raw = load_dataset("parquet", data_files=parquet_files, split="train", cache_dir=os.path.join(data_args.data_cache_dir, "raw") if data_args.data_cache_dir else None)
 
     # filter short samples
     if data_args.min_seq_len is not None and not data_args.prepack:
