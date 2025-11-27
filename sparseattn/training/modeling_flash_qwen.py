@@ -1877,15 +1877,30 @@ class Qwen3Attention(nn.Module):
                 norm = self.xattn_params["norm"]
                 from sparseattn.src.Xattention import Xattention_prefill
                 try:
-                    cw_attn_output = Xattention_prefill(
-                        q,
-                        k,
-                        v,
-                        stride,
-                        norm,
-                        threshold,
-                        use_triton=True,
-                    ).transpose(1,2)  # B,T,H,D
+                    if unpadded_lengths is not None:
+                        # varlen, ignore padding tokens, efficient for large batch with many paddings
+                        cu_seqlens, max_seqlen = unpadded_lengths
+                        cw_attn_output = Xattention_prefill(
+                            q,
+                            k,
+                            v,
+                            stride,
+                            cu_seqlens,
+                            norm,
+                            threshold,
+                            use_triton=True,
+                        ).transpose(1,2)  # B,T,H,D
+                    else:
+                        cw_attn_output = Xattention_prefill(
+                            q,
+                            k,
+                            v,
+                            stride,
+                            
+                            norm,
+                            threshold,
+                            use_triton=True,
+                        ).transpose(1,2)  # B,T,H,D
                 except Exception as e:
                     print("==================================================\n")
                     print(f"q.shape{q.shape},k.shape{k.shape},v.shape{v.shape}")
@@ -1949,7 +1964,6 @@ class Qwen3Attention(nn.Module):
         q = self.q_norm(self.q_proj(hidden_states).view(hidden_shape))
         k = self.k_norm(self.k_proj(hidden_states).view(hidden_shape))
         v = self.v_proj(hidden_states).view(hidden_shape)
-
         if not self.config.enable_ada_sparsity:
             z_kv = get_mask(
                 self.attn_mask_log_alphas,
@@ -2065,8 +2079,8 @@ class Qwen3Attention(nn.Module):
         attn_output = self.o_proj(attn_output.to(self.o_proj.weight.dtype))
 
         attn_weights = None
-
-        return z.sum(), attn_output, attn_weights, past_key_value
+        
+        return z.sum(dim=-1), attn_output, attn_weights, past_key_value
 
 
 class Qwen3DecoderLayer(nn.Module):
@@ -2623,7 +2637,9 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
             # z_loss = layerwise_loss if z_loss is None else (z_loss + layerwise_loss)
             z_loss = layerwise_loss
-
+            
+        z_loss = z_loss.mean()
+        
         if not return_dict:
             # return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns, model_sparsity, target_sparsity, z_loss] if v is not None)
             return tuple(

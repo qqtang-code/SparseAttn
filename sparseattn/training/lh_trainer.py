@@ -297,10 +297,10 @@ class Trainer(HFTrainer):
         # }
         self.task_sparsity_config = {
             "default": {"start": self.start_head_sparsity, "end": self.end_head_sparsity},
-            "Code": {"start": 0.0, "end": 0.2},
-            "Math": {"start": 0.0, "end": 0.1},
-            "MultiHop QA": {"start": 0.0, "end": 0.4},
-            "Single QA": {"start": 0.0, "end": 0.3},
+            "Code": {"start": 0.0, "end": 0.4},
+            "Math": {"start": 0.0, "end": 0.6},
+            "MultiHop QA": {"start": 0.0, "end": 0.2},
+            "Single QA": {"start": 0.0, "end": 0.2},
             "Summarization": {"start": 0.0, "end": 0.7},
         }
 
@@ -505,20 +505,20 @@ class Trainer(HFTrainer):
         reg_loss = (
             outputs["sparsity_loss"] if isinstance(outputs, dict) else outputs[-1]
         )
-        loss = lm_loss + reg_loss
+        loss = lm_loss + 20 * reg_loss
         task = tasks[0]  # because batch size = 1
         model_sparsity = outputs["model_sparsity"]
-        print(f"Rank {torch.distributed.get_rank() if torch.distributed.is_initialized() else 0}: "f"[Step {self.state.global_step}] Task={task} | model_sparsity={model_sparsity.item()} ｜ reg_loss={reg_loss.item()}")
+        print(f"Rank {torch.distributed.get_rank() if torch.distributed.is_initialized() else 0}: "f"[Step {self.state.global_step}] Task={task} | model_sparsity={model_sparsity} ｜ reg_loss={reg_loss}")
 
         if self.log_loss and self.accelerator.is_main_process:
             model_sparsity = (
                 outputs["model_sparsity"] if isinstance(outputs, dict) else outputs[-3]
             )
-            # logger.info(
-            #     f"@ {self.state.global_step} | Loss: {loss:.4f} | LM Loss: {lm_loss:.4f} | "
-            #     f"Reg Loss: {reg_loss:.4f} | Target Sparsity: {target_sparsity:.4f} | "
-            #     f"Model Sparsity: {model_sparsity:.4f}"
-            # )
+            logger.info(
+                f"@ {self.state.global_step} | Loss: {loss} | LM Loss: {lm_loss} | "
+                f"Reg Loss: {reg_loss} | Target Sparsity: {target_sparsity} | "
+                f"Model Sparsity: {model_sparsity}"
+            )
             # Fetch diagnostics if present
             exp_sparsity = (
                 outputs.get("expected_model_sparsity", None)
@@ -559,8 +559,8 @@ class Trainer(HFTrainer):
                 )
 
             logger.info(
-                f"@ {self.state.global_step} | Loss: {loss.item():.4f} | LM: {lm_loss.item():.4f} | Reg: {reg_loss.item():.4f} | "
-                f"Target: {target_sparsity.item():.4f} | Sparsity: {model_sparsity.item():.4f}"
+                f"@ {self.state.global_step} | Loss: {loss} | LM: {lm_loss} | Reg: {reg_loss} | "
+                f"Target: {target_sparsity} | Sparsity: {model_sparsity}"
                 + (" | " + " | ".join(extra) if len(extra) else "")
             )
 
@@ -583,8 +583,8 @@ class Trainer(HFTrainer):
                     "loss": float(
                         loss.detach().item() if isinstance(loss, torch.Tensor) else loss
                     ),
-                    "target_sparsity": float(target_sparsity),
-                    "model_sparsity": float(model_sparsity),
+                    "target_sparsity": target_sparsity,
+                    "model_sparsity": model_sparsity,
                     "step": self.state.global_step,
                 }
                 if isinstance(outputs, dict):
@@ -601,37 +601,37 @@ class Trainer(HFTrainer):
                                 else:
                                     v = float(v.mean().item())
                             train_metrics[k] = v
-                if isinstance(outputs, dict):
-                    if (
-                        "layerwise_model_sparsity" in outputs
-                        and outputs["layerwise_model_sparsity"] is not None
-                    ):
-                        lms = outputs["layerwise_model_sparsity"]
-                        if isinstance(lms, torch.Tensor):
-                            lms = lms.detach().cpu().float()
-                            for i, s in enumerate(lms):
-                                train_metrics[f"layer_{i}/sparsity"] = float(s)
+                # if isinstance(outputs, dict):
+                #     if (
+                #         "layerwise_model_sparsity" in outputs
+                #         and outputs["layerwise_model_sparsity"] is not None
+                #     ):
+                #         lms = outputs["layerwise_model_sparsity"]
+                #         if isinstance(lms, torch.Tensor):
+                #             lms = lms.detach().cpu().float()
+                #             for i, s in enumerate(lms):
+                #                 train_metrics[f"layer_{i}/sparsity"] = float(s)
 
-                    if (
-                        "layerwise_target_sparsity" in outputs
-                        and outputs["layerwise_target_sparsity"] is not None
-                    ):
-                        lt = outputs["layerwise_target_sparsity"]
-                        if isinstance(lt, torch.Tensor):
-                            lt = lt.detach().cpu().float()
-                            for i, t in enumerate(lt):
-                                train_metrics[f"layer_{i}/target"] = float(t)
+                #     if (
+                #         "layerwise_target_sparsity" in outputs
+                #         and outputs["layerwise_target_sparsity"] is not None
+                #     ):
+                #         lt = outputs["layerwise_target_sparsity"]
+                #         if isinstance(lt, torch.Tensor):
+                #             lt = lt.detach().cpu().float()
+                #             for i, t in enumerate(lt):
+                #                 train_metrics[f"layer_{i}/target"] = float(t)
 
-                    if (
-                        "layerwise_model_sparsity" in outputs
-                        and "layerwise_target" in outputs
-                    ):
-                        lms = outputs["layerwise_model_sparsity"]
-                        lt = outputs["layerwise_target"]
-                        if lms is not None and lt is not None:
-                            diff = (lms - lt).detach().cpu().float()
-                            for i, d in enumerate(diff):
-                                train_metrics[f"layer_{i}/sparsity_diff"] = float(d)
+                #     if (
+                #         "layerwise_model_sparsity" in outputs
+                #         and "layerwise_target" in outputs
+                #     ):
+                #         lms = outputs["layerwise_model_sparsity"]
+                #         lt = outputs["layerwise_target"]
+                #         if lms is not None and lt is not None:
+                #             diff = (lms - lt).detach().cpu().float()
+                #             for i, d in enumerate(diff):
+                #                 train_metrics[f"layer_{i}/sparsity_diff"] = float(d)
                 self.log(train_metrics)
 
         if return_output_and_metrics:

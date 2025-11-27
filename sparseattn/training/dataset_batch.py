@@ -38,8 +38,9 @@ class DataArguments:
     prepack: bool = False
     streaming: bool = False
     min_seq_len: Optional[int] = 1000
-    task_type: str = "pretrain"   # <-- unified
+    task_type: str = "pretrain" 
     use_packing: bool = False
+    data_cache_dir: Optional[str] = None
 
 
 # =========================================================
@@ -458,7 +459,7 @@ def build_dataset(paths, data_args, tokenizer=None, is_training=True, model_name
         ds = load_dataset("parquet", data_files=parquet_files, split="train", streaming=True)
         return StreamingParquetIterable(ds, tokenizer, data_args, max_len)
 
-    raw = load_dataset("parquet", data_files=parquet_files, split="train")
+    raw = load_dataset("parquet", data_files=parquet_files,split="train", cache_dir=os.path.join(data_args.data_cache_dir, "raw") if data_args.data_cache_dir else None)
 
     # filter short samples
     if data_args.min_seq_len is not None and not data_args.prepack:
