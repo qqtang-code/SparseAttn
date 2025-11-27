@@ -1,5 +1,5 @@
 # Model and training configuration
-model=${MODEL:-"/data2/hf_model/Qwen3-4B"}
+model=${MODEL:-"/data2/hf_models/Qwen3-4B"}
 bsz=${BSZ:-16}
 seq=${SEQ:-2}
 lr=${LR:-1e-5}
