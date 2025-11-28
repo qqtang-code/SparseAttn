@@ -1204,7 +1204,7 @@ class MaskAllocator(nn.Module):
 
 class AttentionRouter(nn.Module):
     def __init__(self, input_dim, num_key_value_heads, d_feature=128,
-                 use_task_emb=False, temp=1.0, hard=False, 
+                 use_task_emb=False, temp=2/3, hard=False, 
                  router_type='mlp', use_gumbel=True, learnable_temp=False,
                  dropout=0.1, layernorm=True):
         super().__init__()
@@ -1221,7 +1221,6 @@ class AttentionRouter(nn.Module):
             layers = [
                 nn.Linear(d_feature, d_feature),
                 nn.SiLU(),
-                nn.Dropout(dropout),
                 nn.Linear(d_feature, 2)
             ]
         else:
@@ -1252,20 +1251,15 @@ class AttentionRouter(nn.Module):
 
         # 采用第一个Special Token 作为输入
         x = pooled_input[:, 0, :, :]  # [B, H, D]
-
-        if self.use_task_emb:
-            x = x + self.task_emb
+        # x = pooled_input.mean(dim=1)
 
         logits = self.dim_mapping(x)  # [B, H, 2]
 
-        logits = torch.tanh(logits) * 5.0  # [-5, 5]
-
-        tau = torch.exp(self.log_temp).clamp(0.5, 10.0)
-        logits = torch.nan_to_num(logits, nan=0.0, posinf=5.0, neginf=-5.0)
+        tau = torch.exp(self.log_temp)
 
         # --- Gumbel or Softmax routing ---
         if self.training:
-            eps = 1e-8
+            eps = 1e-10
             logits = logits + eps * torch.randn_like(logits)
             decisions = F.gumbel_softmax(logits, tau=tau, hard=False)
             hard_decisions = F.gumbel_softmax(logits, tau=tau, hard=True)
@@ -1971,7 +1965,6 @@ class Qwen3Attention(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
-
         q = self.q_norm(self.q_proj(hidden_states).view(hidden_shape))
         k = self.k_norm(self.k_proj(hidden_states).view(hidden_shape))
         v = self.v_proj(hidden_states).view(hidden_shape)
@@ -2010,7 +2003,7 @@ class Qwen3Attention(nn.Module):
                 )
 
             z = z_kv_batch
-
+        breakpoint()
         has_layer_past = past_key_value is not None
         if has_layer_past:
             past_kv = past_key_value[0]

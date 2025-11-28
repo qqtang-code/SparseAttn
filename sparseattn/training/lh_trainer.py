@@ -582,8 +582,8 @@ class Trainer(HFTrainer):
                     "loss": float(
                         loss.detach().item() if isinstance(loss, torch.Tensor) else loss
                     ),
-                    "target_sparsity": target_sparsity,
-                    "model_sparsity": model_sparsity,
+                    "target_sparsity": target_sparsity.item(),
+                    "model_sparsity": model_sparsity.item(),
                     "step": self.state.global_step,
                 }
                 if isinstance(outputs, dict):
@@ -653,8 +653,8 @@ class Trainer(HFTrainer):
                 "loss": loss.detach().item()
                 if isinstance(loss, torch.Tensor)
                 else float(loss),
-                "target_sparsity": float(target_sparsity),
-                "model_sparsity": float(model_sparsity_val),
+                "target_sparsity": target_sparsity.item(),
+                "model_sparsity": model_sparsity_val.item(),
                 "step": self.state.global_step,
             }
 
