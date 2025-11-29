@@ -24,7 +24,7 @@ from .lh_trainer import Trainer
 # from .lh_trainer_nsa import Trainer as NSATrainer
 
 # from .dataset import build_dataset, DataCollator, DataArguments
-from .dataset_batch import build_dataset, PackingDataCollator, DataArguments
+from .dataset_batch import build_dataset, PackingDataCollator, DataArguments, CustomDistributedStratifiedSampler
 from .dataset import logger as dataset_logger
 from .script_arguments import ScriptArguments, TrainingArguments
 
@@ -326,6 +326,9 @@ def main():
         else:
             logger.warning("skipping token_scaled_loss -- model does not support it")
 
+    data_collator = PackingDataCollator(tokenizer, data_args, max_seq_len=data_args.per_device_max_tokens)
+    assert training_args.max_steps is not None, "max_steps must be set!"
+    
     # load_datasets
     if training_args.do_train:
         # train_dataset = build_dataset(
@@ -337,6 +340,33 @@ def main():
             data_args=data_args,
             is_training=True,
         )
+        
+        class_indices = train_dataset.get_class_indices()
+        logger.info(f"Using stratified sampling. Class distribution: {[len(v) for v in class_indices.values()]}")
+
+        if torch.distributed.is_initialized():
+            world_size = torch.distributed.get_world_size()
+        else:
+            world_size = training_args.n_gpu
+
+        train_sampler = CustomDistributedStratifiedSampler(
+            train_dataset,
+            class_indices=class_indices,
+            num_gpus=world_size,
+            required_per_class=2
+        )
+
+        train_dataloader = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=1,
+            sampler=train_sampler,
+            collate_fn=data_collator,
+            num_workers=training_args.dataloader_num_workers,
+            pin_memory=training_args.dataloader_pin_memory,
+        )
+        
+        
+
 
     if training_args.do_eval:
         # eval_dataset = {
@@ -369,8 +399,7 @@ def main():
         }
 
     # data_collator = DataCollator(tokenizer, data_args)
-    data_collator = PackingDataCollator(tokenizer, data_args, max_seq_len=data_args.per_device_max_tokens)
-    assert training_args.max_steps is not None, "max_steps must be set!"
+    
 
     # Initialize our Trainer
     if training_args.attention_type is not None and "nsa" in training_args.attention_type :
@@ -394,6 +423,9 @@ def main():
             data_collator=data_collator,
             log_loss=script_args.should_log_loss,
         )
+    if training_args.do_train:
+        trainer.train_dataloader = train_dataloader
+        logger.info("Successfully injected CustomDistributedStratifiedSampler into Trainer.")
 
     if trainer.is_fsdp_enabled:
         # Identify which modules have "_fsdp_wrap" attribute set to True and wrap these

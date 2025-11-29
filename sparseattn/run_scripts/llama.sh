@@ -1,5 +1,5 @@
 # Model and training configuration
-model=${MODEL:-"/data1/hf_model/Qwen3-4B"}
+model=${MODEL:-"/data1/hf_model/Meta-Llama-3.1-8B-Instruct"}
 bsz=${BSZ:-16}
 seq=${SEQ:-1}
 lr=${LR:-1e-5}
@@ -40,7 +40,7 @@ topk_k=${TOPK_K:-2048}
 enable_ada_sparsity=${ENABLE_ADA_SPARSITY:-true}
 
 # Layer-wise sparsity configuration
-enable_layerwise_sparsity=${ENABLE_LAYERWISE_SPARSITY:-false}
+enable_layerwise_sparsity=${ENABLE_LAYERWISE_SPARSITY:-true}
 layerwise_sparsity_schedule=${LAYERWISE_SPARSITY_SCHEDULE:-"high-low-high"}
 layerwise_sparsity_min_ratio=${LAYERWISE_SPARSITY_MIN_RATIO:-0.5}
 layerwise_sparsity_max_ratio=${LAYERWISE_SPARSITY_MAX_RATIO:-1.0}
@@ -49,12 +49,13 @@ layerwise_sparsity_weight=${LAYERWISE_SPARSITY_WEIGHT:-1.0}
 erank_analysis_path="/"
 
 # Dataset configuration
-# dataset=${DATASET:-"/data/public_data/mix_sft_filter2"}
+# dataset=${DATASET:-"/data1/public_data/mix_sft_filter2"}
 dataset=${DATASET:-"/data1/public_data/Pre_filter"}
 task_type="pretrain" # pretrain or sft
 
 # Create run name
-extra_name="entropy_xattn"
+# extra_name="entropy_k_xattn_layerwise"
+extra_name="debug_11.10"
 if [[ $freeze_weights == "true" ]]; then
     extra_name="${extra_name}_wfrozen"
 fi

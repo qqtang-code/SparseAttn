@@ -4,7 +4,7 @@ bsz=${BSZ:-16}
 seq=${SEQ:-1}
 lr=${LR:-1e-5}
 steps=${STEPS:-1000}
-save_steps=${SAVE:-76}
+save_steps=${SAVE:-500}
 save_total_limit=3
 warmup=${WARMUP:-0.1}
 suffix=${SUFFIX:-""}
@@ -54,7 +54,7 @@ dataset=${DATASET:-"/data1/public_data/mix_sft_filter2"}
 task_type="sft" # pretrain or sft
 
 # Create run name
-extra_name="xattn_sft_11.6debug"
+extra_name="sft_xattn"
 if [[ $freeze_weights == "true" ]]; then
     extra_name="${extra_name}_wfrozen"
 fi

@@ -1,7 +1,7 @@
 # Model and training configuration
-model=${MODEL:-"/data1/hf_model/Qwen3-4B"}
+model=${MODEL:-"/data2/hf_models/Qwen3-4B"}
 bsz=${BSZ:-16}
-seq=${SEQ:-1}
+seq=${SEQ:-2}
 lr=${LR:-1e-5}
 steps=${STEPS:-1000}
 save_steps=${SAVE:-500}
@@ -18,14 +18,14 @@ fsdp=${FSDP:-"1"}
 gc=${GC:-"1"}
 
 # PruLong-specific arguments
-max_toks=${MAX_TOKS:-32768}
+max_toks=${MAX_TOKS:-16384}
 # max_toks=${MAX_TOKS:-256}
 start_head_sparsity=${START_HEAD_SPARSITY:-0.0}
-end_head_sparsity=${END_HEAD_SPARSITY:-0.7}
+end_head_sparsity=${END_HEAD_SPARSITY:-0.3}
 mask_learning_rate=${MASK_LEARNING_RATE:-1.0}
 reg_learning_rate=${REG_LEARNING_RATE:-1.0}
 sparsity_warmup_ratio=${SPARSITY_WARMUP_RATIO:-0.8}
-disable_linear_reg_term=${DISABLE_LINEAR_REG_TERM:-false}
+disable_linear_reg_term=${DISABLE_LINEAR_REG_TERM:-true}
 # topk
 context_window_if_toggled=${CONTEXT_WINDOW_IF_TOGGLED:-2048}
 freeze_weights=${FREEZE_WEIGHTS:-true}
@@ -40,7 +40,7 @@ topk_k=${TOPK_K:-2048}
 enable_ada_sparsity=${ENABLE_ADA_SPARSITY:-true}
 
 # Layer-wise sparsity configuration
-enable_layerwise_sparsity=${ENABLE_LAYERWISE_SPARSITY:-false}
+enable_layerwise_sparsity=${ENABLE_LAYERWISE_SPARSITY:-true}
 layerwise_sparsity_schedule=${LAYERWISE_SPARSITY_SCHEDULE:-"high-low-high"}
 layerwise_sparsity_min_ratio=${LAYERWISE_SPARSITY_MIN_RATIO:-0.5}
 layerwise_sparsity_max_ratio=${LAYERWISE_SPARSITY_MAX_RATIO:-1.0}
@@ -49,12 +49,13 @@ layerwise_sparsity_weight=${LAYERWISE_SPARSITY_WEIGHT:-1.0}
 erank_analysis_path="/"
 
 # Dataset configuration
-# dataset=${DATASET:-"/data/public_data/mix_sft_filter2"}
-dataset=${DATASET:-"/data1/public_data/Pre_filter"}
-task_type="pretrain" # pretrain or sft
+dataset=${DATASET:-"/data2/public_data/for_debug_mix_sft_64k"}
+# dataset=${DATASET:-"/data1/public_data/Pre_filter"}
+task_type="sft" # pretrain or sft
 
 # Create run name
-extra_name="entropy_xattn"
+# extra_name="sft3_pretrain_64k_task_xattn_entropy_layerwise_nolinear_11.22"
+extra_name="debug_11.24"
 if [[ $freeze_weights == "true" ]]; then
     extra_name="${extra_name}_wfrozen"
 fi
@@ -74,7 +75,7 @@ if [ -z "$CUDA_VISIBLE_DEVICES" ]; then
 else
     num_gpus=$(echo $CUDA_VISIBLE_DEVICES | tr ',' '\n' | wc -l)
 fi
-num_gpus=${NUM_GPUS_PER_NODE:-$num_gpus}
+num_gpus=1
 
 num_nodes=$(scontrol show hostnames "$SLURM_JOB_NODELIST" 2>/dev/null | wc -l)
 if [ $num_nodes == 0 ]; then
@@ -83,32 +84,18 @@ fi
 num_nodes=${NUM_NODES:-$num_nodes}
 
 # Setup distributed training
-if [ $num_nodes -gt 1 ]; then
-    master_addr=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
-    master_addr=${MASTER_ADDR:-$master_addr}
 
-    header="srun torchrun \
-    --rdzv-backend=c10d \
-    --rdzv-endpoint=$master_addr:56321 \
-    --nnodes=$num_nodes \
-    --nproc-per-node=$num_gpus \
-    -m training.lh_train_language_model"
-else
-    master_port=$(comm -23 <(seq 49152 65535 | sort) <(ss -Htan | awk '{print $4}' | cut -d':' -f2 | sort -u) | shuf | head -n 1)
-
-    header="torchrun \
-    --rdzv-backend=c10d \
-    --rdzv-endpoint=localhost:$master_port \
-    --nnodes=1 \
-    --nproc-per-node=$num_gpus \
-    -m training.lh_train_language_model"
-fi
+header="python -m debugpy --connect 7777 --wait-for-client \
+$(which torchrun) \
+--nnodes=1 \
+--master_port=3749 \
+--nproc-per-node=$num_gpus \
+-m training.lh_train_language_model"
 
 # accu=$(($bsz / $seq / $num_gpus / $num_nodes))
 accu=1
 
 echo "num_nodes=${num_nodes} master_addr=${master_addr} master_port=${master_port} num_gpus=${num_gpus}"
-
 # Environment variables
 export OMP_NUM_THREADS=$num_gpus
 export SWANLAB_API_KEY="t0PmOeLpVom1LRBDAKHaA"
@@ -119,7 +106,7 @@ export LOGIT_BLOCK_SIZE=2048
 
 # Training arguments
 base_arguments=(
-    --report_to swanlab
+    --report_to tensorboard
     --do_train
 
     --model_name $model
@@ -192,6 +179,9 @@ base_arguments=(
     --layerwise_sparsity_power $layerwise_sparsity_power
     --layerwise_sparsity_weight $layerwise_sparsity_weight
     --erank_analysis_path $erank_analysis_path
+
+    --data_cache_dir "/data2/public_data/data_cache"
+    # --pooling_seq true
 )
 
 # FSDP configuration
@@ -210,4 +200,4 @@ base_arguments+=( $@ )
 
 echo "Command: ${header} ${base_arguments[@]}"
 ${header} "${base_arguments[@]}" 2>&1 | tee -a $out_dir/log.out \
-    && [ -f $out_dir/config.json ] && python -m training.save_prulong_masks --checkpoint $out_dir --out_path $out_dir/masks_sp${end_head_sparsity}.tsv --sparsity $end_head_sparsity 
+    && [ -f $out_dir/config.json ] && python -m training.save_prulong_masks --checkpoint $out_dir --out_path $out_dir/masks_sp${end_head_sparsity}.tsv --sparsity $end_head_sparsity

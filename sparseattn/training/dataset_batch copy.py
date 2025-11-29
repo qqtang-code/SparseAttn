@@ -128,30 +128,15 @@ class ParquetDataset(Dataset):
         self.all_class_ids = self._get_all_class_ids()
         
     def _get_all_class_ids(self):
+
         logger.info("Collecting all class IDs for stratified sampling...")
-
-        CLASS_MAP = {
-            'Single QA': 0,
-            'MultiHop QA': 1,
-            'Summarization': 2,
-            'Code': 3
-        }
-
         class_ids = []
+
         for idx in range(len(self.raw_dataset)):
-            item = self.raw_dataset[idx]
-            meta = item.get("metadata", {}) or {}
-            if isinstance(meta, str):
-                try:
-                    meta = ast.literal_eval(meta)
-                except Exception:
-                    meta = {}
-
-            task = meta.get("task", "Other")
-            class_id = CLASS_MAP.get(task, 4)
-
-            class_ids.append(class_id)
-
+             item = self.raw_dataset[idx]
+             _, _, _, _, _, class_id = _build_sft_input_and_labels(item, self.tokenizer, self.data_args, self.max_seq_len)
+             class_ids.append(class_id)
+        
         return class_ids
 
     def get_class_indices(self):
@@ -560,65 +545,98 @@ import torch
 import torch.distributed as dist
 from typing import Dict, List, Iterator
 
-class CustomDistributedStratifiedSampler(torch.utils.data.Sampler):
-    def __init__(
-        self,
-        dataset,
-        class_indices: Dict[int, List[int]],
-        num_gpus: int = 8,
-        required_per_class: int = 2,
-        seed: int = 42,
-    ):
-        # -------- Distributed setup --------
+# 使用类型提示 Dict 和 List
+
+class CustomDistributedStratifiedSampler(Sampler[int]):
+    def __init__(self, 
+                 dataset, 
+                 class_indices: Dict[int, List[int]], 
+                 num_gpus: int = 8, 
+                 required_per_class: int = 2,
+                 seed: int = 42):
+
         if dist.is_initialized():
             self.rank = dist.get_rank()
             self.world_size = dist.get_world_size()
         else:
             self.rank = 0
-            self.world_size = num_gpus
-
-        self.seed = seed
-        self.required_per_class = required_per_class
-        self.num_classes = len(class_indices)
+            self.world_size = num_gpus 
+        
         self.class_indices = class_indices
+        self.required_per_class = required_per_class 
+        self.num_classes = len(class_indices) # 4
+        self.seed = seed
 
-        # 一个 step 需要多少样本
-        self.batch_size = self.num_classes * self.required_per_class
-        if self.batch_size != self.world_size:
-            raise ValueError(f"world_size={self.world_size} must equal total batch_size={self.batch_size}")
+        self.total_batch_size = self.num_classes * required_per_class # 8
+        if self.total_batch_size != self.world_size:
+            raise ValueError(f"Total Batch Size ({self.total_batch_size}) must equal World Size ({self.world_size}) for per-device batch size of 1.")
 
-        # 计算 step 数
-        min_size = min(len(v) for v in class_indices.values())
-        self.num_steps = min_size // required_per_class
+        min_class_size = min(len(v) for v in class_indices.values())
+        self.num_steps = math.floor(min_class_size / required_per_class)
 
-        # 每个 rank 样本数量
-        self.num_samples = self.num_steps     # 每 step 一个样本给每 rank
+        self.total_samples = self.num_steps * self.total_batch_size
+
+        if self.total_samples % self.world_size != 0:
+            raise RuntimeError("Total samples must be divisible by world size.")
+
+        self.num_samples_per_rank = self.total_samples // self.world_size
+
         if self.rank == 0:
-            print(f"[Sampler] steps={self.num_steps}, samples per rank={self.num_samples}")
+            print(f"[{self.rank}] Sampler Init: Steps={self.num_steps}, Total Samples={self.total_samples}, Samples/Rank={self.num_samples_per_rank}")
 
-    def __len__(self):
-        return self.num_samples
 
-    def __iter__(self):
-        rng = random.Random(self.seed)
+    def __iter__(self) -> Iterator[int]:
+        g = torch.Generator()
+        g.manual_seed(self.seed)
+        
+        all_class_batches = []
+        target_required_count = self.num_steps * self.required_per_class # k * 2
 
-        final_rank_samples = []
+        for class_id, indices in self.class_indices.items():
+            temp_indices = indices[:]
 
-        for step in range(self.num_steps):
+            random.seed(self.seed) 
+            random.shuffle(temp_indices) 
+            random.seed() # 恢复
 
-            step_indices = []
-            for cls, idx_list in self.class_indices.items():
+            class_size = len(temp_indices)
+            if class_size < target_required_count:
+                num_repeats = math.ceil(target_required_count / class_size)
+                repeated_indices = temp_indices * num_repeats
+                final_indices = repeated_indices[:target_required_count]
+            else:
+                final_indices = temp_indices[:target_required_count]
 
-                rng.shuffle(idx_list)
-                start = step * self.required_per_class
-                end = start + self.required_per_class
-                step_indices.extend(idx_list[start:end])
+            class_batches = [
+                final_indices[i:i + self.required_per_class]
+                for i in range(0, target_required_count, self.required_per_class)
+            ]
+            all_class_batches.append(class_batches)
 
-            if len(step_indices) != self.world_size:
-                raise RuntimeError("step size mismatches world_size")
+        combined_steps = list(zip(*all_class_batches)) 
 
-            rng.shuffle(step_indices)
+        rank_indices_list = []
 
-            final_rank_samples.append(step_indices[self.rank])
+        for step_seed, step_batches in enumerate(combined_steps):
+            current_step_indices = [] 
+            for batch in step_batches:
+                current_step_indices.extend(batch)
+            step_shuffle_seed = self.seed + step_seed
+            random.seed(step_shuffle_seed)
+            random.shuffle(current_step_indices)
+            random.seed() # 恢复
 
-        return iter(final_rank_samples)
+            if len(current_step_indices) != self.world_size:
+                 raise RuntimeError("Step indices count does not match world size.")
+
+            rank_indices_list.append(current_step_indices[self.rank])
+            
+        final_indices = rank_indices_list 
+
+        if len(final_indices) != self.num_samples_per_rank:
+             print(f"[{self.rank}] WARNING: Generated {len(final_indices)} indices, expected {self.num_samples_per_rank}.")
+
+        return iter(final_indices)
+
+    def __len__(self) -> int:
+        return self.num_samples_per_rank

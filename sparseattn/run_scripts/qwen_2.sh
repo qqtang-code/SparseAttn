@@ -1,15 +1,15 @@
 # Model and training configuration
-model=${MODEL:-"/data1/hf_model/Qwen3-4B"}
+model=${MODEL:-"/data2/hf_models/Qwen3-4B"}
 bsz=${BSZ:-16}
 seq=${SEQ:-1}
 lr=${LR:-1e-5}
 steps=${STEPS:-1000}
-save_steps=${SAVE:-500}
+save_steps=${SAVE:-100}
 save_total_limit=3
 warmup=${WARMUP:-0.1}
 suffix=${SUFFIX:-""}
 overrides=${OVERRIDES:-""}
-min_lr_ratio=${MIN_LR_RATIO:-0.01}
+min_lr_ratio=${MIN_LR_RATIO:-1e-7}
 seq_parallel_size=${SEQ_PARALLEL_SIZE:-1}
 
 # FSDP configuration
@@ -18,14 +18,15 @@ fsdp=${FSDP:-"1"}
 gc=${GC:-"1"}
 
 # PruLong-specific arguments
+# max_toks=${MAX_TOKS:-65536}
 max_toks=${MAX_TOKS:-32768}
 # max_toks=${MAX_TOKS:-256}
 start_head_sparsity=${START_HEAD_SPARSITY:-0.0}
-end_head_sparsity=${END_HEAD_SPARSITY:-0.7}
+end_head_sparsity=${END_HEAD_SPARSITY:-0.3}
 mask_learning_rate=${MASK_LEARNING_RATE:-1.0}
 reg_learning_rate=${REG_LEARNING_RATE:-1.0}
 sparsity_warmup_ratio=${SPARSITY_WARMUP_RATIO:-0.8}
-disable_linear_reg_term=${DISABLE_LINEAR_REG_TERM:-false}
+disable_linear_reg_term=${DISABLE_LINEAR_REG_TERM:-true}
 # topk
 context_window_if_toggled=${CONTEXT_WINDOW_IF_TOGGLED:-2048}
 freeze_weights=${FREEZE_WEIGHTS:-true}
@@ -33,7 +34,7 @@ freeze_masks=${FREEZE_MASKS:-false}
 warmup_type=${WARMUP_TYPE:-"linear"}
 
 # Streaming configuration
-toggle_type=${TOGGLE_TYPE:-"xattn"}
+toggle_type=${TOGGLE_TYPE:-"streaming"}
 sink_size=${SINK_SIZE:-128}
 topk_k=${TOPK_K:-2048}
 
@@ -49,12 +50,14 @@ layerwise_sparsity_weight=${LAYERWISE_SPARSITY_WEIGHT:-1.0}
 erank_analysis_path="/"
 
 # Dataset configuration
-# dataset=${DATASET:-"/data/public_data/mix_sft_filter2"}
-dataset=${DATASET:-"/data1/public_data/Pre_filter"}
-task_type="pretrain" # pretrain or sft
+dataset=${DATASET:-"/data2/public_data/mix_sft_64k"}
+dataset_cache_dir="data_cache/sft"
+# dataset=${DATASET:-"/data1/public_data/Pre_filter"}
+task_type="sft" # pretrain or sft
 
 # Create run name
-extra_name="entropy_xattn"
+extra_name="sft3_64k_pretrain_xattn_mlp_20reg_nolinear_specialtoken_debug_11.27"
+# extra_name="debug_11.15_nolayerwise_tasksparsity"
 if [[ $freeze_weights == "true" ]]; then
     extra_name="${extra_name}_wfrozen"
 fi
@@ -94,8 +97,8 @@ if [ $num_nodes -gt 1 ]; then
     --nproc-per-node=$num_gpus \
     -m training.lh_train_language_model"
 else
-    master_port=$(comm -23 <(seq 49152 65535 | sort) <(ss -Htan | awk '{print $4}' | cut -d':' -f2 | sort -u) | shuf | head -n 1)
-
+    # master_port=$(comm -23 <(seq 49152 65535 | sort) <(ss -Htan | awk '{print $4}' | cut -d':' -f2 | sort -u) | shuf | head -n 1)
+    master_port=35768
     header="torchrun \
     --rdzv-backend=c10d \
     --rdzv-endpoint=localhost:$master_port \
@@ -150,6 +153,8 @@ base_arguments=(
     --save_steps $save_steps
     --save_total_limit $save_total_limit
     --dataloader_num_workers 1
+
+    --data_cache_dir $dataset_cache_dir
 
     --disable_tqdm true
     --use_fast_tokenizer false
@@ -211,3 +216,4 @@ base_arguments+=( $@ )
 echo "Command: ${header} ${base_arguments[@]}"
 ${header} "${base_arguments[@]}" 2>&1 | tee -a $out_dir/log.out \
     && [ -f $out_dir/config.json ] && python -m training.save_prulong_masks --checkpoint $out_dir --out_path $out_dir/masks_sp${end_head_sparsity}.tsv --sparsity $end_head_sparsity 
+

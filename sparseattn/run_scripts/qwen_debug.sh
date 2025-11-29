@@ -1,5 +1,5 @@
 # Model and training configuration
-model=${MODEL:-"/data1/hf_model/Qwen3-4B"}
+model=${MODEL:-"/data2/hf_models/Qwen3-4B"}
 bsz=${BSZ:-16}
 seq=${SEQ:-1}
 lr=${LR:-1e-5}
@@ -18,8 +18,8 @@ fsdp=${FSDP:-"1"}
 gc=${GC:-"1"}
 
 # PruLong-specific arguments
-max_toks=${MAX_TOKS:-65536}
-# max_toks=${MAX_TOKS:-256}
+# max_toks=${MAX_TOKS:-65536}
+max_toks=${MAX_TOKS:-128}
 start_head_sparsity=${START_HEAD_SPARSITY:-0.0}
 end_head_sparsity=${END_HEAD_SPARSITY:-0.3}
 mask_learning_rate=${MASK_LEARNING_RATE:-1.0}
@@ -40,7 +40,7 @@ topk_k=${TOPK_K:-2048}
 enable_ada_sparsity=${ENABLE_ADA_SPARSITY:-true}
 
 # Layer-wise sparsity configuration
-enable_layerwise_sparsity=${ENABLE_LAYERWISE_SPARSITY:-true}
+enable_layerwise_sparsity=${ENABLE_LAYERWISE_SPARSITY:-false}
 layerwise_sparsity_schedule=${LAYERWISE_SPARSITY_SCHEDULE:-"high-low-high"}
 layerwise_sparsity_min_ratio=${LAYERWISE_SPARSITY_MIN_RATIO:-0.5}
 layerwise_sparsity_max_ratio=${LAYERWISE_SPARSITY_MAX_RATIO:-1.0}
@@ -49,13 +49,14 @@ layerwise_sparsity_weight=${LAYERWISE_SPARSITY_WEIGHT:-1.0}
 erank_analysis_path="/"
 
 # Dataset configuration
-dataset=${DATASET:-"/data1/public_data/mix_sft_64k"}
+dataset=${DATASET:-"/data2/public_data/mix_sft_64k"}
+dataset_cache_dir="data_cache/sft"
 # dataset=${DATASET:-"/data1/public_data/Pre_filter"}
 task_type="sft" # pretrain or sft
 
 # Create run name
-# extra_name="sft3_pretrain_64k_task_xattn_entropy_layerwise_nolinear_11.22"
-extra_name="debug_11.24"
+# extra_name="sft3_pretrain_64k_xattn_mlp_new*2_nolinear_first_token_20reg_32k_11.28"
+extra_name="debug_11.26"
 if [[ $freeze_weights == "true" ]]; then
     extra_name="${extra_name}_wfrozen"
 fi
@@ -75,7 +76,7 @@ if [ -z "$CUDA_VISIBLE_DEVICES" ]; then
 else
     num_gpus=$(echo $CUDA_VISIBLE_DEVICES | tr ',' '\n' | wc -l)
 fi
-num_gpus=1
+num_gpus=8
 
 num_nodes=$(scontrol show hostnames "$SLURM_JOB_NODELIST" 2>/dev/null | wc -l)
 if [ $num_nodes == 0 ]; then
@@ -120,7 +121,7 @@ export LOGIT_BLOCK_SIZE=2048
 
 # Training arguments
 base_arguments=(
-    --report_to swanlab
+    --report_to tensorboard
     --do_train
 
     --model_name $model
@@ -150,7 +151,9 @@ base_arguments=(
     --max_steps $steps
     --save_steps $save_steps
     --save_total_limit $save_total_limit
-    --dataloader_num_workers 1
+    --dataloader_num_workers 0
+
+    --data_cache_dir $dataset_cache_dir
 
     --disable_tqdm true
     --use_fast_tokenizer false
