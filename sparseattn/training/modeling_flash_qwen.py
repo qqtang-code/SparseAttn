@@ -727,16 +727,26 @@ class AttentionRouter(nn.Module):
         if not self.training:
             decisions = hard_decisions
 
-        sparse_mask = hard_decisions[..., 1]  # [B, H]
-        decisions_out = decisions[..., 1].squeeze(1)
+        # 稀疏掩码的硬编码值
+        sparse_mask_hard = hard_decisions[..., 1]  # [B, H]
 
+        # 稀疏掩码的软编码值 (用于梯度)
+        sparse_mask_soft = decisions[..., 1] # [B, H]
+
+        # 使用 STE：在 hard 值上减去 soft 值 (梯度为0)，再加上 soft 值 (梯度为 soft 值的梯度)
+        # 这就是 (y_hard - y_soft).detach() + y_soft 的标准形式。
+        # 这里的 [..., 1] 是选择第二个类别（开启/稀疏头）的决策
+        sparse_mask = sparse_mask_hard.detach() + (sparse_mask_soft - sparse_mask_soft.detach())
+        # sparse_mask = sparse_mask_hard + (sparse_mask_soft - sparse_mask_hard).detach() # 也可以这样写
+
+        decisions_out = sparse_mask_soft.squeeze(1) # decisions_out 仍然返回软概率
+        
         return {
             'decisions': decisions_out,
             'hard_decisions': hard_decisions,
-            'sparse_mask': sparse_mask,
+            'sparse_mask': sparse_mask, # 现在这个 sparse_mask 在前向是 0/1，但有梯度
             'logits': logits,
         }
-
 
 class Qwen3Attention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -1476,7 +1486,7 @@ class Qwen3Attention(nn.Module):
                     target_x = target_x.unsqueeze(0)
 
             res = self.mask_allocator(target_x, range_ids)
-            z_kv_batch = res['decisions']
+            z_kv_batch = res['sparse_mask']
 
             if z_kv_batch.shape[-1] == self.num_key_value_heads:
                 z_kv_batch = (

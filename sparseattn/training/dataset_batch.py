@@ -560,6 +560,9 @@ import torch
 import torch.distributed as dist
 from typing import Dict, List, Iterator
 
+class SamplerConditionError(ValueError):
+    pass
+
 class CustomDistributedStratifiedSampler(torch.utils.data.Sampler):
     def __init__(
         self,
@@ -582,19 +585,26 @@ class CustomDistributedStratifiedSampler(torch.utils.data.Sampler):
         self.num_classes = len(class_indices)
         self.class_indices = class_indices
 
-        # 一个 step 需要多少样本
-        self.batch_size = self.num_classes * self.required_per_class
-        if self.batch_size != self.world_size:
-            raise ValueError(f"world_size={self.world_size} must equal total batch_size={self.batch_size}")
+        self.global_batch_size = self.num_classes * self.required_per_class
 
-        # 计算 step 数
+        if self.world_size != 8:
+            raise SamplerConditionError(
+                f"❌ Sampler Condition Failed: world_size={self.world_size} is not 8."
+            )
+
+        if self.global_batch_size != self.world_size:
+            raise SamplerConditionError(
+                f"❌ Sampler Condition Failed: global_batch_size={self.global_batch_size} (classes*{required_per_class}) "
+                f"must equal world_size={self.world_size} for this specific sampler."
+            )
+        
         min_size = min(len(v) for v in class_indices.values())
         self.num_steps = min_size // required_per_class
 
-        # 每个 rank 样本数量
-        self.num_samples = self.num_steps     # 每 step 一个样本给每 rank
+
+        self.num_samples = self.num_steps
         if self.rank == 0:
-            print(f"[Sampler] steps={self.num_steps}, samples per rank={self.num_samples}")
+            print(f"✅ Sampler Initialized: steps={self.num_steps}, samples per rank={self.num_samples}")
 
     def __len__(self):
         return self.num_samples

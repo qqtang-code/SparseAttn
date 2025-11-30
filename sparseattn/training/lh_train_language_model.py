@@ -24,12 +24,13 @@ from .lh_trainer import Trainer
 # from .lh_trainer_nsa import Trainer as NSATrainer
 
 # from .dataset import build_dataset, DataCollator, DataArguments
-from .dataset_batch import build_dataset, PackingDataCollator, DataArguments, CustomDistributedStratifiedSampler
+from .dataset_batch import build_dataset, PackingDataCollator, DataArguments, CustomDistributedStratifiedSampler, SamplerConditionError
 from .dataset import logger as dataset_logger
 from .script_arguments import ScriptArguments, TrainingArguments
 
 
 from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
+import torch.distributed as dist
 
 from transformers.trainer_utils import get_last_checkpoint
 import json
@@ -343,23 +344,36 @@ def main():
         
         class_indices = train_dataset.get_class_indices()
         logger.info(f"Using stratified sampling. Class distribution: {[len(v) for v in class_indices.values()]}")
-
-        if torch.distributed.is_initialized():
+        
+        if dist.is_initialized():
             world_size = torch.distributed.get_world_size()
         else:
             world_size = training_args.n_gpu
 
-        train_sampler = CustomDistributedStratifiedSampler(
-            train_dataset,
-            class_indices=class_indices,
-            num_gpus=world_size,
-            required_per_class=2
-        )
+        try:
+            if not dist.is_initialized():
+                raise SamplerConditionError("Distributed environment not initialized.")
 
+            custom_sampler = CustomDistributedStratifiedSampler(
+                dataset=train_dataset,
+                class_indices=class_indices,
+                num_gpus=world_size,
+                required_per_class=2,
+                seed=42,
+            )
+            sampler = custom_sampler
+            
+        except SamplerConditionError as e:
+            print(f"⚠️ Sampler fallback triggered: {e}. Using default DistributedSampler instead.")
+            from torch.utils.data.distributed import DistributedSampler
+            sampler = DistributedSampler(
+                dataset=train_dataset,
+                shuffle=True,
+            )
         train_dataloader = torch.utils.data.DataLoader(
-            train_dataset,
-            batch_size=1,
-            sampler=train_sampler,
+            dataset=train_dataset,
+            batch_size=training_args.per_device_train_batch_size,
+            sampler=sampler,
             collate_fn=data_collator,
             num_workers=training_args.dataloader_num_workers,
             pin_memory=training_args.dataloader_pin_memory,
