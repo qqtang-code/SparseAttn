@@ -3,8 +3,8 @@ model=${MODEL:-"/data2/hf_models/Qwen3-4B"}
 bsz=${BSZ:-16}
 seq=${SEQ:-1}
 lr=${LR:-1e-5}
-steps=${STEPS:-1000}
-save_steps=${SAVE:-100}
+steps=${STEPS:-125}
+save_steps=${SAVE:-50}
 save_total_limit=3
 warmup=${WARMUP:-0.1}
 suffix=${SUFFIX:-""}
@@ -55,8 +55,10 @@ dataset_cache_dir="data_cache/sft"
 # dataset=${DATASET:-"/data1/public_data/Pre_filter"}
 task_type="sft" # pretrain or sft
 
+pooling_mode="first_token" # first_token,mean_all,ctx,q,ctx_q
+
 # Create run name
-extra_name="sft3_pretrain_64k_xattn_mlp_new*2_nolinear_first_token_20reg_32k_11.28"
+extra_name="sft3_pretrain_64k_xattn_mlp_new*2_nolinear_first_token_5reg_32k_11.30"
 # extra_name="debug_11.15_nolayerwise_tasksparsity"
 if [[ $freeze_weights == "true" ]]; then
     extra_name="${extra_name}_wfrozen"
@@ -108,7 +110,7 @@ else
 fi
 
 # accu=$(($bsz / $seq / $num_gpus / $num_nodes))
-accu=1
+accu=8
 
 echo "num_nodes=${num_nodes} master_addr=${master_addr} master_port=${master_port} num_gpus=${num_gpus}"
 
@@ -188,6 +190,8 @@ base_arguments=(
     --topk_k $topk_k
 
     --enable_ada_sparsity $enable_ada_sparsity
+
+    --pooling_mode $pooling_mode
 
     # layer decay configuration
     --enable_layerwise_sparsity $enable_layerwise_sparsity

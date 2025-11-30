@@ -612,23 +612,44 @@ class CustomDistributedStratifiedSampler(torch.utils.data.Sampler):
     def __iter__(self):
         rng = random.Random(self.seed)
 
+        # flatten all samples for other-class borrowing
+        all_indices = []
+        for cls, idxs in self.class_indices.items():
+            all_indices.extend(idxs)
+
         final_rank_samples = []
 
         for step in range(self.num_steps):
 
             step_indices = []
-            for cls, idx_list in self.class_indices.items():
 
+            for cls, idx_list in self.class_indices.items():
+                # shuffle index list
                 rng.shuffle(idx_list)
+
                 start = step * self.required_per_class
                 end = start + self.required_per_class
-                step_indices.extend(idx_list[start:end])
+                chunk = idx_list[start:end]
 
+                if len(chunk) < self.required_per_class:
+                    # need extra samples
+                    need = self.required_per_class - len(chunk)
+
+                    # borrow from other classes
+                    candidates = [i for i in all_indices if i not in chunk]
+                    rng.shuffle(candidates)
+
+                    borrowed = candidates[:need]
+                    chunk = chunk + borrowed
+
+                step_indices.extend(chunk)
+
+            # now step_indices has num_classes * required_per_class items
             if len(step_indices) != self.world_size:
                 raise RuntimeError("step size mismatches world_size")
 
             rng.shuffle(step_indices)
-
             final_rank_samples.append(step_indices[self.rank])
 
         return iter(final_rank_samples)
+

@@ -49,14 +49,15 @@ layerwise_sparsity_weight=${LAYERWISE_SPARSITY_WEIGHT:-1.0}
 erank_analysis_path="/"
 
 # Dataset configuration
-dataset=${DATASET:-"/data2/public_data/mix_sft_64k"}
+dataset=${DATASET:-"/data2/public_data/for_debug_mix_sft_64k"}
 dataset_cache_dir="data_cache/sft"
 # dataset=${DATASET:-"/data1/public_data/Pre_filter"}
 task_type="sft" # pretrain or sft
 
 # Create run name
 # extra_name="sft3_pretrain_64k_xattn_mlp_new*2_nolinear_first_token_20reg_32k_11.28"
-extra_name="debug_11.26"
+# extra_name="debug_11.26"
+extra_name="debug_11.30"
 if [[ $freeze_weights == "true" ]]; then
     extra_name="${extra_name}_wfrozen"
 fi
@@ -107,7 +108,7 @@ else
 fi
 
 # accu=$(($bsz / $seq / $num_gpus / $num_nodes))
-accu=1
+accu=8
 
 echo "num_nodes=${num_nodes} master_addr=${master_addr} master_port=${master_port} num_gpus=${num_gpus}"
 
@@ -151,7 +152,7 @@ base_arguments=(
     --max_steps $steps
     --save_steps $save_steps
     --save_total_limit $save_total_limit
-    --dataloader_num_workers 0
+    --dataloader_num_workers 1
 
     --data_cache_dir $dataset_cache_dir
 

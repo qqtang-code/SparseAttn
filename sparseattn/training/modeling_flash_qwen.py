@@ -80,6 +80,9 @@ class PawQwen3Config(Qwen3Config):
         # Streaming
         self.toggle_type = kwargs.pop("toggle_type", "streaming")
         self.sink_size = kwargs.pop("sink_size", 128)
+        
+        # Head Router
+        self.pooling_mode = kwargs.pop("pooling_mode", "first_token")
 
         # TriangleMix
         self.triangle_n_last = kwargs.pop("triangle_n_last", 128)
@@ -711,40 +714,51 @@ class AttentionRouter(nn.Module):
 
         logits = self.dim_mapping(x)  # [B, H, 2]
 
+        # --- 1. Logit 转换 (从 2维 Categorical 转为 1维 Binary) ---
+        # 既然 dim 1 代表 "开启/稀疏"，dim 0 代表 "关闭"
+        # Binary Logit = Logit_1 - Logit_0
+        # 这样 logit > 0 倾向于开启，logit < 0 倾向于关闭
+        binary_logits = logits[..., 1] - logits[..., 0]  # [B, H]
+
         tau = torch.exp(self.log_temp)
 
-        # --- Gumbel or Softmax routing ---
+        # --- 2. Gumbel-Sigmoid 采样 (Binary Concrete) ---
         if self.training:
+            # 生成 Gumbel 噪声: g = -log(-log(u))
+            # u ~ Uniform(0, 1)
+            u = torch.rand_like(binary_logits)
             eps = 1e-10
-            logits = logits + eps * torch.randn_like(logits)
-            decisions = F.gumbel_softmax(logits, tau=tau, hard=False)
-            hard_decisions = F.gumbel_softmax(logits, tau=tau, hard=True)
+            g = -torch.log(-torch.log(u + eps) + eps)
+            
+            # 连续松弛 (Continuous Relaxation): z_soft \in (0, 1)
+            # 公式: sigmoid((logit + g) / tau)
+            z_soft = torch.sigmoid((binary_logits + g) / tau)
+            
+            # 硬化 (Hard Thresholding): z_hard \in {0, 1}
+            z_hard = (z_soft > 0.5).float()
+            
+            # --- 3. STE (Straight-Through Estimator) ---
+            # 前向传播：使用 z_hard (真正的 0/1)
+            # 反向传播：梯度通过 z_soft (z_hard 的梯度为0，加上 (z_soft - z_soft.detach()) 后，梯度等于 z_soft 的梯度)
+            z = z_hard + (z_soft - z_soft.detach())
+            
         else:
-            decisions = F.softmax(logits / tau, dim=-1)
-            hard_decisions = torch.zeros_like(decisions)
-            hard_decisions.scatter_(-1, logits.argmax(dim=-1, keepdim=True), 1.0)
+            # 推理阶段：直接根据 Logit 确定 (相当于 tau -> 0)
+            # 或者也可以用 sigmoid(logit/tau) > 0.5，但在 deterministic 模式下 logit > 0 即可
+            z_soft = torch.sigmoid(binary_logits / tau) 
+            z_hard = (z_soft > 0.5).float()
+            z = z_hard # 推理时就是硬掩码
 
-        if not self.training:
-            decisions = hard_decisions
+        # --- 4. 输出准备 ---
+        # sparse_mask: 用于计算的掩码，必须是 STE 后的 z (前向0/1，反向有梯度)
+        sparse_mask = z 
 
-        # 稀疏掩码的硬编码值
-        sparse_mask_hard = hard_decisions[..., 1]  # [B, H]
-
-        # 稀疏掩码的软编码值 (用于梯度)
-        sparse_mask_soft = decisions[..., 1] # [B, H]
-
-        # 使用 STE：在 hard 值上减去 soft 值 (梯度为0)，再加上 soft 值 (梯度为 soft 值的梯度)
-        # 这就是 (y_hard - y_soft).detach() + y_soft 的标准形式。
-        # 这里的 [..., 1] 是选择第二个类别（开启/稀疏头）的决策
-        sparse_mask = sparse_mask_hard.detach() + (sparse_mask_soft - sparse_mask_soft.detach())
-        # sparse_mask = sparse_mask_hard + (sparse_mask_soft - sparse_mask_hard).detach() # 也可以这样写
-
-        decisions_out = sparse_mask_soft.squeeze(1) # decisions_out 仍然返回软概率
-        
+        # decisions_out: 这里的 soft 值通常用于记录统计，但梯度的核心在 sparse_mask
+        decisions_out = z_soft 
         return {
             'decisions': decisions_out,
-            'hard_decisions': hard_decisions,
-            'sparse_mask': sparse_mask, # 现在这个 sparse_mask 在前向是 0/1，但有梯度
+            'hard_decisions': z_hard,
+            'sparse_mask': sparse_mask, # [B, H], 这是一个 STE Tensor
             'logits': logits,
         }
 
@@ -821,8 +835,9 @@ class Qwen3Attention(nn.Module):
             # head_dim = self.head_dim,
             d_feature=self.head_dim,
             use_task_emb=getattr(config, "use_task_emb_for_mask", False),
-            temp=getattr(config, "mask_temp", 0.5),
+            temp=getattr(config, "mask_temp", 2/3),
             hard=getattr(config, "mask_hard_sample", False),
+            pooling_mode=config.pooling_mode
         )
         self.context_window_toggle = context_window_toggle
 
