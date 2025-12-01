@@ -645,8 +645,8 @@ class AttentionRouter(nn.Module):
             raise ValueError(f"Unknown router_type: {router_type}")
         self.dim_mapping = nn.Sequential(*layers)
 
-        if use_task_emb:
-            self.task_emb = nn.Parameter(torch.randn(1, d_feature) * 0.02)
+        if self.use_task_emb:
+            self.task_embedding = nn.Embedding(4, d_feature)
 
         # ---- learnable temperature ----
         if learnable_temp:
@@ -682,7 +682,7 @@ class AttentionRouter(nn.Module):
 
         return torch.stack(pooled_features_list, dim=0) # [B, H, D]
 
-    def forward(self, pooled_input: torch.Tensor, range_ids: torch.Tensor):
+    def forward(self, pooled_input: torch.Tensor, range_ids: torch.Tensor, task_ids: Optional[torch.Tensor] = None):
         """
         pooled_input: [B, seq_len, H, D]
         return:
@@ -711,6 +711,10 @@ class AttentionRouter(nn.Module):
         
         else:
             raise ValueError(f"Unknown pooling_mode: {self.pooling_mode}")
+        
+        if self.use_task_emb and task_ids is not None:
+            task_emb = self.task_embedding(task_ids) # [B, D]
+            x = x + task_emb
 
         logits = self.dim_mapping(x)  # [B, H, 2]
 
@@ -834,7 +838,7 @@ class Qwen3Attention(nn.Module):
             num_key_value_heads=self.num_key_value_heads,
             # head_dim = self.head_dim,
             d_feature=self.head_dim,
-            use_task_emb=getattr(config, "use_task_emb_for_mask", False),
+            use_task_emb=getattr(config, "use_task_emb_for_mask", True),
             temp=getattr(config, "mask_temp", 2/3),
             hard=getattr(config, "mask_hard_sample", False),
             pooling_mode=config.pooling_mode
@@ -1465,6 +1469,7 @@ class Qwen3Attention(nn.Module):
         seq_parallel_group: Optional[Any] = None,
         segment_ids: Optional[torch.LongTensor] = None,
         range_ids: Optional[torch.LongTensor] = None,
+        task_ids: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[
             Tuple[torch.Tensor, torch.Tensor]
         ] = None,  # will become mandatory in v4.46
@@ -1500,7 +1505,7 @@ class Qwen3Attention(nn.Module):
                 if target_x.dim() == 3 and target_x.shape[-1] == self.head_dim:
                     target_x = target_x.unsqueeze(0)
 
-            res = self.mask_allocator(target_x, range_ids)
+            res = self.mask_allocator(target_x, range_ids, task_ids)
             z_kv_batch = res['sparse_mask']
 
             if z_kv_batch.shape[-1] == self.num_key_value_heads:
@@ -1636,6 +1641,7 @@ class Qwen3DecoderLayer(nn.Module):
         seq_parallel_group: Optional[Any] = None,
         segment_ids: Optional[torch.LongTensor] = None,
         range_ids: Optional[torch.LongTensor] = None,
+        task_ids: Optional[torch.LongTensor] = None,
     ) -> Tuple[
         torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]
     ]:
@@ -1669,6 +1675,7 @@ class Qwen3DecoderLayer(nn.Module):
             seq_parallel_group=seq_parallel_group,
             segment_ids=segment_ids,
             range_ids=range_ids,
+            task_ids=task_ids
         )
         hidden_states = residual + hidden_states
 
@@ -1916,6 +1923,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
         target_sparsity: Optional[float] = None,
         segment_ids: Optional[torch.LongTensor] = None,
         range_ids: Optional[torch.LongTensor] = None,
+        task_ids: Optional[torch.LongTensor] = None,
         erank_analysis_path: Optional[str] = None,
         **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
     ) -> Union[Tuple, BaseModelOutputWithPast]:
@@ -1992,6 +2000,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
                     use_reentrant=False,
                     segment_ids=segment_ids,
                     range_ids=range_ids,
+                    task_ids=task_ids,
                 )
             else:
                 layer_outputs = decoder_layer(
@@ -2005,6 +2014,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
                     seq_parallel_group=seq_parallel_group,
                     segment_ids=segment_ids,
                     range_ids=range_ids,
+                    task_ids=task_ids,
                 )
 
             z_layer_sum, hidden_states = layer_outputs[0], layer_outputs[1]
@@ -2028,6 +2038,8 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
         next_cache = next_decoder_cache if use_cache else None
         if compute_sparsity:
+            
+            # model_sparsity = 1 - (z_sum / self.total_num_heads)
             if (
                 seq_parallel_group is not None
                 and dist.is_initialized()
@@ -2327,6 +2339,7 @@ class PawQwen3ForCausalLM(Qwen3PreTrainedModel):
         target_sparsity: Optional[float] = None,
         segment_ids: Optional[torch.LongTensor] = None,
         range_ids: Optional[torch.LongTensor] = None,
+        task_ids: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs: Unpack[KwargsForCausalLM],
     ) -> Union[Tuple, CausalLMOutputWithPast]:
@@ -2425,6 +2438,7 @@ class PawQwen3ForCausalLM(Qwen3PreTrainedModel):
             target_sparsity=target_sparsity,
             segment_ids=segment_ids,
             range_ids=range_ids,
+            task_ids=task_ids,
         )
         hidden_states = outputs[0]
         if seq_lengths is None and unpadded_lengths is not None:

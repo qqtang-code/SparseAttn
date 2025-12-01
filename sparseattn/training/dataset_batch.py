@@ -289,6 +289,8 @@ class PackingDataCollator:
 
         all_tasks = [item.get("task_type", "default") for item in batch]
         
+        all_class_ids = torch.stack([item['class_id'] for item in batch], dim=0)
+        
         res = {
             "input_ids": all_ids,
             "labels": all_labels,
@@ -296,6 +298,7 @@ class PackingDataCollator:
             "task_type": all_tasks,
             "segment_ids": all_segment_ids,
             "range_ids": all_range_ids,
+            "task_ids": all_class_ids,
         }
         
         return res
@@ -486,8 +489,9 @@ def _build_sft_input_and_labels(item, tokenizer, data_args, max_seq_len):
     
     CLASS_MAP = {'Single QA': 0, 'MultiHop QA': 1, 'Summarization': 2, 'Code': 3}
     class_id = CLASS_MAP.get(task_type, 4)
+    class_id_tensor = torch.tensor(class_id, dtype=torch.long)
     
-    return input_ids, labels, attention_mask, segment_ids, range_ids_tensor, class_id
+    return input_ids, labels, attention_mask, segment_ids, range_ids_tensor, class_id_tensor
 
 
 # =========================================================
