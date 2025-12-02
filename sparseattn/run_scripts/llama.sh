@@ -1,15 +1,15 @@
 # Model and training configuration
-model=${MODEL:-"/data1/hf_model/Meta-Llama-3.1-8B-Instruct"}
+model=${MODEL:-"/data2/hf_models/Meta-Llama-3.1-8B-Instruct"}
 bsz=${BSZ:-16}
 seq=${SEQ:-1}
 lr=${LR:-1e-5}
-steps=${STEPS:-1000}
-save_steps=${SAVE:-500}
+steps=${STEPS:-125}
+save_steps=${SAVE:-50}
 save_total_limit=3
 warmup=${WARMUP:-0.1}
 suffix=${SUFFIX:-""}
 overrides=${OVERRIDES:-""}
-min_lr_ratio=${MIN_LR_RATIO:-0.01}
+min_lr_ratio=${MIN_LR_RATIO:-1e-7}
 seq_parallel_size=${SEQ_PARALLEL_SIZE:-1}
 
 # FSDP configuration
@@ -18,10 +18,11 @@ fsdp=${FSDP:-"1"}
 gc=${GC:-"1"}
 
 # PruLong-specific arguments
+# max_toks=${MAX_TOKS:-65536}
 max_toks=${MAX_TOKS:-32768}
 # max_toks=${MAX_TOKS:-256}
 start_head_sparsity=${START_HEAD_SPARSITY:-0.0}
-end_head_sparsity=${END_HEAD_SPARSITY:-0.7}
+end_head_sparsity=${END_HEAD_SPARSITY:-0.3}
 mask_learning_rate=${MASK_LEARNING_RATE:-1.0}
 reg_learning_rate=${REG_LEARNING_RATE:-1.0}
 sparsity_warmup_ratio=${SPARSITY_WARMUP_RATIO:-0.8}
@@ -40,7 +41,7 @@ topk_k=${TOPK_K:-2048}
 enable_ada_sparsity=${ENABLE_ADA_SPARSITY:-true}
 
 # Layer-wise sparsity configuration
-enable_layerwise_sparsity=${ENABLE_LAYERWISE_SPARSITY:-true}
+enable_layerwise_sparsity=${ENABLE_LAYERWISE_SPARSITY:-false}
 layerwise_sparsity_schedule=${LAYERWISE_SPARSITY_SCHEDULE:-"high-low-high"}
 layerwise_sparsity_min_ratio=${LAYERWISE_SPARSITY_MIN_RATIO:-0.5}
 layerwise_sparsity_max_ratio=${LAYERWISE_SPARSITY_MAX_RATIO:-1.0}
@@ -49,13 +50,16 @@ layerwise_sparsity_weight=${LAYERWISE_SPARSITY_WEIGHT:-1.0}
 erank_analysis_path="/"
 
 # Dataset configuration
-# dataset=${DATASET:-"/data1/public_data/mix_sft_filter2"}
-dataset=${DATASET:-"/data1/public_data/Pre_filter"}
-task_type="pretrain" # pretrain or sft
+dataset=${DATASET:-"/data2/public_data/mix_sft_64k"}
+dataset_cache_dir="data_cache/sft"
+# dataset=${DATASET:-"/data1/public_data/Pre_filter"}
+task_type="sft" # pretrain or sft
+
+pooling_mode="first_token" # first_token,mean_all,ctx,q,ctx_q
 
 # Create run name
-# extra_name="entropy_k_xattn_layerwise"
-extra_name="debug_11.10"
+extra_name="sft3_pretrain_64k_xattn_mlp_new*2_linear_first_token_20reg_32k_12.2"
+# extra_name="debug_11.15_nolayerwise_tasksparsity"
 if [[ $freeze_weights == "true" ]]; then
     extra_name="${extra_name}_wfrozen"
 fi
@@ -106,7 +110,7 @@ else
 fi
 
 # accu=$(($bsz / $seq / $num_gpus / $num_nodes))
-accu=1
+accu=8
 
 echo "num_nodes=${num_nodes} master_addr=${master_addr} master_port=${master_port} num_gpus=${num_gpus}"
 
@@ -152,6 +156,8 @@ base_arguments=(
     --save_total_limit $save_total_limit
     --dataloader_num_workers 1
 
+    --data_cache_dir $dataset_cache_dir
+
     --disable_tqdm true
     --use_fast_tokenizer false
     --remove_unused_columns false
@@ -184,6 +190,8 @@ base_arguments=(
     --topk_k $topk_k
 
     --enable_ada_sparsity $enable_ada_sparsity
+
+    --pooling_mode $pooling_mode
 
     # layer decay configuration
     --enable_layerwise_sparsity $enable_layerwise_sparsity
