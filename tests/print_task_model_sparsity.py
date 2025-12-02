@@ -11,7 +11,7 @@ task_configs = {
     "Summarization": {"start": 0.0, "end": 0.7},
 }
 
-LOG_PATH="/data1/lcm_lab/qqt/SparseAttn/sparseattn/checkpoints/masksonly_Qwen3-4B_bsz16_steps125_lr1e-5_warmup0.1_sp0.3_cw2048_mlr1.0_rlr1.0sft3_pretrain_64k_xattn_mlp_new*2_nolinear_ctx_q_5reg_32k_11.30_debug_wfrozen/log.out"
+LOG_PATH="/data1/lcm_lab/qqt/SparseAttn/sparseattn/checkpoints/masksonly_Qwen3-4B_bsz16_steps125_lr1e-5_warmup0.1_sp0.3_cw2048_mlr1.0_rlr1.0sft3_pretrain_64k_xattn_mlp_new*2_nolinear_first_token_5reg_32k_11.30_debug_wfrozen/log.out"
 
 TOTAL_STEPS = 125
 WARMUP_RATIO = 0.8

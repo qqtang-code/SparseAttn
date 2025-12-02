@@ -371,7 +371,7 @@ def _build_sft_input_and_labels(item, tokenizer, data_args, max_seq_len):
     separator = "\n\n"
 
     # Task Token (Segment ID 0)
-    task_ids = tokenizer(task_token, add_special_tokens=True)["input_ids"]
+    task_ids = tokenizer(task_token, add_special_tokens=False)["input_ids"]
 
     if task_ids[-1] == tokenizer.eos_token_id or task_ids[-1] == tokenizer.sep_token_id:
         task_ids = task_ids[:-1]
@@ -404,9 +404,11 @@ def _build_sft_input_and_labels(item, tokenizer, data_args, max_seq_len):
     current_len = 0
     
     # Task (Segment 0)
+    special_start = current_len
     full_input_ids = task_ids
     segment_ids = [0] * len(task_ids)
     current_len += len(task_ids)
+    special_end = current_len - 1 if task_ids else special_start
     
     # Context (Segment 1)
     ctx_start = current_len
@@ -446,6 +448,7 @@ def _build_sft_input_and_labels(item, tokenizer, data_args, max_seq_len):
 
         max_valid_index = max_seq_len - 1 
 
+        special_end = min(special_end, max_valid_index)
         ctx_end = min(ctx_end, max_valid_index)
         q_end = min(q_end, max_valid_index)
         a_end = min(a_end, max_valid_index)
@@ -453,6 +456,8 @@ def _build_sft_input_and_labels(item, tokenizer, data_args, max_seq_len):
         if q_start > max_valid_index:
             q_start = q_end + 1 
 
+        if special_start > max_valid_index:
+            special_start = special_end + 1
 
         if ctx_start > max_valid_index:
             ctx_start = ctx_end + 1
@@ -466,7 +471,7 @@ def _build_sft_input_and_labels(item, tokenizer, data_args, max_seq_len):
     labels = full_input_ids.copy()
     
     # Range_ids: [ctx_start, ctx_end, q_start, q_end, a_start, a_end]
-    range_ids = [ctx_start, ctx_end, q_start, q_end, a_start, a_end]
+    range_ids = [special_start, special_end, ctx_start, ctx_end, q_start, q_end, a_start, a_end]
     
     padding_len = max_seq_len - len(full_input_ids)
     if padding_len > 0:

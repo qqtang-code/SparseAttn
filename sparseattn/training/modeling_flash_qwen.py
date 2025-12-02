@@ -656,8 +656,8 @@ class AttentionRouter(nn.Module):
     def _segment_pooling(self, pooled_input: torch.Tensor, range_ids: torch.Tensor, segments: list) -> torch.Tensor:
         B, S, H, D = pooled_input.shape
         pooled_features_list = []
-
-        idx_map = {'ctx': (0, 1), 'q': (2, 3), 'a': (4, 5)} 
+        
+        idx_map = {'first_token': (0, 1),'ctx': (2, 3), 'q': (4, 5), 'a': (6, 7)} 
         for i in range(B):
             sample_features = []
 
@@ -695,7 +695,7 @@ class AttentionRouter(nn.Module):
         """
         B, S, H, D = pooled_input.shape
         if self.pooling_mode == 'first_token':
-            x = pooled_input[:, 0, :, :]  # [B, H, D]
+            x = self._segment_pooling(pooled_input, range_ids, ['first_token'])  # [B, H, D]
         
         elif self.pooling_mode == 'mean_all':
             x = pooled_input.mean(dim=1) # [B, H, D]
@@ -838,7 +838,7 @@ class Qwen3Attention(nn.Module):
             num_key_value_heads=self.num_key_value_heads,
             # head_dim = self.head_dim,
             d_feature=self.head_dim,
-            use_task_emb=getattr(config, "use_task_emb_for_mask", True),
+            use_task_emb=getattr(config, "use_task_emb_for_mask", False),
             temp=getattr(config, "mask_temp", 2/3),
             hard=getattr(config, "mask_hard_sample", False),
             pooling_mode=config.pooling_mode
