@@ -25,8 +25,6 @@ from functools import partial
 import math
 import gc
 
-from .dataset_batch import StreamingParquetIterable
-
 from datasets import Dataset
 import transformers
 from transformers import Trainer as HFTrainer
@@ -297,11 +295,11 @@ class Trainer(HFTrainer):
         # }
         self.task_sparsity_config = {
             "default": {"start": self.start_head_sparsity, "end": self.end_head_sparsity},
-            "Code": {"start": 0.0, "end": 0.4},
-            "Math": {"start": 0.0, "end": 0.6},
-            "MultiHop QA": {"start": 0.0, "end": 0.2},
-            "Single QA": {"start": 0.0, "end": 0.2},
-            "Summarization": {"start": 0.0, "end": 0.7},
+            "Code": {"start": 0.5, "end": 0.4},
+            "Math": {"start": 0.5, "end": 0.6},
+            "MultiHop QA": {"start": 0.5, "end": 0.2},
+            "Single QA": {"start": 0.5, "end": 0.2},
+            "Summarization": {"start": 0.5, "end": 0.7},
         }
 
 
@@ -347,7 +345,7 @@ class Trainer(HFTrainer):
             else:
                 sp = end_sp
             sparsities.append(sp)
-        
+
         return torch.tensor(sparsities, dtype=torch.float32)  # shape: [B]
 
     def get_sequence_parallel_inputs(self, inputs):
@@ -449,28 +447,14 @@ class Trainer(HFTrainer):
         target_sparsity = target_sparsity.to(model.device)  # [B]
         
         inputs = self.get_sequence_parallel_inputs(inputs)
-
-        unique_tasks = list(set(tasks))
-        mean_spars = {t: target_sparsity[i].item() for i, t in enumerate(tasks[:3])}
+        
         print(f"[Step {self.state.global_step}] Sample tasks: {tasks[:3]} → sparsity: {[f'{s:.3f}' for s in target_sparsity[:3].tolist()]}")
         attention_mask = inputs.get("attention_mask")
         valid_tokens = attention_mask.sum(dim=1)
         print(f"Rank {torch.distributed.get_rank() if torch.distributed.is_initialized() else 0}: "
             f"valid tokens per sample = {valid_tokens.tolist()}, total = {valid_tokens.sum().item()}")
-        try:
-            outputs = model(**inputs, use_cache=False, target_sparsity=target_sparsity)
-        except Exception as e:
-            attn_mask = inputs["attention_mask"]
-            valid_tokens = attn_mask.sum(dim=1)
-            print(f"Rank {torch.distributed.get_rank() if torch.distributed.is_initialized() else 0}: "
-                f"valid tokens per sample = {valid_tokens.tolist()}, total = {valid_tokens.sum().item()}")
-            print(f"[Warning] Error occurred on this batch, skipping. Error: {repr(e)}")
-            print("-" * 80, flush=True)
 
-            zero_loss = torch.tensor(0.0, requires_grad=True, device=model.device)
-            if return_outputs:
-                return (zero_loss, None)
-            return zero_loss
+        outputs = model(**inputs, use_cache=False, target_sparsity=target_sparsity)
 
         lm_loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
 
@@ -502,21 +486,16 @@ class Trainer(HFTrainer):
                 )  # moving avg
             lm_loss = lm_loss / self.state.avg_num_valid_tokens_per_device
 
-        reg_loss = (
-            outputs["sparsity_loss"] if isinstance(outputs, dict) else outputs[-1]
-        )
-        loss = lm_loss + 20 * reg_loss
+        reg_loss = outputs["sparsity_loss"] if isinstance(outputs, dict) else outputs[-2]
+        contrastive_loss = outputs["contrastive_loss"] if isinstance(outputs, dict) else outputs[-1]
+        
+        loss = lm_loss + 10 * reg_loss + contrastive_loss
         model_sparsity = outputs["model_sparsity"]
         print(f"Rank {torch.distributed.get_rank() if torch.distributed.is_initialized() else 0}: "f"[Step {self.state.global_step}] Task={tasks} | model_sparsity={model_sparsity} ｜ reg_loss={reg_loss}")
 
         if self.log_loss and self.accelerator.is_main_process:
             model_sparsity = (
                 outputs["model_sparsity"] if isinstance(outputs, dict) else outputs[-3]
-            )
-            logger.info(
-                f"@ {self.state.global_step} | Loss: {loss} | LM Loss: {lm_loss} | "
-                f"Reg Loss: {reg_loss} | Target Sparsity: {target_sparsity} | "
-                f"Model Sparsity: {model_sparsity}"
             )
             # Fetch diagnostics if present
             exp_sparsity = (
@@ -558,8 +537,9 @@ class Trainer(HFTrainer):
                 )
 
             logger.info(
-                f"@ {self.state.global_step} | Loss: {loss} | LM: {lm_loss} | Reg: {reg_loss} | "
-                f"Target: {target_sparsity} | Sparsity: {model_sparsity}"
+                f"@ {self.state.global_step} | Loss: {loss} | LM Loss: {lm_loss} | "
+                f"Reg Loss: {reg_loss} | contrastive_loss: {contrastive_loss} | "
+                f"Target Sparsity: {target_sparsity} | Model Sparsity: {model_sparsity}"
                 + (" | " + " | ".join(extra) if len(extra) else "")
             )
 
@@ -582,6 +562,11 @@ class Trainer(HFTrainer):
                     "loss": float(
                         loss.detach().item() if isinstance(loss, torch.Tensor) else loss
                     ),
+                    "contrastive_loss": float(
+                        contrastive_loss.detach().item()
+                        if isinstance(contrastive_loss, torch.Tensor)
+                        else contrastive_loss
+                    ),
                     "target_sparsity": target_sparsity,
                     "model_sparsity": model_sparsity,
                     "step": self.state.global_step,
@@ -600,37 +585,6 @@ class Trainer(HFTrainer):
                                 else:
                                     v = float(v.mean().item())
                             train_metrics[k] = v
-                # if isinstance(outputs, dict):
-                #     if (
-                #         "layerwise_model_sparsity" in outputs
-                #         and outputs["layerwise_model_sparsity"] is not None
-                #     ):
-                #         lms = outputs["layerwise_model_sparsity"]
-                #         if isinstance(lms, torch.Tensor):
-                #             lms = lms.detach().cpu().float()
-                #             for i, s in enumerate(lms):
-                #                 train_metrics[f"layer_{i}/sparsity"] = float(s)
-
-                #     if (
-                #         "layerwise_target_sparsity" in outputs
-                #         and outputs["layerwise_target_sparsity"] is not None
-                #     ):
-                #         lt = outputs["layerwise_target_sparsity"]
-                #         if isinstance(lt, torch.Tensor):
-                #             lt = lt.detach().cpu().float()
-                #             for i, t in enumerate(lt):
-                #                 train_metrics[f"layer_{i}/target"] = float(t)
-
-                #     if (
-                #         "layerwise_model_sparsity" in outputs
-                #         and "layerwise_target" in outputs
-                #     ):
-                #         lms = outputs["layerwise_model_sparsity"]
-                #         lt = outputs["layerwise_target"]
-                #         if lms is not None and lt is not None:
-                #             diff = (lms - lt).detach().cpu().float()
-                #             for i, d in enumerate(diff):
-                #                 train_metrics[f"layer_{i}/sparsity_diff"] = float(d)
                 self.log(train_metrics)
 
         if return_output_and_metrics:
@@ -1320,73 +1274,7 @@ class Trainer(HFTrainer):
         return metrics
 
     # def get_train_dataloader(self):
-    #     """
-    #     Because streaming handles the distributed data parallel by itself, we don't need special data loader.
-    #     The plainest data loader is enough.
-    #     """
-    #     if not isinstance(self.train_dataset, StreamingParquetIterable):
-    #         return super().get_train_dataloader()
 
-    #     if not self.args.streaming_dataset:
-    #         return super().get_train_dataloader()
-
-    #     logger.warning("Use streaming dataloader for train")
-
-    #     if self.train_dataset is None:
-    #         raise ValueError("Trainer: training requires a train_dataset.")
-
-    #     train_dataset = self.train_dataset
-    #     data_collator = self.data_collator
-    #     data_collator = self._get_collator_with_removed_columns(
-    #         data_collator, description="training"
-    #     )
-
-    #     dataloader_params = {
-    #         "batch_size": self._train_batch_size,
-    #         "collate_fn": data_collator,
-    #         "num_workers": self.args.dataloader_num_workers,
-    #         "pin_memory": self.args.dataloader_pin_memory,
-    #         "persistent_workers": self.args.dataloader_persistent_workers,
-    #     }
-
-    #     # Streaming is iterable so no need to set sampler etc.
-
-    #     # Instead of use accelerate to prepare the dataloader, we just return a plain dataloader
-    #     self.train_dataloader = DataLoader(train_dataset, **dataloader_params)
-    #     # This actually uses the dataset first dimension......
-
-    #     return self.train_dataloader
-
-    # def get_eval_dataloader(self, eval_dataset):
-    #     """
-    #     Because streaming handles the distributed data parallel by itself, we don't need special data loader.
-    #     The plainest data loader is enough.
-    #     """
-    #     if not self.args.streaming_dataset:
-    #         return super().get_eval_dataloader()
-
-    #     logger.warning("Use streaming dataloader for val")
-
-    #     if eval_dataset is None and self.eval_dataset is None:
-    #         raise ValueError("Trainer: evaluation requires an eval_dataset.")
-    #     eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
-    #     data_collator = self.data_collator
-    #     data_collator = self._get_collator_with_removed_columns(
-    #         data_collator, description="evaluation"
-    #     )
-
-    #     dataloader_params = {
-    #         "batch_size": self.args.eval_batch_size,
-    #         "collate_fn": data_collator,
-    #         "num_workers": self.args.dataloader_num_workers,
-    #         "pin_memory": self.args.dataloader_pin_memory,
-    #         "persistent_workers": self.args.dataloader_persistent_workers,
-    #     }
-
-    #     # Streaming is iterable so no need to set sampler etc.
-
-    #     # Instead of use accelerate to prepare the dataloader, we just return a plain dataloader
-    #     return StreamingDataLoader(eval_dataset, **dataloader_params)
 
     def _save_checkpoint(self, model, trial, metrics=None):
         # A wrapper around the original _save_checkpoint function to save streaming dataset state
@@ -1401,23 +1289,6 @@ class Trainer(HFTrainer):
         checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
         run_dir = self._get_output_dir(trial=trial)
         output_dir = os.path.join(run_dir, checkpoint_folder)
-
-        if (
-            isinstance(self.train_dataset, StreamingParquetIterable)
-            and self.state.is_world_process_zero
-        ):
-            num_samples = (
-                self.state.global_step
-                * self.args.train_batch_size
-                * self.args.world_size
-                * self.args.gradient_accumulation_steps
-            )
-            dataset_state_dict = self.train_dataset.state_dict(num_samples)
-            logger.warning(f"Save streaming dataset state: {dataset_state_dict}")
-            with open(
-                os.path.join(output_dir, "streaming_dataset_state.json"), "w"
-            ) as f:
-                json.dump(dataset_state_dict, f)
 
         # Save streaming dataset state
         if (
@@ -1518,19 +1389,8 @@ class Trainer(HFTrainer):
 
             # Load the dataset state and reinit the dataloader
             logger.warning(
-                f"Resume streaming dataset state from {checkpoint}: {dataset_state_dict}"
+                "⚠️ Dataset does not support state_dict loading, skipping resume."
             )
-            if hasattr(self.train_dataset, "load_state_dict"):
-                self.train_dataset.load_state_dict(dataset_state_dict)
-                logger.warning(
-                    "✅ Successfully resumed StreamingParquetIterable state."
-                )
-            elif isinstance(self.train_dataset, PrepackedDataset):
-                logger.info("PrepackedDataset detected — no streaming state to resume.")
-            else:
-                logger.warning(
-                    "⚠️ Dataset does not support state_dict loading, skipping resume."
-                )
 
     # Override the original train() to handle the case
     # when resuming from a checkpoint but no trainer_state is there

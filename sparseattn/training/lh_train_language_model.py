@@ -108,17 +108,6 @@ def main():
         use_auth_token=True if script_args.use_auth_token else None,
         enable_thinking=True if script_args.use_thinking else False,
     )
-    # Some special tokens
-    special_tokens_dict = {
-        'additional_special_tokens': [
-            '[TASK_SQA]',   # For Single QA
-            '[TASK_MHQA]',  # For MultiHop QA
-            '[TASK_SUM]',   # For Summarization
-            '[TASK_CODE]',  # For Code
-            '[TASK_OTHER]'  # Fallback
-        ]
-    }
-    tokenizer.add_special_tokens(special_tokens_dict)
     
     # Determine model type and load appropriate config
     if "qwen" in script_args.model_name_or_path.lower():
@@ -137,6 +126,7 @@ def main():
             erank_analysis_path=training_args.erank_analysis_path
             if hasattr(training_args, "erank_analysis_path")
             else None,
+            pooling_mode = training_args.pooling_mode,
         )
     elif "llama" in script_args.model_name_or_path.lower():
         config = PawLlamaConfig.from_pretrained(
@@ -268,9 +258,7 @@ def main():
                 f"Model name {script_args.model_name_or_path} does not contain. "
                 "Please provide a valid model name."
             )
-    # reset tokenizer 
-    model.resize_token_embeddings(len(tokenizer))
-
+            
     if hasattr(model, "reset_masks"):
         model.reset_masks()
 

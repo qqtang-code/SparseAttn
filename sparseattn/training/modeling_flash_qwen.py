@@ -106,6 +106,7 @@ class PawQwen3Config(Qwen3Config):
 
         # 新增：top-k 注意力的超参（每个 query 仅保留前 k 个 key）
         self.topk_k = kwargs.pop("topk_k", 32)
+        self.pooling_seq = kwargs.pop("pooling_seq", True)
 
         super().__init__(*args, **kwargs)
 
@@ -531,7 +532,7 @@ class Qwen3RotaryEmbedding(nn.Module):
 
         self._update_cos_sin_cache(max_seqlen + seqlen_offset, q.device, q.dtype)
 
-        return apply_rotary_emb_func(
+        rope_q = apply_rotary_emb_func(
             q,
             self._cos_cached[seqlen_offset:],
             self._sin_cached[seqlen_offset:],
@@ -539,7 +540,8 @@ class Qwen3RotaryEmbedding(nn.Module):
             True,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
-        ), apply_rotary_emb_func(
+        )
+        rope_k = apply_rotary_emb_func(
             k,
             self._cos_cached[seqlen_offset:],
             self._sin_cached[seqlen_offset:],
@@ -548,6 +550,7 @@ class Qwen3RotaryEmbedding(nn.Module):
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
         )
+        return rope_q, rope_k
 
 
 class Qwen3MLP(nn.Module):
@@ -615,598 +618,11 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
-class AttentionRouterEntropy(nn.Module):
-    def __init__(self,
-                 input_dim,
-                 num_key_value_heads,
-                 head_dim=None,
-                 d_feature=128,
-                 num_chunks=4,
-                 use_task_emb=False,
-                 temp=1.0,
-                 hard=False,
-                 router_type='mlp',
-                 entropy_agg='mean',       # 'mean' or 'max' (如何把 chunk-level entropy 聚合成每 head 一个值)
-                 entropy_mode='attn',      # 'attn' (default) or 'feature'
-                 eps=1e-8):
-        super().__init__()
-        self.num_kv = num_key_value_heads
-        self.temp = temp
-        self.hard = hard
-        self.use_task_emb = use_task_emb
-        self.router_type = router_type
-        self.num_chunks = num_chunks
-        self.entropy_agg = entropy_agg
-        self.eps = eps
-        self.head_dim = head_dim  # used for entropy normalization if provided
-        self.entropy_mode = entropy_mode
-
-        map_in = input_dim + 1  # concat entropy scalar per head
-        if router_type == 'linear':
-            self.dim_mapping = nn.Linear(map_in, 2)
-        else:  # 'mlp' or other
-            self.dim_mapping = nn.Sequential(
-                nn.Linear(map_in, d_feature),
-                nn.SiLU(),
-                nn.Linear(d_feature, 2)
-            )
-
-        self.q_projector = nn.Sequential(
-            nn.Linear((head_dim or input_dim), input_dim),
-            nn.SiLU(),
-            nn.Linear(input_dim, input_dim)
-        )
-
-        # chunk prototype queries used to pool the sequence into chunks (learned)
-        self.chunk_queries = nn.Parameter(torch.randn(num_chunks, head_dim or input_dim) * 0.01)
-
-    def _compute_entropy_per_head_from_attn(self, attn_chunks, seq_len):
-        """
-        attn_chunks: [B, C, H, S]  (C=num_chunks, S=seq_len)
-        returns: [B, H] normalized entropy per head in [0,1]
-        """
-        # clamp for numerical stability
-        p = attn_chunks.clamp(min=self.eps)
-        # entropy per chunk per head: -sum p log p
-        ent_chunk = - (p * p.log()).sum(dim=-1)  # [B, C, H]
-        # normalize by log(S) to get value in [0,1]
-        denom = math.log(max(seq_len, 2))
-        ent_chunk = ent_chunk / denom
-        # aggregate across chunks into a single head-level entropy
-        if self.entropy_agg == 'mean':
-            ent = ent_chunk.mean(dim=1)  # [B, H]
-        else:
-            ent = ent_chunk.max(dim=1).values
-        return ent
-
-    def _compute_entropy_per_head_feature(self, chunked_q):
-        """
-        Fallback: original feature-based entropy (kept for compatibility)
-        chunked_q: [B, C, H, D]
-        returns: [B, H]
-        """
-        B, C, H, D = chunked_q.shape
-        v = chunked_q.reshape(B*C*H, D)
-        a = v.abs()
-        p = F.softmax(a, dim=-1).clamp(min=self.eps, max=1.0)
-        ent = - (p * p.log()).sum(dim=-1) / math.log(max(D, 2))
-        ent = ent.view(B, C, H)
-        return ent.mean(dim=1) if self.entropy_agg == 'mean' else ent.max(dim=1).values
-
-    def _compress_seq_to_chunks(self, q):
-        """
-        q: [B, S, H, D]
-        returns:
-          pooled: [B, C, H, D]
-          attn_chunks: [B, C, H, S]  (attention weights used to pool)
-        Implementation: use learned chunk_queries as queries to attend over sequence positions per head.
-        """
-        B, S, H, D = q.shape
-        q_flat = q.permute(0, 2, 1, 3)  # [B, H, S, D]
-
-        # normalize both sides to avoid overflow
-        q_norm = F.normalize(q_flat, dim=-1)
-        chunk_q = F.normalize(self.chunk_queries, dim=-1)  # [C, D]
-
-        # expand chunk queries -> [B, H, C, D]
-        queries = chunk_q.unsqueeze(0).unsqueeze(0).expand(B, H, -1, -1)
-        # compute similarity: [B, H, C, S]
-        sim = (queries @ q_norm.transpose(-1, -2)) / 0.1  # temperature factor for contrast
-        sim = sim - sim.amax(dim=-1, keepdim=True)  # numerical stabilization
-
-        attn_weights = torch.softmax(sim, dim=-1)  # [B, H, C, S]
-
-        # pooled features: attn_weights @ q_flat -> [B, H, C, D]
-        pooled = (attn_weights @ q_flat)
-        # reorder to [B, C, H, D]
-        pooled = pooled.permute(0, 2, 1, 3).contiguous()
-
-        # reorder attn to [B, C, H, S] to be consistent with entropy function
-        attn_chunks = attn_weights.permute(0, 2, 1, 3).contiguous()
-
-        return pooled, attn_chunks
-
-    def forward(self, q=None, pooled_input=None, task_ids=None):
-        """
-        Either provide q ([B,S,H,D]) or pooled_input ([B,1,H,input_dim]) (or both). q preferred.
-        Returns dict:
-          decisions: soft probability of sparse [B, H]
-          hard_decisions: one-hot [B, H, 2]
-          sparse_mask: binary [B, H] (0=full, 1=sparse) - inference uses this
-          logits: raw logits [B, H, 2]
-          entropy: [B, H] normalized entropy per head
-        """
-        assert q is not None or pooled_input is not None, "Either q or pooled_input must be provided."
-        if q is not None:
-            # q: [B, S, H, D]
-            B, S, H, D = q.shape
-
-            # compress seq -> chunks and also get attn weights
-            chunked, attn_chunks = self._compress_seq_to_chunks(q)  # chunked: [B, C, H, D]; attn_chunks: [B, C, H, S]
-
-            if self.entropy_mode == 'attn':
-                entropy = self._compute_entropy_per_head_from_attn(attn_chunks, seq_len=S)  # [B, H]
-            else:
-                entropy = self._compute_entropy_per_head_feature(chunked)
-
-            # derive a pooled feature per head from chunked q: mean across chunks and D
-            q_chunk_mean_over_D = chunked.mean(dim=1)  # [B, H, D]
-            pooled_feat_proj = self.q_projector(q_chunk_mean_over_D)  # [B, H, input_dim]
-        else:
-            # pooled_input: expected shape [B, 1, H, input_dim] or [B, H, input_dim]
-            pi = pooled_input
-            if pi.dim() == 4:
-                # [B,1,H,input_dim] -> [B,H,input_dim]
-                pooled_feat_proj = pi.squeeze(1)
-            elif pi.dim() == 3:
-                pooled_feat_proj = pi
-            else:
-                raise ValueError("pooled_input must be shape [B,1,H,input_dim] or [B,H,input_dim]")
-            # no entropy from q available -> set entropy to zeros (or you could estimate)
-            entropy = torch.zeros(pooled_feat_proj.shape[0], pooled_feat_proj.shape[1], device=pooled_feat_proj.device)
-
-        # Now pooled_feat_proj: [B, H, input_dim]
-        B, H, in_dim = pooled_feat_proj.shape
-        # entropy: [B, H] -> normalize (already normalized by log(S) earlier for attn mode)
-        ent = entropy.unsqueeze(-1)  # [B, H, 1]
-
-        # concat features
-        cat = torch.cat([pooled_feat_proj, ent], dim=-1)  # [B, H, input_dim+1]
-
-        # compute logits per head
-        logits = self.dim_mapping(cat)  # [B, H, 2]
-
-        # soft / hard decisions
-        if self.router_type == 'gumbel' and self.training:
-            # Gumbel-Softmax (soft, differentiable)
-            decisions_full = F.gumbel_softmax(logits.view(-1, 2), tau=self.temp, hard=False)
-            decisions_full = decisions_full.view(B, H, 2)
-            hard_decisions = F.gumbel_softmax(logits.view(-1, 2), tau=self.temp, hard=True).view(B, H, 2)
-        else:
-            # softmax with temperature for soft decisions
-            decisions_full = F.softmax(logits / max(self.temp, 1e-6), dim=-1)  # [B,H,2]
-            # hard decisions: one-hot via argmax (non-differentiable; training uses decisions_full)
-            argmax = logits.argmax(dim=-1, keepdim=True)  # [B,H,1]
-            hard_decisions = torch.zeros_like(decisions_full).scatter_(-1, argmax, 1.0)
-
-        # inference mode: use hard decisions as the returned "decisions" mask if not training
-        if not self.training:
-            chosen = hard_decisions
-        else:
-            chosen = decisions_full  # soft during training
-
-        # sparse mask is index 1 (1 = sparse)
-        sparse_mask = chosen[..., 1]  # [B, H]  (soft in train, binary in eval)
-
-        # also produce a clean decisions scalar (probability of sparse)
-        decisions = decisions_full[..., 1]  # soft prob of sparse [B,H]
-
-        return {
-            'decisions': decisions,            # soft probability (train: soft, eval: one-hot->0/1)
-            'hard_decisions': hard_decisions,  # one-hot [B,H,2]
-            'sparse_mask': sparse_mask,        # binary/soft mask [B,H]
-            'logits': logits,                  # raw logits [B,H,2]
-            'entropy': entropy                 # [B,H]
-        }
-
-
-class MaskAllocator(nn.Module):
-    def __init__(self, input_dim, num_key_value_heads, hidden_dim=128, temp=1.5, hard=False, dtype=torch.float32):
-        super().__init__()
-        self.num_kv = num_key_value_heads
-        self.temp = temp
-        self.hard = hard
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, self.num_kv, bias=True),
-        )
-        self.max_logit = 5.0
-
-    def forward(self, hidden_states):
-        # hidden_states: [B, S, H]
-        pooled = hidden_states.mean(dim=1)
-        logits_raw = self.net(pooled)
-        
-        logits = self.max_logit * torch.tanh(logits_raw / self.max_logit)
-        probs = torch.sigmoid(logits)
-
-        if self.training:
-            # Gumbel-Sigmoid
-            logits_2d = torch.stack([logits, -logits], dim=-1)
-            z = F.gumbel_softmax(logits_2d, tau=self.temp, hard=self.hard, dim=-1)[..., 0]
-            z = torch.clamp(z, 0.1, 0.9) 
-        else:
-            z = (torch.sigmoid(logits) > 0.5).float()
-        
-
-        return {
-            'decisions': z,            # soft probability (train: soft, eval: one-hot->0/1)
-            'logits': probs,                  # raw logits [B,H,2]
-        }
-
-# class AttentionRouter(nn.Module):
-#     def __init__(self, input_dim, num_key_value_heads, d_feature=128,
-#                  use_task_emb=False, temp=1.0, hard=False, router_type='mlp'):
-#         super().__init__()
-#         self.num_kv = num_key_value_heads
-#         self.temp = temp
-#         self.hard = hard
-#         self.use_task_emb = use_task_emb
-#         self.router_type = router_type
-
-#         if router_type == 'linear':
-#             self.dim_mapping = nn.Linear(d_feature, 2)
-#         elif router_type == 'mlp':
-#             self.dim_mapping = nn.Sequential(
-#                 nn.Linear(d_feature, d_feature),
-#                 nn.SiLU(),
-#                 nn.Linear(d_feature, 2)
-#             )
-
-#     def forward(self, pooled_input):
-#         """pooled_input: [b, seq_len, h, hidden_dim]"""
-#         x = pooled_input.mean(dim=1)
-#         logits = self.dim_mapping(x) # [b, 1, h, 2]
-#         if self.router_type == 'gumbel' and self.training:
-#             # Gumbel-Softmax: 训练时可微，推理时离散
-#             decisions = F.gumbel_softmax(logits, tau=self.temp, hard=False)
-#             hard_decisions = F.gumbel_softmax(logits, tau=self.temp, hard=True)
-#         else:
-#             # 标准softmax
-#             decisions = F.softmax(logits / self.temp, dim=-1)
-#             hard_decisions = torch.zeros_like(decisions)
-#             hard_decisions.scatter_(-1, logits.argmax(dim=-1, keepdim=True), 1.0)
-
-#         if not self.training:
-#             decisions = hard_decisions
-
-#         sparse_mask = hard_decisions[..., 1]  # (B, H)
-#         decisions = decisions[..., 1].squeeze(1)
-
-#         return {
-#             'decisions': decisions,  # soft probability
-#             'hard_decisions': hard_decisions,  # one-hot
-#             'sparse_mask': sparse_mask,  # binary mask
-#             'logits': logits,  # for loss computation
-#         }
-# class AttentionRouter(nn.Module):
-#     def __init__(self, input_dim, num_key_value_heads, d_feature=128,
-#                  use_task_emb=False, temp=1.0, hard=False, 
-#                  router_type='mlp', use_gumbel=True, learnable_temp=False,
-#                  dropout=0.1, layernorm=True):
-#         super().__init__()
-#         self.num_kv = num_key_value_heads
-#         self.temp = temp
-#         self.hard = hard
-#         self.use_task_emb = use_task_emb
-#         self.router_type = router_type
-#         self.use_gumbel = use_gumbel
-#         self.learnable_temp = learnable_temp
-#         if router_type == 'linear':
-#             layers = [nn.Linear(d_feature, 2)]
-#         elif router_type == 'mlp':
-#             layers = [
-#                 nn.Linear(d_feature, d_feature),
-#                 nn.SiLU(),
-#                 nn.Dropout(dropout),
-#                 nn.Linear(d_feature, 2)
-#             ]
-#         else:
-#             raise ValueError(f"Unknown router_type: {router_type}")
-#         self.dim_mapping = nn.Sequential(*layers)
-
-#         if use_task_emb:
-#             self.task_emb = nn.Parameter(torch.randn(1, d_feature) * 0.02)
-
-#         # ---- learnable temperature ----
-#         if learnable_temp:
-#             self.log_temp = nn.Parameter(torch.log(torch.tensor(temp)))
-#         else:
-#             self.register_buffer("log_temp", torch.log(torch.tensor(temp)))
-
-#     def forward(self, pooled_input):
-#         """
-#         pooled_input: [B, seq_len, H, D]
-#         return:
-#             {
-#               'decisions': [B, H],
-#               'hard_decisions': [B, H, 2],
-#               'sparse_mask': [B, H],
-#               'logits': [B, H, 2]
-#             }
-#         """
-#         B, S, H, D = pooled_input.shape
-
-#         x = pooled_input.mean(dim=1)  # [B, H, D]
-
-#         if self.use_task_emb:
-#             x = x + self.task_emb
-
-#         logits = self.dim_mapping(x)  # [B, H, 2]
-
-#         logits = torch.tanh(logits) * 5.0  # [-5, 5]
-
-#         tau = torch.exp(self.log_temp).clamp(0.5, 10.0)
-#         logits = torch.nan_to_num(logits, nan=0.0, posinf=5.0, neginf=-5.0)
-
-#         # --- Gumbel or Softmax routing ---
-#         if self.training:
-#             eps = 1e-8
-#             logits = logits + eps * torch.randn_like(logits)
-#             decisions = F.gumbel_softmax(logits, tau=tau, hard=False)
-#             hard_decisions = F.gumbel_softmax(logits, tau=tau, hard=True)
-#         else:
-#             decisions = F.softmax(logits / tau, dim=-1)
-#             hard_decisions = torch.zeros_like(decisions)
-#             hard_decisions.scatter_(-1, logits.argmax(dim=-1, keepdim=True), 1.0)
-
-#         if not self.training:
-#             decisions = hard_decisions
-
-#         sparse_mask = hard_decisions[..., 1]  # [B, H]
-#         decisions_out = decisions[..., 1].squeeze(1)
-
-#         return {
-#             'decisions': decisions_out,
-#             'hard_decisions': hard_decisions,
-#             'sparse_mask': sparse_mask,
-#             'logits': logits,
-#         }
-
-
-# class AttentionRouter(nn.Module):
-#     def __init__(self,
-#                  input_dim,
-#                  num_key_value_heads,
-#                  head_dim=None,
-#                  d_feature=128,
-#                  num_chunks=4,
-#                  use_task_emb=False,
-#                  temp=1.0,
-#                  hard=False,
-#                  router_type='mlp',
-#                  entropy_agg='mean',
-#                  entropy_mode='attn',
-#                  eps=1e-8):
-#         super().__init__()
-#         self.num_kv = num_key_value_heads
-#         self.temp = temp
-#         self.hard = hard
-#         self.use_task_emb = use_task_emb
-#         self.router_type = router_type
-#         self.num_chunks = num_chunks
-#         self.entropy_agg = entropy_agg
-#         self.eps = eps
-#         self.head_dim = head_dim
-#         self.entropy_mode = entropy_mode
-
-#         feat_dim = head_dim or input_dim
-#         self.chunk_queries = nn.Parameter(torch.randn(num_chunks, feat_dim) * 0.01)
-
-#         if router_type == 'linear':
-#             self.dim_mapping = nn.Linear(map_in, 2)
-#         else:
-#             self.dim_mapping = nn.Sequential(
-#                 nn.Linear(d_feature, d_feature),
-#                 nn.SiLU(),
-#                 nn.Linear(d_feature, 2)
-#             )
-
-#         self.q_projector = nn.Sequential(
-#             nn.Linear(feat_dim, input_dim),
-#             nn.SiLU(),
-#             nn.Linear(input_dim, input_dim)
-#         )
-
-#         self.register_buffer("log_temp", torch.log(torch.tensor(temp)))
-
-#     def _compress_seq_to_chunks(self, q):
-#         """
-#         q: [B, S, H, D]
-#         returns:
-#           pooled: [B, C, H, D]
-#           attn_chunks: [B, C, H, S]
-#         Implementation: use learned chunk_queries as queries to attend over sequence positions per head.
-#         """
-#         B, S, H, D = q.shape
-#         device = q.device
-        
-
-#         q_flat = q.permute(0, 2, 1, 3)  # [B, H, S, D]
-#         q_norm = F.normalize(q_flat, dim=-1)
-#         chunk_q = F.normalize(self.chunk_queries, dim=-1)  # [C, D]
-
-#         queries = chunk_q.unsqueeze(0).unsqueeze(0).expand(B, H, -1, -1)  # [B, H, C, D]
-#         sim = (queries @ q_norm.transpose(-1, -2)) / 0.1  # [B, H, C, S]
-#         sim = sim - sim.amax(dim=-1, keepdim=True)
-#         attn_weights = torch.softmax(sim, dim=-1)  # [B, H, C, S]
-
-#         pooled = attn_weights @ q_flat  # [B, H, C, D]
-#         pooled = pooled.permute(0, 2, 1, 3).contiguous()  # [B, C, H, D]
-#         attn_chunks = attn_weights.permute(0, 2, 1, 3).contiguous()  # [B, C, H, S]
-
-#         return pooled, attn_chunks
-
-#     def forward(self, pooled_input):
-#         """
-#         pooled_input: [B, S, H, D]
-#         return:
-#             {
-#               'decisions': [B, H],
-#               'hard_decisions': [B, H, 2],
-#               'sparse_mask': [B, H],
-#               'logits': [B, H, 2],
-#               'attn_chunks': [B, C, H, S],
-#             }
-#         """
-#         B, S, H, D = pooled_input.shape
-#         device = pooled_input.device
-
-#         # ---- chunk-level compression ----
-#         pooled, attn_chunks = self._compress_seq_to_chunks(pooled_input)  # [B, C, H, D]
-
-#         x = pooled.mean(dim=1)  # [B, H, D]
-#         logits = self.dim_mapping(x)  # [B, H, 2]
-#         logits = torch.tanh(logits) * 5.0
-
-#         tau = torch.exp(self.log_temp).clamp(0.5, 10.0)
-#         logits = torch.nan_to_num(logits, nan=0.0, posinf=5.0, neginf=-5.0)
-
-#         # ---- Gumbel routing ----
-#         if self.training:
-#             eps = 1e-8
-#             logits = logits + eps * torch.randn_like(logits)
-#             decisions = F.gumbel_softmax(logits, tau=tau, hard=False)
-#             hard_decisions = F.gumbel_softmax(logits, tau=tau, hard=True)
-#         else:
-#             decisions = F.softmax(logits / tau, dim=-1)
-#             hard_decisions = torch.zeros_like(decisions)
-#             hard_decisions.scatter_(-1, logits.argmax(dim=-1, keepdim=True), 1.0)
-
-#         if not self.training:
-#             decisions = hard_decisions
-
-#         sparse_mask = hard_decisions[..., 1]  # [B, H]
-#         decisions_out = decisions[..., 1]     # [B, H]
-
-#         return {
-#             'decisions': decisions_out,
-#             'hard_decisions': hard_decisions,
-#             'sparse_mask': sparse_mask,
-#             'logits': logits,
-#             'attn_chunks': attn_chunks,
-#         }
-
-# # 不直接通过mlp压成2个维度
-# class AttentionRouter(nn.Module):
-#     def __init__(self,
-#                  input_dim,
-#                  num_key_value_heads,
-#                  head_dim=None,
-#                  d_feature=128,
-#                  use_task_emb=False,
-#                  temp=1.0,
-#                  hard=False,
-#                  router_type='mlp',
-#                  entropy_agg='mean',
-#                  entropy_mode='attn',
-#                  eps=1e-8,
-#                  max_logit=5.0):
-#         super().__init__()
-#         self.num_kv = num_key_value_heads
-#         self.temp = temp
-#         self.hard = hard
-#         self.use_task_emb = use_task_emb
-#         self.router_type = router_type
-#         self.entropy_agg = entropy_agg
-#         self.eps = eps
-#         self.head_dim = head_dim or input_dim
-#         self.entropy_mode = entropy_mode
-#         self.max_logit = max_logit  # 新增：用于 tanh 缩放
-
-#         feat_dim = self.head_dim
-
-#         # 替换 dim_mapping 为 self.net
-#         if router_type == 'linear':
-#             self.net = nn.Linear(feat_dim, 1)  # 直接输出 1 维 logit_raw per head
-#         else:
-#             self.net = nn.Sequential(
-#                 nn.Linear(feat_dim, d_feature),
-#                 nn.SiLU(),
-#                 nn.Linear(d_feature, 1)  # [B, H, 1]
-#             )
-
-#         self.register_buffer("log_temp", torch.log(torch.tensor(float(temp))))
-
-#     def forward(self, pooled_input):
-#         """
-#         pooled_input: [B, S, H, D]
-#         return:
-#             {
-#               'decisions': [B, H],          # soft or hard probs for "keep" (class 1)
-#               'hard_decisions': [B, H, 2],  # one-hot: [prune, keep]
-#               'sparse_mask': [B, H],        # same as decisions during eval, or hard_decisions[...,1]
-#               'logits': [B, H],
-#               'logits_raw': [B, H],
-#             }
-#         """
-#         B, S, H, D = pooled_input.shape
-#         device = pooled_input.device
-
-#         # ---- Pool over sequence: average over S (no chunking) ----
-#         # Shape: [B, S, H, D] -> [B, H, D] (mean over seq)
-#         x = pooled_input.mean(dim=1)  # [B, H, D]
-
-#         # ---- Pass through net to get raw logits (unbounded scalar per head) ----
-#         logits_raw = self.net(x)      # [B, H, 1] or [B, H] if linear; squeeze
-#         if logits_raw.ndim == 3:
-#             logits_raw = logits_raw.squeeze(-1)  # [B, H]
-
-#         # ---- Scale via tanh to bounded logits in [-max_logit, max_logit] ----
-#         logits = self.max_logit * torch.tanh(logits_raw / self.max_logit)  # [B, H]
-
-#         # ---- Get probs = sigmoid(logits) for pruning decision (keep if prob > 0.5) ----
-#         probs = torch.sigmoid(logits)  # [B, H]
-
-#         tau = torch.exp(self.log_temp).clamp(0.5, 10.0)
-
-#         # ---- Gumbel-Sigmoid sampling (binary case) during training ----
-#         if self.training:
-#             # Gumbel-Sigmoid trick: simulate Bernoulli(probs) via Gumbel-Softmax over 2-class
-#             # Construct logits_2d = [logit_keep, logit_prune] = [logits, -logits]
-#             logits_2d = torch.stack([logits, -logits], dim=-1)  # [B, H, 2]
-
-#             z = F.gumbel_softmax(logits_2d, tau=tau, hard=self.hard, dim=-1)  # [B, H, 2]
-#             decisions_soft = z[..., 1]  # prob of "keep" (class 1) — soft during train
-#             hard_decisions = z if self.hard else z.detach()  # if hard=False, still soft but reparam
-
-#             # Optional clamping per your spec (helps stabilize gradients)
-#             decisions_soft = torch.clamp(decisions_soft, 0.1, 0.9)
-#         else:
-#             # Deterministic: hard threshold at 0.5
-#             decisions_soft = (probs > 0.5).float()
-#             hard_decisions = torch.zeros(B, H, 2, device=device)
-#             hard_decisions.scatter_(-1, (probs > 0.5).long().unsqueeze(-1), 1.0)
-
-#         # Final outputs
-#         decisions_out = decisions_soft  # [B, H]
-#         sparse_mask = hard_decisions[..., 1]  # [B, H]
-
-#         return {
-#             'decisions': decisions_out,
-#             'hard_decisions': hard_decisions,
-#             'sparse_mask': sparse_mask,
-#             'logits': logits,          # bounded [-max_logit, max_logit]
-#             'logits_raw': logits_raw,  # unbounded (for analysis/debug)
-#             # attn_chunks removed since no chunking
-#         }
-
 class AttentionRouter(nn.Module):
     def __init__(self, input_dim, num_key_value_heads, d_feature=128,
-                 use_task_emb=False, temp=1.0, hard=False, 
+                 use_task_emb=False, temp=2/3, hard=False, 
                  router_type='mlp', use_gumbel=True, learnable_temp=False,
-                 dropout=0.1, layernorm=True):
+                 dropout=0.1, layernorm=True, pooling_mode='ctx_q'):
         super().__init__()
         self.num_kv = num_key_value_heads
         self.temp = temp
@@ -1215,77 +631,151 @@ class AttentionRouter(nn.Module):
         self.router_type = router_type
         self.use_gumbel = use_gumbel
         self.learnable_temp = learnable_temp
-        if router_type == 'linear':
-            layers = [nn.Linear(d_feature, 2)]
-        elif router_type == 'mlp':
-            layers = [
-                nn.Linear(d_feature, d_feature),
-                nn.SiLU(),
-                nn.Dropout(dropout),
-                nn.Linear(d_feature, 2)
-            ]
-        else:
-            raise ValueError(f"Unknown router_type: {router_type}")
-        self.dim_mapping = nn.Sequential(*layers)
-
-        if use_task_emb:
-            self.task_emb = nn.Parameter(torch.randn(1, d_feature) * 0.02)
+        self.pooling_mode = pooling_mode
+        
+        # binary cls
+        self.cls_net = nn.Sequential( 
+            nn.Linear(d_feature, 2 * d_feature),
+            nn.SiLU(),
+            nn.Linear(2 * d_feature, d_feature),
+            nn.SiLU(),
+            nn.Linear(d_feature, 1)
+        )
 
         # ---- learnable temperature ----
         if learnable_temp:
             self.log_temp = nn.Parameter(torch.log(torch.tensor(temp)))
         else:
             self.register_buffer("log_temp", torch.log(torch.tensor(temp)))
-
-    def forward(self, pooled_input):
+            self.tau = torch.exp(self.log_temp).clamp(0.3, 1.0)
+        
+    def forward(
+        self, 
+        x, 
+        cu_seq_len=None,
+        range_ids: torch.Tensor = None                        , 
+        task_ids: Optional[torch.Tensor] = None
+    ):
         """
-        pooled_input: [B, seq_len, H, D]
+        x: [cu_seq_len, H, D]
+        cu_seq_len: [0, seq_len_1, seq_len_2 + seq_len_1, ...]
+        range_ids: [B, 6]
+        task_ids: [B]
+        
         return:
             {
               'decisions': [B, H],
               'hard_decisions': [B, H, 2],
               'sparse_mask': [B, H],
-              'logits': [B, H, 2]
+              'logits': [B, H, 1]
             }
         """
-        B, S, H, D = pooled_input.shape
-
-        # 采用第一个Special Token 作为输入
-        x = pooled_input[:, 0, :, :]  # [B, H, D]
-
-        if self.use_task_emb:
-            x = x + self.task_emb
-
-        logits = self.dim_mapping(x)  # [B, H, 2]
-
-        logits = torch.tanh(logits) * 5.0  # [-5, 5]
-
-        tau = torch.exp(self.log_temp).clamp(0.5, 10.0)
-        logits = torch.nan_to_num(logits, nan=0.0, posinf=5.0, neginf=-5.0)
-
+        bsz = (cu_seq_len.shape[0] - 1) if cu_seq_len is not None else 1
+        
+        # 目前所有支持的pooling 方法
+        if self.pooling_mode == 'first_token':
+            pooled_latent = self._segment_pooling(
+                x, range_ids, ['first_token'], cu_seq_len)  # [B, H, D]
+        else:
+            raise ValueError(f"Unknown pooling_mode: {self.pooling_mode}")
+        
+        binary_logits = self.cls_net(pooled_latent)  # [B, H, 2]
+        
+        if self.learnable_temp:
+            tau = torch.exp(self.log_temp).clamp(0.3, 1.0)
+        else:
+            tau = self.tau
+            
         # --- Gumbel or Softmax routing ---
         if self.training:
+            # 生成 Gumbel 噪声: g = -log(-log(u))
+            # u ~ Uniform(0, 1)
+            u = torch.rand_like(binary_logits)
             eps = 1e-8
-            logits = logits + eps * torch.randn_like(logits)
-            decisions = F.gumbel_softmax(logits, tau=tau, hard=False)
-            hard_decisions = F.gumbel_softmax(logits, tau=tau, hard=True)
+            g = -torch.log(-torch.log(u + eps) + eps)
+            
+            # 连续松弛 (Continuous Relaxation): z_soft \in (0, 1)
+            # 公式: sigmoid((logit + g) / tau)
+            z_soft = torch.sigmoid((binary_logits + g) / tau)
+            
+            # 硬化 (Hard Thresholding): z_hard \in {0, 1}
+            z_hard = (z_soft > 0.5).float()
+            
+            # --- 3. STE (Straight-Through Estimator) ---
+            # 前向传播：使用 z_hard (真正的 0/1)
+            # 反向传播：梯度通过 z_soft (z_hard 的梯度为0，加上 (z_soft - z_soft.detach()) 后，梯度等于 z_soft 的梯度)
+            z = z_hard + (z_soft - z_soft.detach())
+            
         else:
-            decisions = F.softmax(logits / tau, dim=-1)
-            hard_decisions = torch.zeros_like(decisions)
-            hard_decisions.scatter_(-1, logits.argmax(dim=-1, keepdim=True), 1.0)
+            # 推理阶段：直接根据 Logit 确定 (相当于 tau -> 0)
+            # 或者也可以用 sigmoid(logit/tau) > 0.5，但在 deterministic 模式下 logit > 0 即可
+            z_soft = torch.sigmoid(binary_logits / tau) 
+            z_hard = (z_soft > 0.5).float()
+            z = z_hard
 
-        if not self.training:
-            decisions = hard_decisions
+        # --- 4. 输出准备 ---
+        # sparse_mask: 用于计算的掩码，必须是 STE 后的 z (前向0/1，反向有梯度)
+        sparse_mask = z 
 
-        sparse_mask = hard_decisions[..., 1]  # [B, H]
-        decisions_out = decisions[..., 1].squeeze(1)
-
+        # decisions_out: 这里的 soft 值通常用于记录统计，但梯度的核心在 sparse_mask
+        decisions_out = z_soft 
         return {
+            'pooled_hidden_states': pooled_latent, # [B, H, D]
             'decisions': decisions_out,
-            'hard_decisions': hard_decisions,
-            'sparse_mask': sparse_mask,
-            'logits': logits,
+            'hard_decisions': z_hard,
+            'sparse_mask': sparse_mask, # [B, H], 这是一个 STE Tensor
+            'logits': binary_logits,
         }
+        
+        
+    def _segment_pooling(
+        self, 
+        x: torch.Tensor, 
+        range_ids: torch.Tensor, 
+        segments: list[str],
+        cu_seq_len: torch.Tensor,
+    ) -> torch.Tensor:
+        """_summary_
+
+        Args:
+            x (torch.Tensor): [cu_seqlen, H, D]
+            range_ids (torch.Tensor): _description_
+            segments (list[str]): _description_
+            cu_seq_len (torch.Tensor): _description_
+
+        Returns:
+            torch.Tensor: _description_
+        """
+        POOL_MAP = {'first_token': (0, 1),'ctx': (2, 3), 'q': (4, 5), 'a': (6, 7)} 
+        
+        B = cu_seq_len.shape[0] - 1
+        H, D = x.shape[1:]
+        pooled_features_list = []
+        
+        for i in range(B):
+            sample_features = []
+            x_s, x_e = cu_seq_len[i], cu_seq_len[i + 1]
+            for seg in segments:
+                start_idx, end_idx = POOL_MAP[seg]
+                start, end = range_ids[i, start_idx:end_idx + 1].tolist()
+
+                if end >= start:
+                    seg_slice = x[x_s + start: x_s + end + 1,  : , :]
+                    seg_pooled = seg_slice.mean(dim=0)  # [H, D]
+                else:
+                    seg_pooled = torch.zeros(H, D, device=x.device)
+                
+                sample_features.append(seg_pooled)
+
+            if sample_features:
+                combined_feature = torch.stack(sample_features, dim=0).mean(dim=0) # [H, D]
+            else:
+                combined_feature = torch.zeros(H, D, device=x.device)
+                
+            pooled_features_list.append(combined_feature)
+
+        return torch.stack(pooled_features_list, dim=0) # [B, H, D]
+
 
 
 class Qwen3Attention(nn.Module):
@@ -1361,30 +851,10 @@ class Qwen3Attention(nn.Module):
             # head_dim = self.head_dim,
             d_feature=self.head_dim,
             use_task_emb=getattr(config, "use_task_emb_for_mask", False),
-            temp=getattr(config, "mask_temp", 0.5),
+            temp=getattr(config, "mask_temp", 2/3),
             hard=getattr(config, "mask_hard_sample", False),
+            pooling_mode=getattr(config, "pooling_mode", "first_token"),
         )
-        
-        # self.mask_allocator = AttentionRouterEntropy(
-        #     input_dim=self.hidden_size,          
-        #     num_key_value_heads=self.num_key_value_heads,  
-        #     head_dim=self.head_dim,               
-        #     d_feature=128,                        
-        #     num_chunks=128,                         
-        #     use_task_emb=getattr(config, "use_task_emb_for_mask", False),
-        #     temp=getattr(config, "mask_temp", 0.5),       
-        #     hard=getattr(config, "mask_hard_sample", False),  
-        #     router_type=getattr(config, "mask_router_type", "gumbel"),  # 'mlp' / 'linear' / 'gumbel'
-        #     entropy_agg='mean',                   # 'mean' 或 'max'
-        # )
-        
-        # self.mask_allocator = MaskAllocator(
-        #     input_dim=self.hidden_size,
-        #     num_key_value_heads=self.num_key_value_heads,
-        #     hidden_dim=min(512, self.hidden_size // 2),
-        #     temp=getattr(config, "mask_temp", 0.5),
-        #     hard=getattr(config, "mask_hard_sample", False),
-        # )
 
         self.context_window_toggle = context_window_toggle
 
@@ -1697,7 +1167,6 @@ class Qwen3Attention(nn.Module):
         if unpadded_lengths is not None:
             # varlen, ignore padding tokens, efficient for large batch with many paddings
             cu_seqlens, max_seqlen = unpadded_lengths
-
             attn_output = flash_attn_varlen_kvpacked_func(
                 q,
                 kv,
@@ -1857,12 +1326,7 @@ class Qwen3Attention(nn.Module):
             else:
                 cw_attn_output = topk_attention(q, kv)
         elif self.toggle_type == "xattn":  
-            # def set_pdb_trace(rank: int = None):
-            #     import pdb
-            #     import sys
-            #     sys.stdin = open(0)  
-            #     pdb.set_trace()
-            # set_pdb_trace(0)
+
             if not self.training :
                 _, seq_len, _, _ = q.size()       
             if self.training or seq_len != 1:
@@ -1948,9 +1412,19 @@ class Qwen3Attention(nn.Module):
         else:
             raise ValueError(f"Unknown toggle type: {self.toggle_type}")
 
-        effective_attn_output = attn_output * z[:,None,:,None] + cw_attn_output * (
-            1 - z
-        )[:,None,:,None]
+        if unpadded_lengths is not None:
+            effective_attn_output = []
+            cu_seqlens, max_seqlen = unpadded_lengths
+            bsz = len(cu_seqlens) - 1
+            for i in range(bsz):
+                effective_attn_output.append(
+                    attn_output[cu_seqlens[i]:cu_seqlens[i + 1], :, :] * z[i, None, ...] + cw_attn_output[cu_seqlens[i]:cu_seqlens[i + 1], :, :] * (1 - z)[i, None, ...]
+                )
+            effective_attn_output = torch.cat(effective_attn_output, dim=0)
+        else:        
+            effective_attn_output = attn_output * z[:,None,...] + cw_attn_output * (
+                1 - z
+            )[:,None,...]
 
         return effective_attn_output
 
@@ -1964,11 +1438,15 @@ class Qwen3Attention(nn.Module):
         use_cache: bool = False,
         unpadded_lengths: Optional[Tuple[torch.Tensor]] = None,
         seq_parallel_group: Optional[Any] = None,
+        segment_ids: Optional[torch.LongTensor] = None,
+        range_ids: Optional[torch.LongTensor] = None,
+        task_ids: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[
             Tuple[torch.Tensor, torch.Tensor]
         ] = None,  # will become mandatory in v4.46
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
@@ -1984,24 +1462,9 @@ class Qwen3Attention(nn.Module):
             # Next: expand z_kv to (num_key_value_heads, num_key_value_groups) and then flatten it to (num_heads)
             z = z_kv.unsqueeze(-1).expand(-1, self.num_key_value_groups).reshape(-1)
         else:
-            target_x = q
-            if unpadded_lengths is not None:
-                cu_seqlens, _ = unpadded_lengths
-                B = cu_seqlens.numel() - 1
-                pooled_list = []
-                for b in range(B):
-                    s, e = int(cu_seqlens[b]), int(cu_seqlens[b + 1])
-                    if e > s:
-                        pooled_list.append(target_x[s:e])
-                    else:
-                        pooled_list.append(torch.zeros_like(target_x[0:1]))
-                target_x = torch.cat(pooled_list, dim=0).unsqueeze(0)  # [B, seq, H, D] 或 [B, H, D]
-                if target_x.dim() == 3 and target_x.shape[-1] == self.head_dim:
-                    target_x = target_x.unsqueeze(0)
-
-            res = self.mask_allocator(target_x)
-            z_kv_batch = res['decisions']
-
+            res = self.mask_allocator(q, unpadded_lengths[0], range_ids, task_ids)
+            z_kv_batch, pooled_hidden_states = res['sparse_mask'], res['pooled_hidden_states']
+            
             if z_kv_batch.shape[-1] == self.num_key_value_heads:
                 z_kv_batch = (
                     z_kv_batch.unsqueeze(-1)              # [B, num_kv, 1]
@@ -2018,19 +1481,11 @@ class Qwen3Attention(nn.Module):
         else:
             past_len = 0
 
-        # NOTE: Hack to include position_ids, assuming they are increasing uniformly per block
         if position_ids is not None:
             past_len += position_ids.min()
 
-        if unpadded_lengths is not None:
-            # We don't use the unpadded_length during rotary embeds and instead create a temporary `batch` dimension
-            # This does not actually affect the otucome since the positional embeddings are relative and stay valid
-            # This also ensures that in sequence parallelism the correct `past_len` offset is applied to mid-sequence chunks
-            q, k = self.rotary_emb(q.unsqueeze(0), k.unsqueeze(0), past_len)
-            q, k = q.squeeze(0), k.squeeze(0)
-        else:
-            q, k = self.rotary_emb(q, k, past_len)
-
+        q, k = self.rotary_emb(q, k, past_len, unpadded_lengths)
+        
         kv = torch.stack([k, v], -3)
         if self.num_key_value_groups > 1:
             kv = kv.repeat_interleave(self.num_key_value_groups, dim=-2)
@@ -2082,13 +1537,13 @@ class Qwen3Attention(nn.Module):
             kwargs = {}
 
         attn_output = attention_func(q, kv, k, v, unpadded_lengths, z, **kwargs)
-
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output.to(self.o_proj.weight.dtype))
 
         attn_weights = None
         
-        return z.sum(dim=-1), attn_output, attn_weights, past_key_value
+        # z: [B, H, 1] -> [B, H] -> [B]
+        return z.squeeze(-1).sum(dim=-1), pooled_hidden_states, attn_output, attn_weights, past_key_value
 
 
 class Qwen3DecoderLayer(nn.Module):
@@ -2135,6 +1590,9 @@ class Qwen3DecoderLayer(nn.Module):
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         seq_parallel_group: Optional[Any] = None,
+        segment_ids: Optional[torch.LongTensor] = None,
+        range_ids: Optional[torch.LongTensor] = None,
+        task_ids: Optional[torch.LongTensor] = None,
     ) -> Tuple[
         torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]
     ]:
@@ -2157,7 +1615,7 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        z_sum, hidden_states, self_attn_weights, present_key_value = self.self_attn(
+        z_sum, pooled_hidden_states, hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -2166,6 +1624,9 @@ class Qwen3DecoderLayer(nn.Module):
             use_cache=use_cache,
             unpadded_lengths=unpadded_lengths,
             seq_parallel_group=seq_parallel_group,
+            segment_ids=segment_ids,
+            range_ids=range_ids,
+            task_ids=task_ids
         )
         hidden_states = residual + hidden_states
 
@@ -2175,10 +1636,7 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
-        outputs = (
-            z_sum,
-            hidden_states,
-        )
+        outputs = (z_sum, pooled_hidden_states, hidden_states,)
 
         if output_attentions:
             outputs += (self_attn_weights,)
@@ -2236,6 +1694,8 @@ class BaseModelOutputWithPastAndSparsity(ModelOutput):
     layerwise_model_sparsity: Optional[torch.FloatTensor] = None  # (num_layers,)
     layerwise_target_sparsity: Optional[torch.FloatTensor] = None  # (num_layers,)
     layerwise_sparsity_loss: Optional[torch.FloatTensor] = None  # scalar
+    # contrastive_loss
+    contrastive_loss: Optional[torch.FloatTensor] = None# 
 
 
 class Qwen3Model(Qwen3PreTrainedModel):
@@ -2411,6 +1871,9 @@ class Qwen3Model(Qwen3PreTrainedModel):
         unpadded_lengths: Optional[Tuple[torch.Tensor]] = None,
         seq_parallel_group: Optional[Any] = None,
         target_sparsity: Optional[float] = None,
+        segment_ids: Optional[torch.LongTensor] = None,
+        range_ids: Optional[torch.LongTensor] = None,
+        task_ids: Optional[torch.LongTensor] = None,
         erank_analysis_path: Optional[str] = None,
         **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
     ) -> Union[Tuple, BaseModelOutputWithPast]:
@@ -2442,7 +1905,6 @@ class Qwen3Model(Qwen3PreTrainedModel):
             )
 
         # position_ids = None
-
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
@@ -2463,6 +1925,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
         z_sum = 0 if compute_sparsity else None
 
         layer_z_sums = []  # 收集每层 z_sum 以计算逐层稀疏度
+        # all_pooled_hidden_states = []
 
         for idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
@@ -2485,6 +1948,9 @@ class Qwen3Model(Qwen3PreTrainedModel):
                     False,
                     seq_parallel_group,
                     use_reentrant=False,
+                    segment_ids=segment_ids,
+                    range_ids=range_ids,
+                    task_ids=task_ids,
                 )
             else:
                 layer_outputs = decoder_layer(
@@ -2496,11 +1962,15 @@ class Qwen3Model(Qwen3PreTrainedModel):
                     output_attentions=output_attentions,
                     use_cache=use_cache,
                     seq_parallel_group=seq_parallel_group,
+                    segment_ids=segment_ids,
+                    range_ids=range_ids,
+                    task_ids=task_ids,
                 )
 
-            z_layer_sum, hidden_states = layer_outputs[0], layer_outputs[1]
+            z_layer_sum, pooled_hidden_states, hidden_states = layer_outputs[0], layer_outputs[1], layer_outputs[2]
+
             if compute_sparsity:
-                z_sum = z_sum + z_layer_sum
+                z_sum += z_layer_sum
             layer_z_sums.append(z_layer_sum)
 
             if use_cache:
@@ -2509,9 +1979,47 @@ class Qwen3Model(Qwen3PreTrainedModel):
             if output_attentions:
                 all_self_attns += (layer_outputs[2],)
 
+        # pooled_hidden_states = torch.cat(pooled_hidden_states, dim=1)
+        
+        # all gather all pooled_hidden_states across all GPUs
+        pooled_hidden_states = pooled_hidden_states.mean(dim=1) # [B, D]
+        world_size = dist.get_world_size()
+        
+        global_pooled_hidden_states = [torch.zeros_like(pooled_hidden_states, device=hidden_states.device) for _ in range(world_size)]
+        global_task_ids = [torch.zeros_like(task_ids, device=hidden_states.device) for _ in range(world_size)]
+        
+        dist.all_gather(global_pooled_hidden_states, pooled_hidden_states)
+        dist.all_gather(global_task_ids, task_ids)
+        
+        """
+        global_pooled_hidden_states: [[B, D], [B, D], ..., [B, D]] # world_size * [B, D]
+        global_task_ids: [[B], [B], ..., [B]] # world_size * [B]
+        """
+        
+        global_hidden = torch.cat(global_pooled_hidden_states, dim=0)   # [world_size * max_B, D]
+        global_task = torch.cat(global_task_ids, dim=0)     # [world_size * max_B]
+        N = global_hidden.size(0)
+        
+        # 聚合所有的task，获得task 表征
+        unique_tasks = torch.unique(global_task)  # e.g., tensor([0, 1, 3])
+        K_eff = unique_tasks.size(0)
+        
+        prototypes = torch.stack([
+            global_hidden[global_task == t].mean(dim=0)
+            for t in unique_tasks
+        ], dim=0)
+        
+        task_to_idx = {int(t.item()): i for i, t in enumerate(unique_tasks)}
+        mapped_labels = torch.tensor([task_to_idx[int(t.item())] for t in global_task], device=global_task.device)  # [N]
+
+        z_norm = F.normalize(global_hidden, dim=1)         # [N, D]
+        p_norm = F.normalize(prototypes, dim=1)           # [K_eff, D]
+        
+        logits = torch.mm(z_norm, p_norm.t()) / 0.05  # FIXME：0.05是预设的一个温度，变为超参数 cc:qqt，控制对比锐度，太小梯度爆炸，太大区分度弱（0.05 ~ 0.1）
+        
+        contrastive_loss = F.cross_entropy(logits, mapped_labels)
+        
         hidden_states = self.norm(hidden_states)
-
-
 
         # add hidden states from the last decoder layer
         if output_hidden_states:
@@ -2543,10 +2051,13 @@ class Qwen3Model(Qwen3PreTrainedModel):
                     gathered_layer_z_sums.append(sum(tmp))
                 layer_z_sums = gathered_layer_z_sums
 
+            # 1. z_sum / H 表示full attn占所有head的比例
+            # 2. 1 - z_sum / H 表示当前模型稀疏度
             model_sparsity = 1 - (z_sum / self.total_num_heads)
         else:
             model_sparsity = None
             z_loss = None
+        
         if compute_sparsity:
             layerwise_model_sparsity = None
             layerwise_target = None
@@ -2563,14 +2074,16 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 
                 z_loss = (
                     self.sparsity_lambda_1.reshape([])
-                    * (model_sparsity - target_sparsity)
-                    + self.sparsity_lambda_2.reshape([])
-                    * (model_sparsity - target_sparsity) ** 2
+                    * (model_sparsity - target_sparsity).mean()
+                    + self.sparsity_lambda_2.reshape([]) 
+                    * ((model_sparsity - target_sparsity) ** 2).mean()
                 )
+                
         else:
             layerwise_model_sparsity = None
             layerwise_target = None
             layerwise_loss = None
+        
         if (
             target_sparsity is not None
             and self.config.enable_layerwise_sparsity
@@ -2599,7 +2112,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
                     ratios = max_r - (max_r - min_r) * x
                 else:
                     ratios = min_r + (max_r - min_r) * x
-
+                
                 layerwise_target = torch.clamp(
                     ratios * float(target_sparsity), min=0.0, max=1.0
                 )
@@ -2623,18 +2136,6 @@ class Qwen3Model(Qwen3PreTrainedModel):
                     layerwise_target = layerwise_target / s * (target_sparsity * L)
 
             diffs = layerwise_model_sparsity - layerwise_target
-
-            def is_main_process():
-                if not dist.is_available() or not dist.is_initialized():
-                    return True
-                return dist.get_rank() == 0
-
-            # if is_main_process():
-            #     print("============debug layerwise sparsity loss computation============")
-            #     print("debug layerwise_model_sparsity:", layerwise_model_sparsity)
-            #     print("debug layerwise_target:", layerwise_target)
-            #     print("debug diffs:", diffs)
-            #     print("============debug layerwise sparsity loss computation============")
 
             per_layer_loss = self.sparsity_lambda_1.reshape(
                 []
@@ -2678,6 +2179,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
             lambda2=self.sparsity_lambda_2.reshape([]),
             layerwise_model_sparsity=layerwise_model_sparsity,
             layerwise_target_sparsity=layerwise_target,
+            contrastive_loss=contrastive_loss,
         )
 
 
@@ -2703,7 +2205,8 @@ class CausalLMOutputWithPastAndSparsity(ModelOutput):
     layerwise_model_sparsity: Optional[torch.FloatTensor] = None  # (num_layers,)
     layerwise_target_sparsity: Optional[torch.FloatTensor] = None  # (num_layers,)
     layerwise_sparsity_loss: Optional[torch.FloatTensor] = None  # scalar
-
+    # contrastive_loss
+    contrastive_loss: Optional[torch.FloatTensor] = None  # scalar
 
 class KwargsForCausalLM(FlashAttentionKwargs, LossKwargs): ...
 
@@ -2816,6 +2319,9 @@ class PawQwen3ForCausalLM(Qwen3PreTrainedModel):
         shifted_labels: Optional[torch.LongTensor] = None,
         seq_parallel_group: Optional[Any] = None,
         target_sparsity: Optional[float] = None,
+        segment_ids: Optional[torch.LongTensor] = None,
+        range_ids: Optional[torch.LongTensor] = None,
+        task_ids: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs: Unpack[KwargsForCausalLM],
     ) -> Union[Tuple, CausalLMOutputWithPast]:
@@ -2880,9 +2386,7 @@ class PawQwen3ForCausalLM(Qwen3PreTrainedModel):
             max_seqlen = seq_lengths.max().item()
 
             unpadded_lengths = (cu_seqlens, max_seqlen)
-        elif (
-            (attention_mask is not None) and (not attention_mask.all().item())
-        ) and not use_cache:
+        elif attention_mask is not None and not use_cache and attention_mask.size(0) != 1:
             if inputs_embeds is not None:
                 bsz = inputs_embeds.size(0)
                 inputs_embeds, unpad_indices, cu_seqlens, max_seqlen = unpad_input(
@@ -2912,7 +2416,11 @@ class PawQwen3ForCausalLM(Qwen3PreTrainedModel):
             unpadded_lengths=unpadded_lengths,
             seq_parallel_group=seq_parallel_group,
             target_sparsity=target_sparsity,
+            segment_ids=segment_ids,
+            range_ids=range_ids,
+            task_ids=task_ids,
         )
+        
         hidden_states = outputs[0]
         if seq_lengths is None and unpadded_lengths is not None:
             hidden_states = pad_input(hidden_states, unpad_indices, bsz, max_seqlen_for_pad_seq)
@@ -2965,6 +2473,7 @@ class PawQwen3ForCausalLM(Qwen3PreTrainedModel):
         if not return_dict:
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
+        
         return CausalLMOutputWithPastAndSparsity(
             loss=loss,
             logits=logits,
@@ -2978,6 +2487,7 @@ class PawQwen3ForCausalLM(Qwen3PreTrainedModel):
             lambda2=outputs.lambda2,
             layerwise_model_sparsity=outputs.layerwise_model_sparsity,
             layerwise_target_sparsity=outputs.layerwise_target_sparsity,
+            contrastive_loss=outputs.contrastive_loss,
         )
 
     def prepare_inputs_for_generation(

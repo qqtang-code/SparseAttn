@@ -191,6 +191,12 @@ class TrainingArguments(HfTrainingArguments):
             "help": "The type of toggling to use. Currently supports: `streaming` and `local`."
         },
     )
+    pooling_mode: str = field(
+        default="first_token",
+        metadata={
+            "help": "The pooling mode to use. Options: 'first_token', 'mean'"
+        },
+    )
 
     ## Streaming
     toggle_type: str = field(
