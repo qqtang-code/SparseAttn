@@ -52,6 +52,41 @@ class ParquetDataset(Dataset):
         self.data_args = data_args
         self.max_seq_len = max_seq_len
         self.is_training = is_training
+        self.all_class_ids = self._get_all_class_ids()
+        
+    def _get_all_class_ids(self):
+        logger.info("Collecting all class IDs for stratified sampling...")
+
+        CLASS_MAP = {
+            'Single QA': 0,
+            'MultiHop QA': 1,
+            'Summarization': 2,
+            'Code': 3
+        }
+
+        class_ids = []
+        for idx in range(len(self.raw_dataset)):
+            item = self.raw_dataset[idx]
+            meta = item.get("metadata", {}) or {}
+            if isinstance(meta, str):
+                try:
+                    meta = ast.literal_eval(meta)
+                except Exception:
+                    meta = {}
+
+            task = meta.get("task", "Other")
+            class_id = CLASS_MAP.get(task, 4)
+
+            class_ids.append(class_id)
+
+        return class_ids
+
+    def get_class_indices(self):
+        class_indices = {0: [], 1: [], 2: [], 3: []}
+        for i, class_id in enumerate(self.all_class_ids):
+            if class_id in class_indices:
+                class_indices[class_id].append(i)
+        return class_indices
 
     def __len__(self):
         return len(self.raw_dataset)
@@ -262,6 +297,9 @@ class PackingDataCollator:
             "segment_ids": all_segment_ids,
             "range_ids": all_range_ids,
             "task_ids": all_class_ids,
+            "segment_ids": all_segment_ids,
+            "range_ids": all_range_ids,
+            "task_ids": all_class_ids,
         }
         
         return res
@@ -309,3 +347,104 @@ def build_dataset(paths, data_args, tokenizer=None, is_training=True, model_name
         logger.info(f"Filtered dataset size: {len(raw)}")
 
     return ParquetDataset(raw, tokenizer, data_args, max_len, is_training)
+
+from torch.utils.data.sampler import Sampler
+import random
+import math
+import torch
+import torch.distributed as dist
+from typing import Dict, List, Iterator
+
+class SamplerConditionError(ValueError):
+    pass
+
+class CustomDistributedStratifiedSampler(torch.utils.data.Sampler):
+    def __init__(
+        self,
+        dataset,
+        class_indices: Dict[int, List[int]],
+        num_gpus: int = 8,
+        required_per_class: int = 2,
+        seed: int = 42,
+    ):
+        # -------- Distributed setup --------
+        if dist.is_initialized():
+            self.rank = dist.get_rank()
+            self.world_size = dist.get_world_size()
+        else:
+            self.rank = 0
+            self.world_size = num_gpus
+
+        self.seed = seed
+        self.required_per_class = required_per_class
+        self.num_classes = len(class_indices)
+        self.class_indices = class_indices
+
+        self.global_batch_size = self.num_classes * self.required_per_class
+
+        if self.world_size != 8:
+            raise SamplerConditionError(
+                f"❌ Sampler Condition Failed: world_size={self.world_size} is not 8."
+            )
+
+        if self.global_batch_size != self.world_size:
+            raise SamplerConditionError(
+                f"❌ Sampler Condition Failed: global_batch_size={self.global_batch_size} (classes*{required_per_class}) "
+                f"must equal world_size={self.world_size} for this specific sampler."
+            )
+        
+        min_size = min(len(v) for v in class_indices.values())
+        self.num_steps = min_size // required_per_class
+
+
+        self.num_samples = self.num_steps
+        if self.rank == 0:
+            print(f"✅ Sampler Initialized: steps={self.num_steps}, samples per rank={self.num_samples}")
+
+    def __len__(self):
+        return self.num_samples
+
+    def __iter__(self):
+        rng = random.Random(self.seed)
+
+        # flatten all samples for other-class borrowing
+        all_indices = []
+        for cls, idxs in self.class_indices.items():
+            all_indices.extend(idxs)
+
+        final_rank_samples = []
+
+        for step in range(self.num_steps):
+
+            step_indices = []
+
+            for cls, idx_list in self.class_indices.items():
+                # shuffle index list
+                rng.shuffle(idx_list)
+
+                start = step * self.required_per_class
+                end = start + self.required_per_class
+                chunk = idx_list[start:end]
+
+                if len(chunk) < self.required_per_class:
+                    # need extra samples
+                    need = self.required_per_class - len(chunk)
+
+                    # borrow from other classes
+                    candidates = [i for i in all_indices if i not in chunk]
+                    rng.shuffle(candidates)
+
+                    borrowed = candidates[:need]
+                    chunk = chunk + borrowed
+
+                step_indices.extend(chunk)
+
+            # now step_indices has num_classes * required_per_class items
+            if len(step_indices) != self.world_size:
+                raise RuntimeError("step size mismatches world_size")
+
+            rng.shuffle(step_indices)
+            final_rank_samples.append(step_indices[self.rank])
+
+        return iter(final_rank_samples)
+

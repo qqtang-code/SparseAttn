@@ -52,12 +52,8 @@ erank_analysis_path="/"
 
 # Dataset configuration
 dataset=${DATASET:-"/data2/public_data/mix_sft_64k"}
-# dataset=${DATASET:-"/data1/public_data/Pre_filter"}
 task_type="sft" # pretrain or sft
-
-# Create run name
-# extra_name="sft3_pretrain_64k_task_xattn_entropy_layerwise_nolinear_11.22"
-extra_name="debug_11.24"
+extra_name="debug_11.30"
 if [[ $freeze_weights == "true" ]]; then
     extra_name="${extra_name}_wfrozen"
 fi
@@ -89,7 +85,7 @@ header="torchrun \
 # header="python -m debugpy --listen 0.0.0.0:5678 --wait-for-client -m training.lh_train_language_model"
 
 # accu=$(($bsz / $seq / $num_gpus / $num_nodes))
-accu=1
+accu=8
 
 # Environment variables
 export OMP_NUM_THREADS=$num_gpus

@@ -70,40 +70,45 @@ fi
 run_name="masksonly_$(basename $model)_bsz${bsz}_steps${steps}_lr${lr}_warmup${warmup}_sp${end_head_sparsity}_cw${context_window_if_toggled}_mlr${mask_learning_rate}_rlr${reg_learning_rate}${extra_name}${suffix}"
 
 out_dir="checkpoints/$run_name"
-mkdir -p "$out_dir"
+mkdir -p $out_dir
+nvidia-smi
 
-#############################################
-# Environment
-#############################################
-
-export TOKENIZERS_PARALLELISM=true
-export LOGIT_BLOCK_SIZE=2048
-export SWANLAB_API_KEY="t0PmOeLpVom1LRBDAKHaA"
-export SWANLAB_LOG_DIR="$out_dir"
-export SWANLAB_MODE="cloud"
-
-#############################################
-# Train (single node / single GPU)
-#############################################
-
+# Calculate GPU and node configuration
+if [ -z "$CUDA_VISIBLE_DEVICES" ]; then
+    num_gpus=$(nvidia-smi -L | wc -l)
+else
+    num_gpus=$(echo $CUDA_VISIBLE_DEVICES | tr ',' '\n' | wc -l)
+fi
 num_gpus=1
+
+num_nodes=$(scontrol show hostnames "$SLURM_JOB_NODELIST" 2>/dev/null | wc -l)
+if [ $num_nodes == 0 ]; then
+    num_nodes=1
+fi
+num_nodes=${NUM_NODES:-$num_nodes}
+
+# Setup distributed training
+
+header="python -m debugpy --connect 7777 --wait-for-client \
+$(which torchrun) \
+--nnodes=1 \
+--master_port=3749 \
+--nproc-per-node=$num_gpus \
+-m training.lh_train_language_model"
+
+# accu=$(($bsz / $seq / $num_gpus / $num_nodes))
 accu=1
 
-echo "Using single GPU: num_gpus=$num_gpus"
+echo "num_nodes=${num_nodes} master_addr=${master_addr} master_port=${master_port} num_gpus=${num_gpus}"
+# Environment variables
+export OMP_NUM_THREADS=$num_gpus
+export SWANLAB_API_KEY="t0PmOeLpVom1LRBDAKHaA"
+export SWANLAB_LOG_DIR=$out_dir
+export SWANLAB_MODE="cloud"
+export TOKENIZERS_PARALLELISM=true
+export LOGIT_BLOCK_SIZE=2048
 
-#############################################
-# debugpy attach header
-#############################################
-
-header="python -m debugpy --listen 5678 --wait-for-client $(which torchrun) \
-    --nnodes=1 \
-    --nproc-per-node=$num_gpus \
-    -m training.lh_train_language_model"
-
-#############################################
 # Training arguments
-#############################################
-
 base_arguments=(
     --report_to tensorboard
     --do_train

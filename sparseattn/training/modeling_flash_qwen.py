@@ -80,6 +80,9 @@ class PawQwen3Config(Qwen3Config):
         # Streaming
         self.toggle_type = kwargs.pop("toggle_type", "streaming")
         self.sink_size = kwargs.pop("sink_size", 128)
+        
+        # Head Router
+        self.pooling_mode = kwargs.pop("pooling_mode", "first_token")
 
         # TriangleMix
         self.triangle_n_last = kwargs.pop("triangle_n_last", 128)
@@ -777,7 +780,6 @@ class AttentionRouter(nn.Module):
         return torch.stack(pooled_features_list, dim=0) # [B, H, D]
 
 
-
 class Qwen3Attention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
@@ -1427,7 +1429,53 @@ class Qwen3Attention(nn.Module):
             )[:,None,...]
 
         return effective_attn_output
+    def transform_unpadded_to_batched(self, target_x, unpadded_lengths):
+        if unpadded_lengths is None:
+            if target_x.dim() == 3:
+                return target_x.unsqueeze(0)
+            return target_x
 
+        cu_seqlens, seq_lengths = unpadded_lengths
+        B = cu_seqlens.numel() - 1
+        if B == 0:
+            return torch.empty((0,) + target_x.shape[1:], device=target_x.device, dtype=target_x.dtype)
+
+        max_seq_len = seq_lengths
+        
+        batched_list = []
+
+        for b in range(B):
+            s, e = int(cu_seqlens[b]), int(cu_seqlens[b + 1])
+            seq_len = e - s
+
+            if seq_len > 0:
+                current_sequence = target_x[s:e]
+
+                padding_len = max_seq_len - seq_len
+
+                padding_shape = (padding_len,) + current_sequence.shape[1:]
+                padding_tensor = torch.zeros(
+                    padding_shape, 
+                    dtype=current_sequence.dtype, 
+                    device=current_sequence.device
+                )
+
+                padded_sequence = torch.cat([current_sequence, padding_tensor], dim=0)
+                
+            else:
+                other_dims = target_x.shape[1:]
+
+                padded_sequence = torch.zeros(
+                    (max_seq_len,) + other_dims,
+                    dtype=target_x.dtype,
+                    device=target_x.device
+                )
+            
+            batched_list.append(padded_sequence)
+
+        target_x = torch.stack(batched_list, dim=0)
+        
+        return target_x
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1449,7 +1497,6 @@ class Qwen3Attention(nn.Module):
 
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
-
         q = self.q_norm(self.q_proj(hidden_states).view(hidden_shape))
         k = self.k_norm(self.k_proj(hidden_states).view(hidden_shape))
         v = self.v_proj(hidden_states).view(hidden_shape)
@@ -1473,7 +1520,6 @@ class Qwen3Attention(nn.Module):
                 )
 
             z = z_kv_batch
-
         has_layer_past = past_key_value is not None
         if has_layer_past:
             past_kv = past_key_value[0]
@@ -2027,6 +2073,8 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
         next_cache = next_decoder_cache if use_cache else None
         if compute_sparsity:
+            
+            # model_sparsity = 1 - (z_sum / self.total_num_heads)
             if (
                 seq_parallel_group is not None
                 and dist.is_initialized()

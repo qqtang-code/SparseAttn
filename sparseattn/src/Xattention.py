@@ -1,4 +1,3 @@
-from sparseattn.src.utils import *
 import torch
 import math
 import torch.nn.functional as F

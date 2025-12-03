@@ -24,12 +24,13 @@ from .lh_trainer import Trainer
 # from .lh_trainer_nsa import Trainer as NSATrainer
 
 # from .dataset import build_dataset, DataCollator, DataArguments
-from .dataset_batch import build_dataset, PackingDataCollator, DataArguments
+from .dataset_batch import build_dataset, PackingDataCollator, DataArguments, CustomDistributedStratifiedSampler, SamplerConditionError
 from .dataset import logger as dataset_logger
 from .script_arguments import ScriptArguments, TrainingArguments
 
 
 from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
+import torch.distributed as dist
 
 from transformers.trainer_utils import get_last_checkpoint
 import json
@@ -121,6 +122,7 @@ def main():
             sink_size=training_args.sink_size,
             topk_k=training_args.topk_k,
             disable_linear_regularization_term=training_args.disable_linear_regularization_term,
+            pooling_mode=training_args.pooling_mode,
             enable_ada_sparsity=training_args.enable_ada_sparsity,
             enable_layerwise_sparsity=training_args.enable_layerwise_sparsity,
             erank_analysis_path=training_args.erank_analysis_path
@@ -139,6 +141,7 @@ def main():
             sink_size=training_args.sink_size,
             topk_k=training_args.topk_k,
             disable_linear_regularization_term=training_args.disable_linear_regularization_term,
+            pooling_mode=training_args.pooling_mode,
             enable_ada_sparsity=training_args.enable_ada_sparsity,
             enable_layerwise_sparsity=training_args.enable_layerwise_sparsity,
             erank_analysis_path=training_args.erank_analysis_path
@@ -156,6 +159,7 @@ def main():
             sink_size=training_args.sink_size,
             topk_k=training_args.topk_k,
             disable_linear_regularization_term=training_args.disable_linear_regularization_term,
+            pooling_mode=training_args.pooling_mode,
             enable_ada_sparsity=training_args.enable_ada_sparsity,
             enable_layerwise_sparsity=training_args.enable_layerwise_sparsity,
             erank_analysis_path=training_args.erank_analysis_path
@@ -314,6 +318,9 @@ def main():
         else:
             logger.warning("skipping token_scaled_loss -- model does not support it")
 
+    data_collator = PackingDataCollator(tokenizer, data_args, max_seq_len=data_args.per_device_max_tokens)
+    assert training_args.max_steps is not None, "max_steps must be set!"
+    
     # load_datasets
     if training_args.do_train:
         # train_dataset = build_dataset(
@@ -325,6 +332,46 @@ def main():
             data_args=data_args,
             is_training=True,
         )
+        
+        class_indices = train_dataset.get_class_indices()
+        logger.info(f"Using stratified sampling. Class distribution: {[len(v) for v in class_indices.values()]}")
+        
+        if dist.is_initialized():
+            world_size = torch.distributed.get_world_size()
+        else:
+            world_size = training_args.n_gpu
+
+        try:
+            if not dist.is_initialized():
+                raise SamplerConditionError("Distributed environment not initialized.")
+
+            custom_sampler = CustomDistributedStratifiedSampler(
+                dataset=train_dataset,
+                class_indices=class_indices,
+                num_gpus=world_size,
+                required_per_class=2,
+                seed=42,
+            )
+            sampler = custom_sampler
+            
+        except SamplerConditionError as e:
+            print(f"⚠️ Sampler fallback triggered: {e}. Using default DistributedSampler instead.")
+            from torch.utils.data.distributed import DistributedSampler
+            sampler = DistributedSampler(
+                dataset=train_dataset,
+                shuffle=True,
+            )
+        train_dataloader = torch.utils.data.DataLoader(
+            dataset=train_dataset,
+            batch_size=training_args.per_device_train_batch_size,
+            sampler=sampler,
+            collate_fn=data_collator,
+            num_workers=training_args.dataloader_num_workers,
+            pin_memory=training_args.dataloader_pin_memory,
+        )
+        
+        
+
 
     if training_args.do_eval:
         # eval_dataset = {
@@ -357,8 +404,7 @@ def main():
         }
 
     # data_collator = DataCollator(tokenizer, data_args)
-    data_collator = PackingDataCollator(tokenizer, data_args, max_seq_len=data_args.per_device_max_tokens)
-    assert training_args.max_steps is not None, "max_steps must be set!"
+    
 
     # Initialize our Trainer
     if training_args.attention_type is not None and "nsa" in training_args.attention_type :
@@ -382,6 +428,9 @@ def main():
             data_collator=data_collator,
             log_loss=script_args.should_log_loss,
         )
+    if training_args.do_train:
+        trainer.train_dataloader = train_dataloader
+        logger.info("Successfully injected CustomDistributedStratifiedSampler into Trainer.")
 
     if trainer.is_fsdp_enabled:
         # Identify which modules have "_fsdp_wrap" attribute set to True and wrap these
