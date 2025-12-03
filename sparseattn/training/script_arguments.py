@@ -217,13 +217,6 @@ class TrainingArguments(HfTrainingArguments):
         metadata={"help": "The k value for top-k toggling."},
     )
     
-    pooling_mode: str = field(
-        default="first_token",
-        metadata={
-            "help": "The pooling mode to use. Options: 'first_token', 'mean'"
-        },
-    )
-    
     enable_ada_sparsity: bool = field(
         default=False,
         metadata={"help": "Whether to enable layer-wise sparsity."},

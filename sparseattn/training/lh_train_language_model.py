@@ -128,7 +128,6 @@ def main():
             erank_analysis_path=training_args.erank_analysis_path
             if hasattr(training_args, "erank_analysis_path")
             else None,
-            pooling_mode = training_args.pooling_mode,
         )
     elif "llama" in script_args.model_name_or_path.lower():
         config = PawLlamaConfig.from_pretrained(
