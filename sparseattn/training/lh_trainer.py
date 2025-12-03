@@ -567,8 +567,8 @@ class Trainer(HFTrainer):
                         if isinstance(contrastive_loss, torch.Tensor)
                         else contrastive_loss
                     ),
-                    "target_sparsity": target_sparsity,
-                    "model_sparsity": model_sparsity,
+                    "target_sparsity": target_sparsity.detach().float().mean().item(),
+                    "model_sparsity": model_sparsity.detach().float().mean().item(),
                     "step": self.state.global_step,
                 }
                 if isinstance(outputs, dict):
@@ -795,6 +795,11 @@ class Trainer(HFTrainer):
 
         return super()._get_train_sampler()
 
+    def get_train_dataloader(self):    
+        if self.train_dataloader is not None:
+            return self.train_dataloader
+
+        return super().get_train_dataloader()
     def prediction_step(
         self,
         model: nn.Module,

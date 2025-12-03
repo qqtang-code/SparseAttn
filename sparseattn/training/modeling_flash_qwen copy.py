@@ -109,7 +109,6 @@ class PawQwen3Config(Qwen3Config):
 
         # 新增：top-k 注意力的超参（每个 query 仅保留前 k 个 key）
         self.topk_k = kwargs.pop("topk_k", 32)
-        self.pooling_seq = kwargs.pop("pooling_seq", True)
 
         super().__init__(*args, **kwargs)
 
@@ -535,7 +534,7 @@ class Qwen3RotaryEmbedding(nn.Module):
 
         self._update_cos_sin_cache(max_seqlen + seqlen_offset, q.device, q.dtype)
 
-        rope_q = apply_rotary_emb_func(
+        return apply_rotary_emb_func(
             q,
             self._cos_cached[seqlen_offset:],
             self._sin_cached[seqlen_offset:],
@@ -543,8 +542,7 @@ class Qwen3RotaryEmbedding(nn.Module):
             True,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
-        )
-        rope_k = apply_rotary_emb_func(
+        ), apply_rotary_emb_func(
             k,
             self._cos_cached[seqlen_offset:],
             self._sin_cached[seqlen_offset:],
@@ -553,7 +551,6 @@ class Qwen3RotaryEmbedding(nn.Module):
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
         )
-        return rope_q, rope_k
 
 
 class Qwen3MLP(nn.Module):
@@ -620,12 +617,11 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     )
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
-
 class AttentionRouter(nn.Module):
     def __init__(self, input_dim, num_key_value_heads, d_feature=128,
                  use_task_emb=False, temp=2/3, hard=False, 
                  router_type='mlp', use_gumbel=True, learnable_temp=False,
-                 dropout=0.1, layernorm=True, pooling_mode='ctx_q'):
+                 dropout=0.1, layernorm=True, pooling_mode='ctx_q', save_logits=True,log_save_path="router_logs_task_emb_new"):
         super().__init__()
         self.num_kv = num_key_value_heads
         self.temp = temp
@@ -633,68 +629,130 @@ class AttentionRouter(nn.Module):
         self.use_task_emb = use_task_emb
         self.router_type = router_type
         self.use_gumbel = use_gumbel
-        self.learnable_temp = learnable_temp
         self.pooling_mode = pooling_mode
-        
-        # binary cls
-        self.cls_net = nn.Sequential( 
-            nn.Linear(d_feature, 2 * d_feature),
-            nn.SiLU(),
-            nn.Linear(2 * d_feature, d_feature),
-            nn.SiLU(),
-            nn.Linear(d_feature, 1)
-        )
+        self.learnable_temp = learnable_temp
+        if router_type == 'linear':
+            layers = [nn.Linear(d_feature, 2)]
+        elif router_type == 'mlp':
+            layers = [
+                nn.Linear(d_feature, d_feature * 4),
+                nn.SiLU(),
+                nn.Linear(d_feature * 4, d_feature * 2),
+                nn.SiLU(),
+                nn.Linear(d_feature * 2, 2)
+            ]
+        else:
+            raise ValueError(f"Unknown router_type: {router_type}")
+        self.dim_mapping = nn.Sequential(*layers)
+
+        if self.use_task_emb:
+            self.task_embedding = nn.Embedding(4, d_feature)
 
         # ---- learnable temperature ----
         if learnable_temp:
             self.log_temp = nn.Parameter(torch.log(torch.tensor(temp)))
         else:
             self.register_buffer("log_temp", torch.log(torch.tensor(temp)))
-            self.tau = torch.exp(self.log_temp).clamp(0.3, 1.0)
+            
+        self.save_logits = save_logits
+        self.log_dir = log_save_path
+        self.save_counter = 0
+        self.logit_buffer = [] 
+        self.buffer_limit = 10
+    def _segment_pooling(self, pooled_input: torch.Tensor, range_ids: torch.Tensor, segments: list) -> torch.Tensor:
+        B, S, H, D = pooled_input.shape
+        pooled_features_list = []
         
-    def forward(
-        self, 
-        x, 
-        cu_seq_len=None,
-        range_ids: torch.Tensor = None                        , 
-        task_ids: Optional[torch.Tensor] = None
-    ):
+        idx_map = {'first_token': (0, 1),'ctx': (2, 3), 'q': (4, 5), 'a': (6, 7)} 
+        for i in range(B):
+            sample_features = []
+
+            for seg in segments:
+                start_idx, end_idx = idx_map[seg]
+                start, end = range_ids[i, start_idx:end_idx + 1].tolist()
+                if end >= start:
+                    seg_slice = pooled_input[i, start : end + 1, :, :]
+                    seg_pooled = seg_slice.mean(dim=0)  # [H, D]
+                else:
+                    seg_pooled = torch.zeros(H, D, device=pooled_input.device)
+                
+                sample_features.append(seg_pooled)
+
+            if sample_features:
+                combined_feature = torch.stack(sample_features, dim=0).mean(dim=0) # [H, D]
+            else:
+                combined_feature = torch.zeros(H, D, device=pooled_input.device)
+                
+            pooled_features_list.append(combined_feature)
+
+        return torch.stack(pooled_features_list, dim=0) # [B, H, D]
+
+    def forward(self, pooled_input: torch.Tensor, range_ids: torch.Tensor, task_ids: Optional[torch.Tensor] = None):
         """
-        x: [cu_seq_len, H, D]
-        cu_seq_len: [0, seq_len_1, seq_len_2 + seq_len_1, ...]
-        range_ids: [B, 6]
-        task_ids: [B]
-        
+        pooled_input: [B, seq_len, H, D]
         return:
             {
               'decisions': [B, H],
               'hard_decisions': [B, H, 2],
               'sparse_mask': [B, H],
-              'logits': [B, H, 1]
+              'logits': [B, H, 2]
             }
         """
-        bsz = (cu_seq_len.shape[0] - 1) if cu_seq_len is not None else 1
-        
-        # 目前所有支持的pooling 方法
+        B, S, H, D = pooled_input.shape
         if self.pooling_mode == 'first_token':
-            pooled_latent = self._segment_pooling(
-                x, range_ids, ['first_token'], cu_seq_len)  # [B, H, D]
+            x = self._segment_pooling(pooled_input, range_ids, ['first_token'])  # [B, H, D]
+        
+        elif self.pooling_mode == 'mean_all':
+            x = pooled_input.mean(dim=1) # [B, H, D]
+
+        elif self.pooling_mode == 'ctx':
+            x = self._segment_pooling(pooled_input, range_ids, ['ctx'])
+        
+        elif self.pooling_mode == 'q':
+            x = self._segment_pooling(pooled_input, range_ids, ['q'])
+        
+        elif self.pooling_mode == 'ctx_q':
+            x = self._segment_pooling(pooled_input, range_ids, ['ctx', 'q'])
+        
         else:
             raise ValueError(f"Unknown pooling_mode: {self.pooling_mode}")
         
-        binary_logits = self.cls_net(pooled_latent)  # [B, H, 2]
-        
-        if self.learnable_temp:
-            tau = torch.exp(self.log_temp).clamp(0.3, 1.0)
-        else:
-            tau = self.tau
+        if self.use_task_emb:
+            if self.training:
+                if torch.rand(1).item() > 0.5:
+                    task_emb = self.task_embedding(task_ids) # [B, D]
+                    task_emb_expanded = task_emb.unsqueeze(1) 
+                    x = x + task_emb_expanded
+            else:
+                x = x
 
-        # --- Gumbel or Softmax routing ---
+        logits = self.dim_mapping(x)  # [B, H, 2]
+        if self.save_logits and task_ids is not None:
+            with torch.no_grad():
+                batch_data = {
+                    'task_ids': task_ids.cpu().clone(),
+                    'logits': logits.detach().cpu().clone(), # [B, H, 2]
+                    'router_input': x.detach().cpu().float().clone()
+                }
+                self.logit_buffer.append(batch_data)
+                
+                if len(self.logit_buffer) >= self.buffer_limit:
+                    self._flush_logs()
+
+        # --- 1. Logit 转换 (从 2维 Categorical 转为 1维 Binary) ---
+        # 既然 dim 1 代表 "开启/稀疏"，dim 0 代表 "关闭"
+        # Binary Logit = Logit_1 - Logit_0
+        # 这样 logit > 0 倾向于开启，logit < 0 倾向于关闭
+        binary_logits = logits[..., 1] - logits[..., 0]  # [B, H]
+
+        tau = torch.exp(self.log_temp)
+
+        # --- 2. Gumbel-Sigmoid 采样 (Binary Concrete) ---
         if self.training:
             # 生成 Gumbel 噪声: g = -log(-log(u))
             # u ~ Uniform(0, 1)
             u = torch.rand_like(binary_logits)
-            eps = 1e-8
+            eps = 1e-10
             g = -torch.log(-torch.log(u + eps) + eps)
             
             # 连续松弛 (Continuous Relaxation): z_soft \in (0, 1)
@@ -714,7 +772,7 @@ class AttentionRouter(nn.Module):
             # 或者也可以用 sigmoid(logit/tau) > 0.5，但在 deterministic 模式下 logit > 0 即可
             z_soft = torch.sigmoid(binary_logits / tau) 
             z_hard = (z_soft > 0.5).float()
-            z = z_hard
+            z = z_hard # 推理时就是硬掩码
 
         # --- 4. 输出准备 ---
         # sparse_mask: 用于计算的掩码，必须是 STE 后的 z (前向0/1，反向有梯度)
@@ -723,62 +781,24 @@ class AttentionRouter(nn.Module):
         # decisions_out: 这里的 soft 值通常用于记录统计，但梯度的核心在 sparse_mask
         decisions_out = z_soft 
         return {
-            'pooled_hidden_states': pooled_latent, # [B, H, D]
             'decisions': decisions_out,
             'hard_decisions': z_hard,
             'sparse_mask': sparse_mask, # [B, H], 这是一个 STE Tensor
-            'logits': binary_logits,
+            'logits': logits,
         }
         
-        
-    def _segment_pooling(
-        self, 
-        x: torch.Tensor, 
-        range_ids: torch.Tensor, 
-        segments: list[str],
-        cu_seq_len: torch.Tensor,
-    ) -> torch.Tensor:
-        """_summary_
+    def _flush_logs(self):
+        if not self.logit_buffer:
+            return
+        os.makedirs(self.log_dir, exist_ok=True)
 
-        Args:
-            x (torch.Tensor): [cu_seqlen, H, D]
-            range_ids (torch.Tensor): _description_
-            segments (list[str]): _description_
-            cu_seq_len (torch.Tensor): _description_
+        filename = os.path.join(self.log_dir, f"step_{self.save_counter:04d}.pt")
 
-        Returns:
-            torch.Tensor: _description_
-        """
-        POOL_MAP = {'first_token': (0, 1),'ctx': (2, 3), 'q': (4, 5), 'a': (6, 7)} 
-        
-        B = cu_seq_len.shape[0] - 1
-        H, D = x.shape[1:]
-        pooled_features_list = []
-        
-        for i in range(B):
-            sample_features = []
-            x_s, x_e = cu_seq_len[i], cu_seq_len[i + 1]
-            for seg in segments:
-                start_idx, end_idx = POOL_MAP[seg]
-                start, end = range_ids[i, start_idx:end_idx + 1].tolist()
+        torch.save(self.logit_buffer, filename)
+        print(f"--> [AttentionRouter] Saved {len(self.logit_buffer)} samples to {filename}")
 
-                if end >= start:
-                    seg_slice = x[x_s + start: x_s + end + 1,  : , :]
-                    seg_pooled = seg_slice.mean(dim=0)  # [H, D]
-                else:
-                    seg_pooled = torch.zeros(H, D, device=x.device)
-                
-                sample_features.append(seg_pooled)
-
-            if sample_features:
-                combined_feature = torch.stack(sample_features, dim=0).mean(dim=0) # [H, D]
-            else:
-                combined_feature = torch.zeros(H, D, device=x.device)
-                
-            pooled_features_list.append(combined_feature)
-
-        return torch.stack(pooled_features_list, dim=0) # [B, H, D]
-
+        self.logit_buffer = []
+        self.save_counter += 1
 
 class Qwen3Attention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -852,12 +872,11 @@ class Qwen3Attention(nn.Module):
             num_key_value_heads=self.num_key_value_heads,
             # head_dim = self.head_dim,
             d_feature=self.head_dim,
-            use_task_emb=getattr(config, "use_task_emb_for_mask", False),
+            use_task_emb=getattr(config, "use_task_emb_for_mask", True),
             temp=getattr(config, "mask_temp", 2/3),
             hard=getattr(config, "mask_hard_sample", False),
-            pooling_mode=getattr(config, "pooling_mode", "first_token"),
+            pooling_mode=config.pooling_mode
         )
-
         self.context_window_toggle = context_window_toggle
 
         self.toggle_type = config.toggle_type
@@ -1169,6 +1188,7 @@ class Qwen3Attention(nn.Module):
         if unpadded_lengths is not None:
             # varlen, ignore padding tokens, efficient for large batch with many paddings
             cu_seqlens, max_seqlen = unpadded_lengths
+
             attn_output = flash_attn_varlen_kvpacked_func(
                 q,
                 kv,
@@ -1328,7 +1348,12 @@ class Qwen3Attention(nn.Module):
             else:
                 cw_attn_output = topk_attention(q, kv)
         elif self.toggle_type == "xattn":  
-
+            # def set_pdb_trace(rank: int = None):
+            #     import pdb
+            #     import sys
+            #     sys.stdin = open(0)  
+            #     pdb.set_trace()
+            # set_pdb_trace(0)
             if not self.training :
                 _, seq_len, _, _ = q.size()       
             if self.training or seq_len != 1:
@@ -1414,19 +1439,9 @@ class Qwen3Attention(nn.Module):
         else:
             raise ValueError(f"Unknown toggle type: {self.toggle_type}")
 
-        if unpadded_lengths is not None:
-            effective_attn_output = []
-            cu_seqlens, max_seqlen = unpadded_lengths
-            bsz = len(cu_seqlens) - 1
-            for i in range(bsz):
-                effective_attn_output.append(
-                    attn_output[cu_seqlens[i]:cu_seqlens[i + 1], :, :] * z[i, None, ...] + cw_attn_output[cu_seqlens[i]:cu_seqlens[i + 1], :, :] * (1 - z)[i, None, ...]
-                )
-            effective_attn_output = torch.cat(effective_attn_output, dim=0)
-        else:        
-            effective_attn_output = attn_output * z[:,None,...] + cw_attn_output * (
-                1 - z
-            )[:,None,...]
+        effective_attn_output = attn_output * z[:,None,:,None] + cw_attn_output * (
+            1 - z
+        )[:,None,:,None]
 
         return effective_attn_output
     def transform_unpadded_to_batched(self, target_x, unpadded_lengths):
@@ -1494,7 +1509,6 @@ class Qwen3Attention(nn.Module):
         ] = None,  # will become mandatory in v4.46
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
         q = self.q_norm(self.q_proj(hidden_states).view(hidden_shape))
@@ -1509,9 +1523,25 @@ class Qwen3Attention(nn.Module):
             # Next: expand z_kv to (num_key_value_heads, num_key_value_groups) and then flatten it to (num_heads)
             z = z_kv.unsqueeze(-1).expand(-1, self.num_key_value_groups).reshape(-1)
         else:
-            res = self.mask_allocator(q, unpadded_lengths[0], range_ids, task_ids)
-            z_kv_batch, pooled_hidden_states = res['sparse_mask'], res['pooled_hidden_states']
-            
+            target_x = q
+            if unpadded_lengths is not None:
+                # target_x = self.transform_unpadded_to_batched(target_x, unpadded_lengths)
+                cu_seqlens, _ = unpadded_lengths
+                B = cu_seqlens.numel() - 1
+                pooled_list = []
+                for b in range(B):
+                    s, e = int(cu_seqlens[b]), int(cu_seqlens[b + 1])
+                    if e > s:
+                        pooled_list.append(target_x[s:e])
+                    else:
+                        pooled_list.append(torch.zeros_like(target_x[0:1]))
+                target_x = torch.cat(pooled_list, dim=0).unsqueeze(0)  # [B, seq, H, D] 或 [B, H, D]
+                if target_x.dim() == 3 and target_x.shape[-1] == self.head_dim:
+                    target_x = target_x.unsqueeze(0)
+
+            res = self.mask_allocator(target_x, range_ids, task_ids)
+            z_kv_batch = res['sparse_mask']
+
             if z_kv_batch.shape[-1] == self.num_key_value_heads:
                 z_kv_batch = (
                     z_kv_batch.unsqueeze(-1)              # [B, num_kv, 1]
@@ -1527,11 +1557,18 @@ class Qwen3Attention(nn.Module):
         else:
             past_len = 0
 
+        # NOTE: Hack to include position_ids, assuming they are increasing uniformly per block
         if position_ids is not None:
             past_len += position_ids.min()
 
-        q, k = self.rotary_emb(q, k, past_len, unpadded_lengths)
-        
+        if unpadded_lengths is not None:
+            # We don't use the unpadded_length during rotary embeds and instead create a temporary `batch` dimension
+            # This does not actually affect the otucome since the positional embeddings are relative and stay valid
+            # This also ensures that in sequence parallelism the correct `past_len` offset is applied to mid-sequence chunks
+            q, k = self.rotary_emb(q, k, past_len, unpadded_lengths)
+        else:
+            q, k = self.rotary_emb(q, k, past_len)
+
         kv = torch.stack([k, v], -3)
         if self.num_key_value_groups > 1:
             kv = kv.repeat_interleave(self.num_key_value_groups, dim=-2)
@@ -1583,13 +1620,13 @@ class Qwen3Attention(nn.Module):
             kwargs = {}
 
         attn_output = attention_func(q, kv, k, v, unpadded_lengths, z, **kwargs)
+
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output.to(self.o_proj.weight.dtype))
 
         attn_weights = None
         
-        # z: [B, H, 1] -> [B, H] -> [B]
-        return z.squeeze(-1).sum(dim=-1), pooled_hidden_states, attn_output, attn_weights, past_key_value
+        return z.sum(dim=-1), attn_output, attn_weights, past_key_value
 
 
 class Qwen3DecoderLayer(nn.Module):
@@ -1661,7 +1698,7 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        z_sum, pooled_hidden_states, hidden_states, self_attn_weights, present_key_value = self.self_attn(
+        z_sum, hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -1682,7 +1719,10 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
-        outputs = (z_sum, pooled_hidden_states, hidden_states,)
+        outputs = (
+            z_sum,
+            hidden_states,
+        )
 
         if output_attentions:
             outputs += (self_attn_weights,)
@@ -1740,8 +1780,6 @@ class BaseModelOutputWithPastAndSparsity(ModelOutput):
     layerwise_model_sparsity: Optional[torch.FloatTensor] = None  # (num_layers,)
     layerwise_target_sparsity: Optional[torch.FloatTensor] = None  # (num_layers,)
     layerwise_sparsity_loss: Optional[torch.FloatTensor] = None  # scalar
-    # contrastive_loss
-    contrastive_loss: Optional[torch.FloatTensor] = None# 
 
 
 class Qwen3Model(Qwen3PreTrainedModel):
@@ -1951,6 +1989,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
             )
 
         # position_ids = None
+
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
@@ -1971,7 +2010,6 @@ class Qwen3Model(Qwen3PreTrainedModel):
         z_sum = 0 if compute_sparsity else None
 
         layer_z_sums = []  # 收集每层 z_sum 以计算逐层稀疏度
-        # all_pooled_hidden_states = []
 
         for idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
@@ -2013,10 +2051,9 @@ class Qwen3Model(Qwen3PreTrainedModel):
                     task_ids=task_ids,
                 )
 
-            z_layer_sum, pooled_hidden_states, hidden_states = layer_outputs[0], layer_outputs[1], layer_outputs[2]
-
+            z_layer_sum, hidden_states = layer_outputs[0], layer_outputs[1]
             if compute_sparsity:
-                z_sum += z_layer_sum
+                z_sum = z_sum + z_layer_sum
             layer_z_sums.append(z_layer_sum)
 
             if use_cache:
@@ -2025,48 +2062,9 @@ class Qwen3Model(Qwen3PreTrainedModel):
             if output_attentions:
                 all_self_attns += (layer_outputs[2],)
 
-        # pooled_hidden_states = torch.cat(pooled_hidden_states, dim=1)
-        
-        # all gather all pooled_hidden_states across all GPUs
-        pooled_hidden_states = pooled_hidden_states.mean(dim=1) # [B, D]
-        world_size = dist.get_world_size()
-        
-        global_pooled_hidden_states = [torch.zeros_like(pooled_hidden_states, device=hidden_states.device) for _ in range(world_size)]
-        global_task_ids = [torch.zeros_like(task_ids, device=hidden_states.device) for _ in range(world_size)]
-        
-        dist.all_gather(global_pooled_hidden_states, pooled_hidden_states)
-        dist.all_gather(global_task_ids, task_ids)
-        
-        """
-        global_pooled_hidden_states: [[B, D], [B, D], ..., [B, D]] # world_size * [B, D]
-        global_task_ids: [[B], [B], ..., [B]] # world_size * [B]
-        """
-        
-        global_hidden = torch.cat(global_pooled_hidden_states, dim=0)   # [world_size * max_B, D]
-        global_task = torch.cat(global_task_ids, dim=0)     # [world_size * max_B]
-        N = global_hidden.size(0)
-        
-        # 聚合所有的task，获得task 表征
-        unique_tasks = torch.unique(global_task)  # e.g., tensor([0, 1, 3])
-        K_eff = unique_tasks.size(0)
-        if unique_tasks.numel() > 1:
-            prototypes = torch.stack([
-                global_hidden[global_task == t].mean(dim=0)
-                for t in unique_tasks
-            ], dim=0)
-            
-            task_to_idx = {int(t.item()): i for i, t in enumerate(unique_tasks)}
-            mapped_labels = torch.tensor([task_to_idx[int(t.item())] for t in global_task], device=global_task.device)  # [N]
-            z_norm = F.normalize(global_hidden, dim=1)         # [N, D]
-            p_norm = F.normalize(prototypes, dim=1)           # [K_eff, D]
-            
-            logits = torch.mm(z_norm, p_norm.t()) / 0.05  # FIXME：0.05是预设的一个温度，变为超参数 cc:qqt，控制对比锐度，太小梯度爆炸，太大区分度弱（0.05 ~ 0.1）
-            
-            contrastive_loss = F.cross_entropy(logits, mapped_labels)
-        else:
-            contrastive_loss = torch.tensor(0.0, device=hidden_states)
-        
         hidden_states = self.norm(hidden_states)
+
+
 
         # add hidden states from the last decoder layer
         if output_hidden_states:
@@ -2100,13 +2098,10 @@ class Qwen3Model(Qwen3PreTrainedModel):
                     gathered_layer_z_sums.append(sum(tmp))
                 layer_z_sums = gathered_layer_z_sums
 
-            # 1. z_sum / H 表示full attn占所有head的比例
-            # 2. 1 - z_sum / H 表示当前模型稀疏度
             model_sparsity = 1 - (z_sum / self.total_num_heads)
         else:
             model_sparsity = None
             z_loss = None
-        
         if compute_sparsity:
             layerwise_model_sparsity = None
             layerwise_target = None
@@ -2123,16 +2118,14 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 
                 z_loss = (
                     self.sparsity_lambda_1.reshape([])
-                    * (model_sparsity - target_sparsity).mean()
-                    + self.sparsity_lambda_2.reshape([]) 
-                    * ((model_sparsity - target_sparsity) ** 2).mean()
+                    * (model_sparsity - target_sparsity)
+                    + self.sparsity_lambda_2.reshape([])
+                    * (model_sparsity - target_sparsity) ** 2
                 )
-                
         else:
             layerwise_model_sparsity = None
             layerwise_target = None
             layerwise_loss = None
-        
         if (
             target_sparsity is not None
             and self.config.enable_layerwise_sparsity
@@ -2161,7 +2154,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
                     ratios = max_r - (max_r - min_r) * x
                 else:
                     ratios = min_r + (max_r - min_r) * x
-                
+
                 layerwise_target = torch.clamp(
                     ratios * float(target_sparsity), min=0.0, max=1.0
                 )
@@ -2185,6 +2178,18 @@ class Qwen3Model(Qwen3PreTrainedModel):
                     layerwise_target = layerwise_target / s * (target_sparsity * L)
 
             diffs = layerwise_model_sparsity - layerwise_target
+
+            def is_main_process():
+                if not dist.is_available() or not dist.is_initialized():
+                    return True
+                return dist.get_rank() == 0
+
+            # if is_main_process():
+            #     print("============debug layerwise sparsity loss computation============")
+            #     print("debug layerwise_model_sparsity:", layerwise_model_sparsity)
+            #     print("debug layerwise_target:", layerwise_target)
+            #     print("debug diffs:", diffs)
+            #     print("============debug layerwise sparsity loss computation============")
 
             per_layer_loss = self.sparsity_lambda_1.reshape(
                 []
@@ -2228,7 +2233,6 @@ class Qwen3Model(Qwen3PreTrainedModel):
             lambda2=self.sparsity_lambda_2.reshape([]),
             layerwise_model_sparsity=layerwise_model_sparsity,
             layerwise_target_sparsity=layerwise_target,
-            contrastive_loss=contrastive_loss,
         )
 
 
@@ -2254,8 +2258,7 @@ class CausalLMOutputWithPastAndSparsity(ModelOutput):
     layerwise_model_sparsity: Optional[torch.FloatTensor] = None  # (num_layers,)
     layerwise_target_sparsity: Optional[torch.FloatTensor] = None  # (num_layers,)
     layerwise_sparsity_loss: Optional[torch.FloatTensor] = None  # scalar
-    # contrastive_loss
-    contrastive_loss: Optional[torch.FloatTensor] = None  # scalar
+
 
 class KwargsForCausalLM(FlashAttentionKwargs, LossKwargs): ...
 
@@ -2435,7 +2438,9 @@ class PawQwen3ForCausalLM(Qwen3PreTrainedModel):
             max_seqlen = seq_lengths.max().item()
 
             unpadded_lengths = (cu_seqlens, max_seqlen)
-        elif attention_mask is not None and not use_cache and attention_mask.size(0) != 1:
+        elif (
+            (attention_mask is not None) and (not attention_mask.all().item())
+        ) and not use_cache:
             if inputs_embeds is not None:
                 bsz = inputs_embeds.size(0)
                 inputs_embeds, unpad_indices, cu_seqlens, max_seqlen = unpad_input(
@@ -2469,7 +2474,6 @@ class PawQwen3ForCausalLM(Qwen3PreTrainedModel):
             range_ids=range_ids,
             task_ids=task_ids,
         )
-        
         hidden_states = outputs[0]
         if seq_lengths is None and unpadded_lengths is not None:
             hidden_states = pad_input(hidden_states, unpad_indices, bsz, max_seqlen_for_pad_seq)
@@ -2522,7 +2526,6 @@ class PawQwen3ForCausalLM(Qwen3PreTrainedModel):
         if not return_dict:
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
-        
         return CausalLMOutputWithPastAndSparsity(
             loss=loss,
             logits=logits,
@@ -2536,7 +2539,6 @@ class PawQwen3ForCausalLM(Qwen3PreTrainedModel):
             lambda2=outputs.lambda2,
             layerwise_model_sparsity=outputs.layerwise_model_sparsity,
             layerwise_target_sparsity=outputs.layerwise_target_sparsity,
-            contrastive_loss=outputs.contrastive_loss,
         )
 
     def prepare_inputs_for_generation(

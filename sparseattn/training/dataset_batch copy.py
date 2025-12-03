@@ -128,15 +128,30 @@ class ParquetDataset(Dataset):
         self.all_class_ids = self._get_all_class_ids()
         
     def _get_all_class_ids(self):
-
         logger.info("Collecting all class IDs for stratified sampling...")
-        class_ids = []
 
+        CLASS_MAP = {
+            'Single QA': 0,
+            'MultiHop QA': 1,
+            'Summarization': 2,
+            'Code': 3
+        }
+
+        class_ids = []
         for idx in range(len(self.raw_dataset)):
-             item = self.raw_dataset[idx]
-             _, _, _, _, _, class_id = _build_sft_input_and_labels(item, self.tokenizer, self.data_args, self.max_seq_len)
-             class_ids.append(class_id)
-        
+            item = self.raw_dataset[idx]
+            meta = item.get("metadata", {}) or {}
+            if isinstance(meta, str):
+                try:
+                    meta = ast.literal_eval(meta)
+                except Exception:
+                    meta = {}
+
+            task = meta.get("task", "Other")
+            class_id = CLASS_MAP.get(task, 4)
+
+            class_ids.append(class_id)
+
         return class_ids
 
     def get_class_indices(self):
@@ -274,6 +289,8 @@ class PackingDataCollator:
 
         all_tasks = [item.get("task_type", "default") for item in batch]
         
+        all_class_ids = torch.stack([item['class_id'] for item in batch], dim=0)
+        
         res = {
             "input_ids": all_ids,
             "labels": all_labels,
@@ -281,6 +298,7 @@ class PackingDataCollator:
             "task_type": all_tasks,
             "segment_ids": all_segment_ids,
             "range_ids": all_range_ids,
+            "task_ids": all_class_ids,
         }
         
         return res
@@ -353,7 +371,7 @@ def _build_sft_input_and_labels(item, tokenizer, data_args, max_seq_len):
     separator = "\n\n"
 
     # Task Token (Segment ID 0)
-    task_ids = tokenizer(task_token, add_special_tokens=True)["input_ids"]
+    task_ids = tokenizer(task_token, add_special_tokens=False)["input_ids"]
 
     if task_ids[-1] == tokenizer.eos_token_id or task_ids[-1] == tokenizer.sep_token_id:
         task_ids = task_ids[:-1]
@@ -386,9 +404,11 @@ def _build_sft_input_and_labels(item, tokenizer, data_args, max_seq_len):
     current_len = 0
     
     # Task (Segment 0)
+    special_start = current_len
     full_input_ids = task_ids
     segment_ids = [0] * len(task_ids)
     current_len += len(task_ids)
+    special_end = current_len - 1 if task_ids else special_start
     
     # Context (Segment 1)
     ctx_start = current_len
@@ -428,6 +448,7 @@ def _build_sft_input_and_labels(item, tokenizer, data_args, max_seq_len):
 
         max_valid_index = max_seq_len - 1 
 
+        special_end = min(special_end, max_valid_index)
         ctx_end = min(ctx_end, max_valid_index)
         q_end = min(q_end, max_valid_index)
         a_end = min(a_end, max_valid_index)
@@ -435,6 +456,8 @@ def _build_sft_input_and_labels(item, tokenizer, data_args, max_seq_len):
         if q_start > max_valid_index:
             q_start = q_end + 1 
 
+        if special_start > max_valid_index:
+            special_start = special_end + 1
 
         if ctx_start > max_valid_index:
             ctx_start = ctx_end + 1
@@ -448,7 +471,7 @@ def _build_sft_input_and_labels(item, tokenizer, data_args, max_seq_len):
     labels = full_input_ids.copy()
     
     # Range_ids: [ctx_start, ctx_end, q_start, q_end, a_start, a_end]
-    range_ids = [ctx_start, ctx_end, q_start, q_end, a_start, a_end]
+    range_ids = [special_start, special_end, ctx_start, ctx_end, q_start, q_end, a_start, a_end]
     
     padding_len = max_seq_len - len(full_input_ids)
     if padding_len > 0:
@@ -471,8 +494,9 @@ def _build_sft_input_and_labels(item, tokenizer, data_args, max_seq_len):
     
     CLASS_MAP = {'Single QA': 0, 'MultiHop QA': 1, 'Summarization': 2, 'Code': 3}
     class_id = CLASS_MAP.get(task_type, 4)
+    class_id_tensor = torch.tensor(class_id, dtype=torch.long)
     
-    return input_ids, labels, attention_mask, segment_ids, range_ids_tensor, class_id
+    return input_ids, labels, attention_mask, segment_ids, range_ids_tensor, class_id_tensor
 
 
 # =========================================================
@@ -545,98 +569,96 @@ import torch
 import torch.distributed as dist
 from typing import Dict, List, Iterator
 
-# 使用类型提示 Dict 和 List
+class SamplerConditionError(ValueError):
+    pass
 
-class CustomDistributedStratifiedSampler(Sampler[int]):
-    def __init__(self, 
-                 dataset, 
-                 class_indices: Dict[int, List[int]], 
-                 num_gpus: int = 8, 
-                 required_per_class: int = 2,
-                 seed: int = 42):
-
+class CustomDistributedStratifiedSampler(torch.utils.data.Sampler):
+    def __init__(
+        self,
+        dataset,
+        class_indices: Dict[int, List[int]],
+        num_gpus: int = 8,
+        required_per_class: int = 2,
+        seed: int = 42,
+    ):
+        # -------- Distributed setup --------
         if dist.is_initialized():
             self.rank = dist.get_rank()
             self.world_size = dist.get_world_size()
         else:
             self.rank = 0
-            self.world_size = num_gpus 
-        
-        self.class_indices = class_indices
-        self.required_per_class = required_per_class 
-        self.num_classes = len(class_indices) # 4
+            self.world_size = num_gpus
+
         self.seed = seed
+        self.required_per_class = required_per_class
+        self.num_classes = len(class_indices)
+        self.class_indices = class_indices
 
-        self.total_batch_size = self.num_classes * required_per_class # 8
-        if self.total_batch_size != self.world_size:
-            raise ValueError(f"Total Batch Size ({self.total_batch_size}) must equal World Size ({self.world_size}) for per-device batch size of 1.")
+        self.global_batch_size = self.num_classes * self.required_per_class
 
-        min_class_size = min(len(v) for v in class_indices.values())
-        self.num_steps = math.floor(min_class_size / required_per_class)
+        if self.world_size != 8:
+            raise SamplerConditionError(
+                f"❌ Sampler Condition Failed: world_size={self.world_size} is not 8."
+            )
 
-        self.total_samples = self.num_steps * self.total_batch_size
-
-        if self.total_samples % self.world_size != 0:
-            raise RuntimeError("Total samples must be divisible by world size.")
-
-        self.num_samples_per_rank = self.total_samples // self.world_size
-
-        if self.rank == 0:
-            print(f"[{self.rank}] Sampler Init: Steps={self.num_steps}, Total Samples={self.total_samples}, Samples/Rank={self.num_samples_per_rank}")
-
-
-    def __iter__(self) -> Iterator[int]:
-        g = torch.Generator()
-        g.manual_seed(self.seed)
+        if self.global_batch_size != self.world_size:
+            raise SamplerConditionError(
+                f"❌ Sampler Condition Failed: global_batch_size={self.global_batch_size} (classes*{required_per_class}) "
+                f"must equal world_size={self.world_size} for this specific sampler."
+            )
         
-        all_class_batches = []
-        target_required_count = self.num_steps * self.required_per_class # k * 2
+        min_size = min(len(v) for v in class_indices.values())
+        self.num_steps = min_size // required_per_class
 
-        for class_id, indices in self.class_indices.items():
-            temp_indices = indices[:]
 
-            random.seed(self.seed) 
-            random.shuffle(temp_indices) 
-            random.seed() # 恢复
+        self.num_samples = self.num_steps
+        if self.rank == 0:
+            print(f"✅ Sampler Initialized: steps={self.num_steps}, samples per rank={self.num_samples}")
 
-            class_size = len(temp_indices)
-            if class_size < target_required_count:
-                num_repeats = math.ceil(target_required_count / class_size)
-                repeated_indices = temp_indices * num_repeats
-                final_indices = repeated_indices[:target_required_count]
-            else:
-                final_indices = temp_indices[:target_required_count]
+    def __len__(self):
+        return self.num_samples
 
-            class_batches = [
-                final_indices[i:i + self.required_per_class]
-                for i in range(0, target_required_count, self.required_per_class)
-            ]
-            all_class_batches.append(class_batches)
+    def __iter__(self):
+        rng = random.Random(self.seed)
 
-        combined_steps = list(zip(*all_class_batches)) 
+        # flatten all samples for other-class borrowing
+        all_indices = []
+        for cls, idxs in self.class_indices.items():
+            all_indices.extend(idxs)
 
-        rank_indices_list = []
+        final_rank_samples = []
 
-        for step_seed, step_batches in enumerate(combined_steps):
-            current_step_indices = [] 
-            for batch in step_batches:
-                current_step_indices.extend(batch)
-            step_shuffle_seed = self.seed + step_seed
-            random.seed(step_shuffle_seed)
-            random.shuffle(current_step_indices)
-            random.seed() # 恢复
+        for step in range(self.num_steps):
 
-            if len(current_step_indices) != self.world_size:
-                 raise RuntimeError("Step indices count does not match world size.")
+            step_indices = []
 
-            rank_indices_list.append(current_step_indices[self.rank])
-            
-        final_indices = rank_indices_list 
+            for cls, idx_list in self.class_indices.items():
+                # shuffle index list
+                rng.shuffle(idx_list)
 
-        if len(final_indices) != self.num_samples_per_rank:
-             print(f"[{self.rank}] WARNING: Generated {len(final_indices)} indices, expected {self.num_samples_per_rank}.")
+                start = step * self.required_per_class
+                end = start + self.required_per_class
+                chunk = idx_list[start:end]
 
-        return iter(final_indices)
+                if len(chunk) < self.required_per_class:
+                    # need extra samples
+                    need = self.required_per_class - len(chunk)
 
-    def __len__(self) -> int:
-        return self.num_samples_per_rank
+                    # borrow from other classes
+                    candidates = [i for i in all_indices if i not in chunk]
+                    rng.shuffle(candidates)
+
+                    borrowed = candidates[:need]
+                    chunk = chunk + borrowed
+
+                step_indices.extend(chunk)
+
+            # now step_indices has num_classes * required_per_class items
+            if len(step_indices) != self.world_size:
+                raise RuntimeError("step size mismatches world_size")
+
+            rng.shuffle(step_indices)
+            final_rank_samples.append(step_indices[self.rank])
+
+        return iter(final_rank_samples)
+
