@@ -58,12 +58,6 @@ from block_sparse_attn import block_streaming_attn_func
 
 from dataclasses import dataclass
 
-from .distributed_attention import DistributedAttention
-from .attention_mask import (
-    deterministic_z_from_log_alpha,
-    sample_z_from_log_alpha,
-    cdf_stretched_concrete,
-)
 from sparseattn.src.Xattention import Xattention_prefill_dim3, Xattention_prefill_dim4
 
 logger = logging.get_logger(__name__)
@@ -637,27 +631,11 @@ class AttentionRouter(nn.Module):
         self.pooling_mode = pooling_mode
         
         # binary cls
-        # self.cls_net = nn.Sequential( 
-        #     nn.Linear(d_feature, 2 * d_feature),
-        #     nn.SiLU(),
-        #     nn.Linear(2 * d_feature, d_feature),
-        #     nn.SiLU(),
-        #     nn.Linear(d_feature, 1)
-        # )
-        
-        self.cls_feat_extractor = nn.Sequential( 
-            nn.Linear(d_feature, 2 * d_feature),
-            nn.SiLU(),
-            nn.Linear(2 * d_feature, d_feature),
-        )
-        
-        self.cls_router_head_agnostic = nn.Sequential(
+        self.cls_net = nn.Sequential( 
+            nn.Linear(d_feature, d_feature),
             nn.SiLU(),
             nn.Linear(d_feature, 1)
         )
-        
-        if self.use_task_emb:
-            self.task_embedding = nn.Embedding(4, d_feature)
 
         # ---- learnable temperature ----
         if learnable_temp:
@@ -670,7 +648,7 @@ class AttentionRouter(nn.Module):
         self, 
         x, 
         cu_seq_len=None,
-        range_ids: torch.Tensor = None, 
+        range_ids: torch.Tensor = None                        , 
         task_ids: Optional[torch.Tensor] = None
     ):
         """
@@ -691,23 +669,11 @@ class AttentionRouter(nn.Module):
         
         # 目前所有支持的pooling 方法
         if self.pooling_mode == 'first_token':
-            pooled_latent = self._segment_pooling(
-                x, range_ids, ['first_token'], cu_seq_len)  # [B, H, D]
+            pooled_latent = self._segment_pooling(x, range_ids, ['first_token'])  # [B, H, D]
         else:
             raise ValueError(f"Unknown pooling_mode: {self.pooling_mode}")
         
-        
-        if self.use_task_emb:
-            if self.training:
-                task_emb = self.task_embedding(task_ids) # [B, D]
-                task_emb_expanded = task_emb.unsqueeze(1) 
-                pooled_latent = pooled_latent + task_emb_expanded
-            else:
-                pooled_latent = pooled_latent
-                
-        pooled_hidden_states = self.cls_feat_extractor(pooled_latent)
-        
-        binary_logits = self.cls_router_head_agnostic(pooled_hidden_states)  # [B, H, 2]
+        binary_logits = self.cls_net(pooled_latent)  # [B, H, 2]
         
         if self.learnable_temp:
             tau = torch.exp(self.log_temp).clamp(0.3, 1.0)
@@ -748,7 +714,7 @@ class AttentionRouter(nn.Module):
         # decisions_out: 这里的 soft 值通常用于记录统计，但梯度的核心在 sparse_mask
         decisions_out = z_soft 
         return {
-            'pooled_hidden_states': pooled_hidden_states, # [B, H, D]
+            'pooled_hidden_states': pooled_latent, # [B, H, D]
             'decisions': decisions_out,
             'hard_decisions': z_hard,
             'sparse_mask': sparse_mask, # [B, H], 这是一个 STE Tensor
@@ -756,49 +722,29 @@ class AttentionRouter(nn.Module):
         }
         
         
-    def _segment_pooling(
-        self, 
-        x: torch.Tensor, 
-        range_ids: torch.Tensor, 
-        segments: list[str],
-        cu_seq_len: torch.Tensor,
-    ) -> torch.Tensor:
-        """_summary_
-
-        Args:
-            x (torch.Tensor): [cu_seqlen, H, D]
-            range_ids (torch.Tensor): _description_
-            segments (list[str]): _description_
-            cu_seq_len (torch.Tensor): _description_
-
-        Returns:
-            torch.Tensor: _description_
-        """
-        POOL_MAP = {'first_token': (0, 1),'ctx': (2, 3), 'q': (4, 5), 'a': (6, 7)} 
-        
-        B = cu_seq_len.shape[0] - 1
-        H, D = x.shape[1:]
+    def _segment_pooling(self, pooled_input: torch.Tensor, range_ids: torch.Tensor, segments: list) -> torch.Tensor:
+        B, S, H, D = pooled_input.shape
         pooled_features_list = []
         
+        idx_map = {'first_token': (0, 1),'ctx': (2, 3), 'q': (4, 5), 'a': (6, 7)} 
         for i in range(B):
             sample_features = []
-            x_s, x_e = cu_seq_len[i], cu_seq_len[i + 1]
-            for seg in segments:
-                start_idx, end_idx = POOL_MAP[seg]
-                start, end = range_ids[i, start_idx:end_idx + 1].tolist()
 
+            for seg in segments:
+                start_idx, end_idx = idx_map[seg]
+                start, end = range_ids[i, start_idx:end_idx + 1].tolist()
                 if end >= start:
-                    seg_slice = x[x_s + start: x_s + end + 1,  : , :]
+                    seg_slice = pooled_input[i, start : end + 1, :, :]
                     seg_pooled = seg_slice.mean(dim=0)  # [H, D]
                 else:
-                    seg_pooled = torch.zeros(H, D, device=x.device)
+                    seg_pooled = torch.zeros(H, D, device=pooled_input.device)
                 
                 sample_features.append(seg_pooled)
 
             if sample_features:
                 combined_feature = torch.stack(sample_features, dim=0).mean(dim=0) # [H, D]
             else:
-                combined_feature = torch.zeros(H, D, device=x.device)
+                combined_feature = torch.zeros(H, D, device=pooled_input.device)
                 
             pooled_features_list.append(combined_feature)
 
@@ -861,7 +807,6 @@ class Qwen3Attention(nn.Module):
         )  # thus post q_norm does not need reshape
 
         self.rotary_emb = Qwen3RotaryEmbedding(config=self.config)
-        self.distributed_attn_func = DistributedAttention(self.interpolated_attention)
 
         self._dtype = self.q_proj.weight.dtype
         self.attn_mask_log_alphas = nn.Parameter(
@@ -1534,9 +1479,12 @@ class Qwen3Attention(nn.Module):
             # Next: expand z_kv to (num_key_value_heads, num_key_value_groups) and then flatten it to (num_heads)
             z = z_kv.unsqueeze(-1).expand(-1, self.num_key_value_groups).reshape(-1)
         else:
-            res = self.mask_allocator(q, unpadded_lengths[0], range_ids, task_ids)
-            z_kv_batch, pooled_hidden_states = res['sparse_mask'], res['pooled_hidden_states']
-            
+            if unpadded_lengths is not None:
+                res = self.mask_allocator(q, unpadded_lengths[0], range_ids, task_ids)
+                z_kv_batch, pooled_hidden_states = res['sparse_mask'], res['pooled_hidden_states']
+            else:
+                res = self.mask_allocator(q, None, range_ids, task_ids)
+                z_kv_batch, pooled_hidden_states = res['sparse_mask'], res['pooled_hidden_states']
             if z_kv_batch.shape[-1] == self.num_key_value_heads:
                 z_kv_batch = (
                     z_kv_batch.unsqueeze(-1)              # [B, num_kv, 1]
@@ -2045,76 +1993,54 @@ class Qwen3Model(Qwen3PreTrainedModel):
             layer_z_sums.append(z_layer_sum)
 
             if use_cache:
-                next_decoder_cache += (layer_outputs[3 if output_attentions else 2],)
+                next_decoder_cache += (layer_outputs[4 if output_attentions else 3],)
 
             if output_attentions:
-                all_self_attns += (layer_outputs[2],)
+                all_self_attns += (layer_outputs[3],)
 
         # pooled_hidden_states = torch.cat(pooled_hidden_states, dim=1)
-        
-        # all gather all pooled_hidden_states across all GPUs
-        pooled_hidden_states = pooled_hidden_states.mean(dim=1) # [B, D]
-        world_size = dist.get_world_size()
-        
-        global_pooled_hidden_states = [torch.zeros_like(pooled_hidden_states, device=hidden_states.device) for _ in range(world_size)]
-        global_task_ids = [torch.zeros_like(task_ids, device=hidden_states.device) for _ in range(world_size)]
-        
-        dist.all_gather(global_pooled_hidden_states, pooled_hidden_states)
-        dist.all_gather(global_task_ids, task_ids)
-        
-        """
-        global_pooled_hidden_states: [[B, D], [B, D], ..., [B, D]] # world_size * [B, D]
-        global_task_ids: [[B], [B], ..., [B]] # world_size * [B]
-        """
-        
-        global_hidden = torch.cat(global_pooled_hidden_states, dim=0)   # [world_size * max_B, D]
-        global_task = torch.cat(global_task_ids, dim=0)     # [world_size * max_B]
-        N = global_hidden.size(0)
-        
-        # 聚合所有的task，获得task 表征
-        unique_tasks = torch.unique(global_task)  # e.g., tensor([0, 1, 3])
-        K_eff = unique_tasks.size(0)
-        if unique_tasks.numel() > 1:
-            prototypes = torch.stack([
-                global_hidden[global_task == t].mean(dim=0)
-                for t in unique_tasks
-            ], dim=0)
+        if compute_sparsity:
+            # all gather all pooled_hidden_states across all GPUs
+            pooled_hidden_states = pooled_hidden_states.mean(dim=1) # [B, D]
+            world_size = dist.get_world_size()
             
-            task_to_idx = {int(t.item()): i for i, t in enumerate(unique_tasks)}
-            mapped_labels = torch.tensor([task_to_idx[int(t.item())] for t in global_task], device=global_task.device)  # [N]
-            z_norm = F.normalize(global_hidden, dim=1)         # [N, D]
-            p_norm = F.normalize(prototypes, dim=1)           # [K_eff, D]
+            global_pooled_hidden_states = [torch.zeros_like(pooled_hidden_states, device=hidden_states.device) for _ in range(world_size)]
+            global_task_ids = [torch.zeros_like(task_ids, device=hidden_states.device) for _ in range(world_size)]
             
-            logits = torch.mm(z_norm, p_norm.t()) / 0.05  # FIXME：0.05是预设的一个温度，变为超参数 cc:qqt，控制对比锐度，太小梯度爆炸，太大区分度弱（0.05 ~ 0.1）
+            dist.all_gather(global_pooled_hidden_states, pooled_hidden_states)
+            dist.all_gather(global_task_ids, task_ids)
             
-            contrastive_loss = F.cross_entropy(logits, mapped_labels)
+            """
+            global_pooled_hidden_states: [[B, D], [B, D], ..., [B, D]] # world_size * [B, D]
+            global_task_ids: [[B], [B], ..., [B]] # world_size * [B]
+            """
+            
+            global_hidden = torch.cat(global_pooled_hidden_states, dim=0)   # [world_size * max_B, D]
+            global_task = torch.cat(global_task_ids, dim=0)     # [world_size * max_B]
+            N = global_hidden.size(0)
+            
+            # 聚合所有的task，获得task 表征
+            unique_tasks = torch.unique(global_task)  # e.g., tensor([0, 1, 3])
+            K_eff = unique_tasks.size(0)
+            if unique_tasks.numel() > 1:
+                prototypes = torch.stack([
+                    global_hidden[global_task == t].mean(dim=0)
+                    for t in unique_tasks
+                ], dim=0)
+                
+                task_to_idx = {int(t.item()): i for i, t in enumerate(unique_tasks)}
+                mapped_labels = torch.tensor([task_to_idx[int(t.item())] for t in global_task], device=global_task.device)  # [N]
+                z_norm = F.normalize(global_hidden, dim=1)         # [N, D]
+                p_norm = F.normalize(prototypes, dim=1)           # [K_eff, D]
+                
+                logits = torch.mm(z_norm, p_norm.t()) / 0.05  # FIXME：0.05是预设的一个温度，变为超参数 cc:qqt，控制对比锐度，太小梯度爆炸，太大区分度弱（0.05 ~ 0.1）
+                
+                contrastive_loss = F.cross_entropy(logits, mapped_labels)
+            else:
+                contrastive_loss = torch.tensor(0.0, device=hidden_states)
         else:
-            contrastive_loss = torch.tensor(0.0, device=hidden_states)
-
-        save_interval = 1
-
-        current_step = getattr(self.config, "global_step", 0) 
-
-        if self.training and (dist.get_rank() == 0) and (current_step % save_interval == 0):
-            try:
-                save_dir = os.path.join("/data1/lcm_lab/qqt/SparseAttn/sparseattn/", "batch_dump_new")
-                os.makedirs(save_dir, exist_ok=True)
-
-                import time
-                timestamp = int(time.time() * 1000)
-                save_path = os.path.join(save_dir, f"batch_step{current_step}_{timestamp}.pt")
-
-                torch.save({
-                    "global_hidden": global_hidden.detach().cpu().half(),
-                    "global_task": global_task.detach().cpu(),
-                    "unique_tasks": unique_tasks.cpu(),
-                    "loss_val": contrastive_loss.item() if isinstance(contrastive_loss, torch.Tensor) else contrastive_loss,
-                    "prototypes": prototypes.detach().cpu() if unique_tasks.numel() > 1 else None
-                }, save_path)
-
-                print(f"[Diagnostic] Saved batch analysis to {save_path}", flush=True)
-            except Exception as e:
-                print(f"[Diagnostic] Save failed: {e}", flush=True)
+            contrastive_loss = None
+        
         hidden_states = self.norm(hidden_states)
 
         # add hidden states from the last decoder layer
@@ -2604,6 +2530,25 @@ class PawQwen3ForCausalLM(Qwen3PreTrainedModel):
             model_inputs = {"inputs_embeds": inputs_embeds}
         else:
             model_inputs = {"input_ids": input_ids}
+
+        # These are static or need special handling during generation
+        custom_keys = ["segment_ids", "range_ids", "task_ids"]
+        for key in custom_keys:
+            if key in kwargs:
+                value = kwargs[key]
+                # For segment_ids: may need to extend to match input_ids length (if generating)
+                if key == "segment_ids" and value is not None:
+                    # Extend segment_ids with answer segment ID (3) for new tokens
+                    if value.shape[1] < input_ids.shape[1]:
+                        pad_len = input_ids.shape[1] - value.shape[1]
+                        pad_seg = torch.full(
+                            (value.shape[0], pad_len),
+                            fill_value=3,  # answer segment ID (as in training)
+                            dtype=value.dtype,
+                            device=value.device,
+                        )
+                        value = torch.cat([value, pad_seg], dim=1)
+                model_inputs[key] = value
 
         model_inputs.update(
             {
