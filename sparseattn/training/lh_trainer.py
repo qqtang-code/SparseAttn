@@ -295,12 +295,13 @@ class Trainer(HFTrainer):
         # }
         self.task_sparsity_config = {
             "default": {"start": self.start_head_sparsity, "end": self.end_head_sparsity},
-            "Code": {"start": 0.5, "end": 0.4},
-            "Math": {"start": 0.5, "end": 0.6},
-            "MultiHop QA": {"start": 0.5, "end": 0.2},
-            "Single QA": {"start": 0.5, "end": 0.2},
-            "Summarization": {"start": 0.5, "end": 0.7},
+            "Code": {"start": 0, "end": 0.4},
+            "Math": {"start": 0, "end": 0.6},
+            "MultiHop QA": {"start": 0, "end": 0.2},
+            "Single QA": {"start": 0, "end": 0.2},
+            "Summarization": {"start": 0, "end": 0.7},
         }
+        self.reverse_class_map = {0: 'Single QA', 1: 'MultiHop QA', 2: 'Summarization', 3: 'Code'}
 
 
         if not dist.is_initialized() or args.seq_parallel_size == dist.get_world_size():
@@ -491,8 +492,15 @@ class Trainer(HFTrainer):
         
         loss = lm_loss + 10 * reg_loss + contrastive_loss
         model_sparsity = outputs["model_sparsity"]
-        print(f"Rank {torch.distributed.get_rank() if torch.distributed.is_initialized() else 0}: "f"[Step {self.state.global_step}] Task={tasks} | model_sparsity={model_sparsity} ｜ reg_loss={reg_loss}")
-
+        print(f"Rank {torch.distributed.get_rank() if torch.distributed.is_initialized() else 0}: "f"[Step {self.state.global_step}] Task={tasks} | model_sparsity={model_sparsity} | reg_loss={reg_loss}")
+        
+        task_ids = outputs['task_ids']
+        task_sparsity_statistic = dict([(task_name, 0) for task_name in self.reverse_class_map.values()])
+        
+        # all gather task ids and model_sparsity
+        distributed_task_ids = self.accelerator.gather(task_ids)
+        distributed_model_sparsity = self.accelerator.gather(model_sparsity)
+            
         if self.log_loss and self.accelerator.is_main_process:
             model_sparsity = (
                 outputs["model_sparsity"] if isinstance(outputs, dict) else outputs[-3]
@@ -542,6 +550,18 @@ class Trainer(HFTrainer):
                 f"Target Sparsity: {target_sparsity} | Model Sparsity: {model_sparsity}"
                 + (" | " + " | ".join(extra) if len(extra) else "")
             )
+            
+            for task_id, task_sparsity in zip(distributed_task_ids, distributed_model_sparsity):
+                task_name = self.reverse_class_map[task_id.item()]
+                task_sparsity_statistic[task_name] = (task_sparsity_statistic[task_name] + task_sparsity) / 2
+            new_task_sparsity_statistic = {
+                f"Spa-{task_name} sparsity": task_sparsity.detach().item()
+                for task_name, task_sparsity in task_sparsity_statistic.items()
+                if task_sparsity > 0
+            }
+            del task_sparsity_statistic
+            for task_name, task_sparsity in new_task_sparsity_statistic.items():
+                logger.info(f"Sparsity Statistic -> {task_name} | Sparsity: {task_sparsity}")
 
             if (
                 not return_output_and_metrics
@@ -571,6 +591,8 @@ class Trainer(HFTrainer):
                     "model_sparsity": model_sparsity.detach().float().mean().item(),
                     "step": self.state.global_step,
                 }
+                train_metrics.update(new_task_sparsity_statistic)
+                
                 if isinstance(outputs, dict):
                     for k in [
                         "lambda1",
@@ -585,45 +607,8 @@ class Trainer(HFTrainer):
                                 else:
                                     v = float(v.mean().item())
                             train_metrics[k] = v
+                
                 self.log(train_metrics)
-
-        if return_output_and_metrics:
-            # shifted_labels = inputs["labels"][:,1:].contiguous()
-            # valid_mask = (shifted_labels != -100)
-            # correct = (outputs.logits[:,:-1].argmax(-1) == shifted_labels).float()
-            # correct[~valid_mask] = 0.0
-            # acc = correct.sum(dim=-1) / valid_mask.float().sum(dim=-1)
-            model_sparsity_val = (
-                outputs["model_sparsity"] if isinstance(outputs, dict) else outputs[-3]
-            )
-
-            metrics = {
-                "lm_loss": lm_loss.detach().item()
-                if isinstance(lm_loss, torch.Tensor)
-                else float(lm_loss),
-                "reg_loss": reg_loss.detach().item()
-                if isinstance(reg_loss, torch.Tensor)
-                else float(reg_loss),
-                "loss": loss.detach().item()
-                if isinstance(loss, torch.Tensor)
-                else float(loss),
-                "target_sparsity": target_sparsity.item(),
-                "model_sparsity": model_sparsity_val.item(),
-                "step": self.state.global_step,
-            }
-
-            # Carry diagnostics into metrics if available
-            if isinstance(outputs, dict):
-                for k in [
-                    "lambda1",
-                    "lambda2",
-                ]:
-                    if k in outputs and outputs[k] is not None:
-                        metrics[k] = outputs[k]
-
-            self.log(metrics)
-
-            return (loss, outputs, metrics)
 
         if return_outputs:
             return (loss, outputs)

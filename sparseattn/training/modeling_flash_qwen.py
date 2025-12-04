@@ -1429,6 +1429,7 @@ class Qwen3Attention(nn.Module):
             )[:,None,...]
 
         return effective_attn_output
+    
     def transform_unpadded_to_batched(self, target_x, unpadded_lengths):
         if unpadded_lengths is None:
             if target_x.dim() == 3:
@@ -1476,6 +1477,7 @@ class Qwen3Attention(nn.Module):
         target_x = torch.stack(batched_list, dim=0)
         
         return target_x
+    
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1741,8 +1743,8 @@ class BaseModelOutputWithPastAndSparsity(ModelOutput):
     layerwise_target_sparsity: Optional[torch.FloatTensor] = None  # (num_layers,)
     layerwise_sparsity_loss: Optional[torch.FloatTensor] = None  # scalar
     # contrastive_loss
-    contrastive_loss: Optional[torch.FloatTensor] = None# 
-
+    contrastive_loss: Optional[torch.FloatTensor] = None
+    
 
 class Qwen3Model(Qwen3PreTrainedModel):
     """
@@ -1921,6 +1923,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
         range_ids: Optional[torch.LongTensor] = None,
         task_ids: Optional[torch.LongTensor] = None,
         erank_analysis_path: Optional[str] = None,
+        enable_contrastive_loss: bool = False,
         **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         compute_sparsity = self.training
@@ -2025,47 +2028,48 @@ class Qwen3Model(Qwen3PreTrainedModel):
             if output_attentions:
                 all_self_attns += (layer_outputs[2],)
 
-        # pooled_hidden_states = torch.cat(pooled_hidden_states, dim=1)
-        
-        # all gather all pooled_hidden_states across all GPUs
-        pooled_hidden_states = pooled_hidden_states.mean(dim=1) # [B, D]
-        world_size = dist.get_world_size()
-        
-        global_pooled_hidden_states = [torch.zeros_like(pooled_hidden_states, device=hidden_states.device) for _ in range(world_size)]
-        global_task_ids = [torch.zeros_like(task_ids, device=hidden_states.device) for _ in range(world_size)]
-        
-        dist.all_gather(global_pooled_hidden_states, pooled_hidden_states)
-        dist.all_gather(global_task_ids, task_ids)
-        
-        """
-        global_pooled_hidden_states: [[B, D], [B, D], ..., [B, D]] # world_size * [B, D]
-        global_task_ids: [[B], [B], ..., [B]] # world_size * [B]
-        """
-        
-        global_hidden = torch.cat(global_pooled_hidden_states, dim=0)   # [world_size * max_B, D]
-        global_task = torch.cat(global_task_ids, dim=0)     # [world_size * max_B]
-        N = global_hidden.size(0)
-        
-        # 聚合所有的task，获得task 表征
-        unique_tasks = torch.unique(global_task)  # e.g., tensor([0, 1, 3])
-        K_eff = unique_tasks.size(0)
-        if unique_tasks.numel() > 1:
-            prototypes = torch.stack([
-                global_hidden[global_task == t].mean(dim=0)
-                for t in unique_tasks
-            ], dim=0)
+        if enable_contrastive_loss:
+            # all gather all pooled_hidden_states across all GPUs
+            pooled_hidden_states = pooled_hidden_states.mean(dim=1) # [B, D]
+            world_size = dist.get_world_size()
             
-            task_to_idx = {int(t.item()): i for i, t in enumerate(unique_tasks)}
-            mapped_labels = torch.tensor([task_to_idx[int(t.item())] for t in global_task], device=global_task.device)  # [N]
-            z_norm = F.normalize(global_hidden, dim=1)         # [N, D]
-            p_norm = F.normalize(prototypes, dim=1)           # [K_eff, D]
+            global_pooled_hidden_states = [torch.zeros_like(pooled_hidden_states, device=hidden_states.device) for _ in range(world_size)]
+            global_task_ids = [torch.zeros_like(task_ids, device=hidden_states.device) for _ in range(world_size)]
             
-            logits = torch.mm(z_norm, p_norm.t()) / 0.05  # FIXME：0.05是预设的一个温度，变为超参数 cc:qqt，控制对比锐度，太小梯度爆炸，太大区分度弱（0.05 ~ 0.1）
+            dist.all_gather(global_pooled_hidden_states, pooled_hidden_states)
+            dist.all_gather(global_task_ids, task_ids)
             
-            contrastive_loss = F.cross_entropy(logits, mapped_labels)
+            """
+            global_pooled_hidden_states: [[B, D], [B, D], ..., [B, D]] # world_size * [B, D]
+            global_task_ids: [[B], [B], ..., [B]] # world_size * [B]
+            """
+            
+            global_hidden = torch.cat(global_pooled_hidden_states, dim=0)   # [world_size * max_B, D]
+            global_task = torch.cat(global_task_ids, dim=0)     # [world_size * max_B]
+            N = global_hidden.size(0)
+            
+            # 聚合所有的task，获得task 表征
+            unique_tasks = torch.unique(global_task)  # e.g., tensor([0, 1, 3])
+            K_eff = unique_tasks.size(0)
+            if unique_tasks.numel() > 1:
+                prototypes = torch.stack([
+                    global_hidden[global_task == t].mean(dim=0)
+                    for t in unique_tasks
+                ], dim=0)
+                
+                task_to_idx = {int(t.item()): i for i, t in enumerate(unique_tasks)}
+                mapped_labels = torch.tensor([task_to_idx[int(t.item())] for t in global_task], device=global_task.device)  # [N]
+                z_norm = F.normalize(global_hidden, dim=1)         # [N, D]
+                p_norm = F.normalize(prototypes, dim=1)           # [K_eff, D]
+                
+                logits = torch.mm(z_norm, p_norm.t()) / 0.05  # FIXME：0.05是预设的一个温度，变为超参数 cc:qqt，控制对比锐度，太小梯度爆炸，太大区分度弱（0.05 ~ 0.1）
+                
+                contrastive_loss = F.cross_entropy(logits, mapped_labels)
+            else:
+                contrastive_loss = torch.tensor(0.0, device=hidden_states.device)
         else:
-            contrastive_loss = torch.tensor(0.0, device=hidden_states)
-        
+            contrastive_loss = torch.tensor(0.0, device=hidden_states.device)
+            
         hidden_states = self.norm(hidden_states)
 
         # add hidden states from the last decoder layer
@@ -2256,6 +2260,8 @@ class CausalLMOutputWithPastAndSparsity(ModelOutput):
     layerwise_sparsity_loss: Optional[torch.FloatTensor] = None  # scalar
     # contrastive_loss
     contrastive_loss: Optional[torch.FloatTensor] = None  # scalar
+    # task_ids
+    task_ids: Optional[torch.FloatTensor] = None
 
 class KwargsForCausalLM(FlashAttentionKwargs, LossKwargs): ...
 
@@ -2268,6 +2274,7 @@ class PawQwen3ForCausalLM(Qwen3PreTrainedModel):
     def __init__(
         self,
         config,
+        enable_contrastive_loss=False,
     ):
         super().__init__(config)
         self.model = Qwen3Model(
@@ -2277,7 +2284,7 @@ class PawQwen3ForCausalLM(Qwen3PreTrainedModel):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         self.logit_block_size = int(os.environ.get("LOGIT_BLOCK_SIZE", 16384))
-
+        self.enable_contrastive_loss = enable_contrastive_loss
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -2468,6 +2475,7 @@ class PawQwen3ForCausalLM(Qwen3PreTrainedModel):
             segment_ids=segment_ids,
             range_ids=range_ids,
             task_ids=task_ids,
+            enable_contrastive_loss=self.enable_contrastive_loss,
         )
         
         hidden_states = outputs[0]
@@ -2537,6 +2545,7 @@ class PawQwen3ForCausalLM(Qwen3PreTrainedModel):
             layerwise_model_sparsity=outputs.layerwise_model_sparsity,
             layerwise_target_sparsity=outputs.layerwise_target_sparsity,
             contrastive_loss=outputs.contrastive_loss,
+            task_ids=task_ids,
         )
 
     def prepare_inputs_for_generation(

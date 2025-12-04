@@ -2,7 +2,7 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
 # Model and training configuration
 model=${MODEL:-"/data2/hf_models/Qwen3-4B"}
-bsz=${BSZ:-16}
+bsz=${BSZ:-32}
 seq=${SEQ:-2}
 lr=${LR:-1e-5}
 steps=${STEPS:-1000}
@@ -16,11 +16,11 @@ seq_parallel_size=${SEQ_PARALLEL_SIZE:-1}
 
 # FSDP configuration
 # 0=Disable, 1=FULL_SHARD, 2=SHARD_GRAD_OP, 3=NO_SHARD, 4=HYBRID_SHARD, 5=HYBRID_SHARD_ZERO2
-fsdp=${FSDP:-"1"}
+fsdp=${FSDP:-"5"}
 gc=${GC:-"1"}
 
 # PruLong-specific arguments
-max_toks=${MAX_TOKS:-65536}
+max_toks=${MAX_TOKS:-32768}
 # max_toks=${MAX_TOKS:-256}
 start_head_sparsity=${START_HEAD_SPARSITY:-0.5}
 end_head_sparsity=${END_HEAD_SPARSITY:-0.3}
@@ -61,7 +61,7 @@ if [[ $freeze_masks == "true" ]]; then
     extra_name="${extra_name}_mfrozen"
 fi
 
-run_name="masksonly_$(basename $model)_bsz${bsz}_steps${steps}_lr${lr}_warmup${warmup}_sp${end_head_sparsity}_cw${context_window_if_toggled}_mlr${mask_learning_rate}_rlr${reg_learning_rate}${extra_name}${suffix}"
+run_name="debug2"
 
 out_dir="checkpoints/$run_name"
 mkdir -p $out_dir
@@ -84,8 +84,8 @@ header="torchrun \
 
 # header="python -m debugpy --listen 0.0.0.0:5678 --wait-for-client -m training.lh_train_language_model"
 
-# accu=$(($bsz / $seq / $num_gpus / $num_nodes))
-accu=8
+accu=$(($bsz / $seq / $num_gpus / $num_nodes))
+# accu=1
 
 # Environment variables
 export OMP_NUM_THREADS=$num_gpus

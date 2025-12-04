@@ -297,9 +297,6 @@ class PackingDataCollator:
             "segment_ids": all_segment_ids,
             "range_ids": all_range_ids,
             "task_ids": all_class_ids,
-            "segment_ids": all_segment_ids,
-            "range_ids": all_range_ids,
-            "task_ids": all_class_ids,
         }
         
         return res

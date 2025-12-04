@@ -223,6 +223,7 @@ def main():
                 cache_dir=script_args.cache_dir,
                 revision=script_args.model_revision,
                 use_auth_token=True if script_args.use_auth_token else None,
+                enable_contrastive_loss=training_args.enable_contrastive_loss,
             )
         elif "llama" in script_args.model_name_or_path.lower():
             model = PawLlamaForCausalLM.from_pretrained(
@@ -297,12 +298,6 @@ def main():
         else:
             logger.warning("skipping loading masks -- model does not support it")
 
-    if (
-        script_args.tokenizer_name is not None
-        and script_args.model_name_or_path != script_args.tokenizer_name
-    ):
-        model.resize_token_embeddings(len(tokenizer))
-
     logger.info(f"Model: {model}")
 
     # Idk causes weird issues without this when doing multiple runs from different codebases
@@ -369,9 +364,6 @@ def main():
             pin_memory=training_args.dataloader_pin_memory,
         )
         
-        
-
-
     if training_args.do_eval:
         # eval_dataset = {
         #     x.split("/")[-1]: build_dataset(

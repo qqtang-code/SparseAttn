@@ -259,3 +259,8 @@ class TrainingArguments(HfTrainingArguments):
         default=None,
         metadata={"help": "Path to the effective rank analysis results file."},
     )
+    
+    enable_contrastive_loss: bool = field(
+        default=False,
+        metadata={"help": "Whether to enable contrastive loss."},
+    )
