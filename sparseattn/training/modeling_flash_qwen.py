@@ -688,8 +688,12 @@ class AttentionRouter(nn.Module):
         
         # 目前所有支持的pooling 方法
         if self.pooling_mode == 'first_token':
-            pooled_latent = self._segment_pooling(
-                x, range_ids, ['first_token'], cu_seq_len)  # [B, H, D]
+            if cu_seq_len is not None:
+                pooled_latent = self._segment_pooling(
+                    x, range_ids, ['first_token'], cu_seq_len)  # [B, H, D]
+            else:
+                pooled_latent = self._segment_pooling_single_batch(
+                    x, range_ids, ['first_token'])
         else:
             raise ValueError(f"Unknown pooling_mode: {self.pooling_mode}")
         
@@ -744,6 +748,33 @@ class AttentionRouter(nn.Module):
             'sparse_mask': z, # [B, H], 这是一个 STE Tensor
             'logits': binary_logits,
         }
+    def _segment_pooling_single_batch(self, pooled_input: torch.Tensor, range_ids: torch.Tensor, segments: list) -> torch.Tensor:
+        B, S, H, D = pooled_input.shape
+        pooled_features_list = []
+        
+        idx_map = {'first_token': (0, 1),'ctx': (2, 3), 'q': (4, 5), 'a': (6, 7)} 
+        for i in range(B):
+            sample_features = []
+
+            for seg in segments:
+                start_idx, end_idx = idx_map[seg]
+                start, end = range_ids[i, start_idx:end_idx + 1].tolist()
+                if end >= start:
+                    seg_slice = pooled_input[i, start : end + 1, :, :]
+                    seg_pooled = seg_slice.mean(dim=0)  # [H, D]
+                else:
+                    seg_pooled = torch.zeros(H, D, device=pooled_input.device)
+                
+                sample_features.append(seg_pooled)
+
+            if sample_features:
+                combined_feature = torch.stack(sample_features, dim=0).mean(dim=0) # [H, D]
+            else:
+                combined_feature = torch.zeros(H, D, device=pooled_input.device)
+                
+            pooled_features_list.append(combined_feature)
+
+        return torch.stack(pooled_features_list, dim=0) # [B, H, D]
         
         
     def _segment_pooling(
@@ -1526,9 +1557,12 @@ class Qwen3Attention(nn.Module):
             # Next: expand z_kv to (num_key_value_heads, num_key_value_groups) and then flatten it to (num_heads)
             z = z_kv.unsqueeze(-1).expand(-1, self.num_key_value_groups).reshape(-1)
         else:
-            res = self.mask_allocator(q, unpadded_lengths[0], range_ids, task_ids)
-            z_kv_batch, pooled_hidden_states = res['sparse_mask'], res['pooled_hidden_states']
-            
+            if unpadded_lengths is not None:
+                res = self.mask_allocator(q, unpadded_lengths[0], range_ids, task_ids)
+                z_kv_batch, pooled_hidden_states = res['sparse_mask'], res['pooled_hidden_states']
+            else:
+                res = self.mask_allocator(q, None, range_ids, task_ids)
+                z_kv_batch, pooled_hidden_states = res['sparse_mask'], res['pooled_hidden_states']
             if z_kv_batch.shape[-1] == self.num_key_value_heads:
                 z_kv_batch = (
                     z_kv_batch.unsqueeze(-1)              # [B, num_kv, 1]
