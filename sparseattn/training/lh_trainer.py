@@ -484,6 +484,8 @@ class Trainer(HFTrainer):
         # all gather task ids and model_sparsity
         distributed_task_ids = self.accelerator.gather(task_ids)
         distributed_model_sparsity = self.accelerator.gather(model_sparsity)
+        distributed_loss = self.accelerator.gather(loss).mean()
+        
             
         if self.log_loss and self.accelerator.is_main_process:
             model_sparsity = (
@@ -529,7 +531,7 @@ class Trainer(HFTrainer):
                 )
 
             logger.info(
-                f"@ {self.state.global_step} | Loss: {loss} | LM Loss: {lm_loss} | "
+                f"@ {self.state.global_step} | Loss: {distributed_loss} | LM Loss: {lm_loss} | "
                 f"Reg Loss: {reg_loss} | contrastive_loss: {contrastive_loss} | "
                 f"Target Sparsity: {target_sparsity} | Model Sparsity: {model_sparsity}"
                 + (" | " + " | ".join(extra) if len(extra) else "")
