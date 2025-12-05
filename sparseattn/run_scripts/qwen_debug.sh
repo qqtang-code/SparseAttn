@@ -2,7 +2,7 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
 # Model and training configuration
 model=${MODEL:-"/data2/hf_models/Qwen3-4B"}
-bsz=${BSZ:-32}
+bsz=${BSZ:-64}
 seq=${SEQ:-2}
 lr=${LR:-1e-5}
 steps=${STEPS:-1000}

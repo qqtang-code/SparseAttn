@@ -123,6 +123,8 @@ def main():
             topk_k=training_args.topk_k,
             disable_linear_regularization_term=training_args.disable_linear_regularization_term,
             pooling_mode=training_args.pooling_mode,
+            enable_contrastive_loss=training_args.enable_contrastive_loss,
+            
             enable_ada_sparsity=training_args.enable_ada_sparsity,
             enable_layerwise_sparsity=training_args.enable_layerwise_sparsity,
             erank_analysis_path=training_args.erank_analysis_path
@@ -141,6 +143,8 @@ def main():
             topk_k=training_args.topk_k,
             disable_linear_regularization_term=training_args.disable_linear_regularization_term,
             pooling_mode=training_args.pooling_mode,
+            enable_contrastive_loss=training_args.enable_contrastive_loss,
+            
             enable_ada_sparsity=training_args.enable_ada_sparsity,
             enable_layerwise_sparsity=training_args.enable_layerwise_sparsity,
             erank_analysis_path=training_args.erank_analysis_path
@@ -159,6 +163,8 @@ def main():
             topk_k=training_args.topk_k,
             disable_linear_regularization_term=training_args.disable_linear_regularization_term,
             pooling_mode=training_args.pooling_mode,
+            enable_contrastive_loss=training_args.enable_contrastive_loss,
+            
             enable_ada_sparsity=training_args.enable_ada_sparsity,
             enable_layerwise_sparsity=training_args.enable_layerwise_sparsity,
             erank_analysis_path=training_args.erank_analysis_path
@@ -192,6 +198,7 @@ def main():
                 revision=script_args.model_revision,
                 use_auth_token=True if script_args.use_auth_token else None,
                 torch_dtype=torch.bfloat16,
+                compute_contrastive_loss=training_args.enable_contrastive_loss,
             )
             # config = model.config
             # config._attn_implementation = "flash_attention_2"

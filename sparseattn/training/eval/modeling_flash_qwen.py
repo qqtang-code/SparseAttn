@@ -19,18 +19,14 @@
 # limitations under the License.
 """PyTorch Qwen3 model."""
 
-from typing import List, Optional, Tuple, Union, Any
 
+import os
 import torch
+import math
 import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import nn
-from torch.nn import CrossEntropyLoss
-
 import torch.distributed as dist
-
-import os
-
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
@@ -41,13 +37,10 @@ from transformers.utils import logging, ModelOutput, LossKwargs
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.processing_utils import Unpack
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
-
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
-
 from flash_attn import flash_attn_kvpacked_func, flash_attn_varlen_kvpacked_func
 from flash_attn.bert_padding import unpad_input, pad_input
-import math
-
+from typing import List, Optional, Tuple, Union, Any
 try:
     from flash_attn.layers.rotary import apply_rotary_emb_func
 except ImportError:
@@ -1728,11 +1721,12 @@ class Qwen3Model(Qwen3PreTrainedModel):
     def __init__(
         self,
         config: PawQwen3Config,
+        compute_contrastive_loss: bool = False,
     ):
         super().__init__(config)
         context_window_toggle = config.local_window_size
         disable_linear_regularization_term = config.disable_linear_regularization_term
-
+        self.compute_contrastive_loss = compute_contrastive_loss
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
@@ -1999,7 +1993,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 all_self_attns += (layer_outputs[3],)
 
         # pooled_hidden_states = torch.cat(pooled_hidden_states, dim=1)
-        if compute_sparsity:
+        if self.compute_contrastive_loss:
             # all gather all pooled_hidden_states across all GPUs
             pooled_hidden_states = pooled_hidden_states.mean(dim=1) # [B, D]
             world_size = dist.get_world_size()
@@ -2007,8 +2001,10 @@ class Qwen3Model(Qwen3PreTrainedModel):
             global_pooled_hidden_states = [torch.zeros_like(pooled_hidden_states, device=hidden_states.device) for _ in range(world_size)]
             global_task_ids = [torch.zeros_like(task_ids, device=hidden_states.device) for _ in range(world_size)]
             
-            dist.all_gather(global_pooled_hidden_states, pooled_hidden_states)
-            dist.all_gather(global_task_ids, task_ids)
+            dist.all_gather(global_pooled_hidden_states, pooled_hidden_states.detach())
+            dist.all_gather(global_task_ids, task_ids.detach())
+            
+            global_pooled_hidden_states[torch.distributed.get_rank()] = pooled_hidden_states  # 用原始 x 替换当前 rank 的副本（保留梯度）
             
             """
             global_pooled_hidden_states: [[B, D], [B, D], ..., [B, D]] # world_size * [B, D]
@@ -2243,10 +2239,12 @@ class PawQwen3ForCausalLM(Qwen3PreTrainedModel):
     def __init__(
         self,
         config,
+        compute_contrastive_loss=False,
     ):
         super().__init__(config)
         self.model = Qwen3Model(
             config,
+            compute_contrastive_loss,
         )
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)

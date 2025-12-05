@@ -703,7 +703,6 @@ class AttentionRouter(nn.Module):
                 pooled_latent = pooled_latent
                 
         pooled_hidden_states = self.cls_feat_extractor(pooled_latent)
-        
         binary_logits = self.cls_router_head_agnostic(pooled_hidden_states)  # [B, H, 2]
         
         if self.learnable_temp:
@@ -738,17 +737,11 @@ class AttentionRouter(nn.Module):
             z_hard = (z_soft > 0.5).float()
             z = z_hard
 
-        # --- 4. 输出准备 ---
-        # sparse_mask: 用于计算的掩码，必须是 STE 后的 z (前向0/1，反向有梯度)
-        sparse_mask = z 
-
-        # decisions_out: 这里的 soft 值通常用于记录统计，但梯度的核心在 sparse_mask
-        decisions_out = z_soft 
         return {
             'pooled_hidden_states': pooled_hidden_states, # [B, H, D]
-            'decisions': decisions_out,
+            'decisions': z_soft,
             'hard_decisions': z_hard,
-            'sparse_mask': sparse_mask, # [B, H], 这是一个 STE Tensor
+            'sparse_mask': z, # [B, H], 这是一个 STE Tensor
             'logits': binary_logits,
         }
         
@@ -2058,8 +2051,11 @@ class Qwen3Model(Qwen3PreTrainedModel):
             global_pooled_hidden_states = [torch.zeros_like(pooled_hidden_states, device=hidden_states.device) for _ in range(world_size)]
             global_task_ids = [torch.zeros_like(task_ids, device=hidden_states.device) for _ in range(world_size)]
             
-            dist.all_gather(global_pooled_hidden_states, pooled_hidden_states)
-            dist.all_gather(global_task_ids, task_ids)
+            dist.all_gather(global_pooled_hidden_states, pooled_hidden_states.detach())
+            dist.all_gather(global_task_ids, task_ids.detach())
+            
+            global_pooled_hidden_states[torch.distributed.get_rank()] = pooled_hidden_states  # 用原始 x 替换当前 rank 的副本（保留梯度）
+            
             
             """
             global_pooled_hidden_states: [[B, D], [B, D], ..., [B, D]] # world_size * [B, D]

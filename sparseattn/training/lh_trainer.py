@@ -273,26 +273,11 @@ class Trainer(HFTrainer):
         self.reg_learning_rate = args.reg_learning_rate
         self.warmup_type = args.warmup_type
         self.sparsity_warmup_ratio = args.sparsity_warmup_ratio
-        self.disable_linear_regularization_term = (
-            args.disable_linear_regularization_term
-        )
+        self.disable_linear_regularization_term = args.disable_linear_regularization_term
         self.context_window_if_toggled = args.context_window_if_toggled
-
         self.freeze_non_mask_parameters = args.freeze_non_mask_parameters
         self.freeze_mask_parameters = args.freeze_mask_parameters
-
-        self.num_sparsity_warmup_steps = math.ceil(
-            self.sparsity_warmup_ratio * self.args.max_steps
-        )
-        
-        # self.task_sparsity_config = {
-        #     "default": {"start": self.start_head_sparsity, "end": self.end_head_sparsity},
-        #     "Code": {"start": 0.1, "end": 0.7},
-        #     "Math": {"start": 0.0, "end": 0.6},
-        #     "MultiHop QA": {"start": 0.2, "end": 0.5},
-        #     "Single QA": {"start": 0.1, "end": 0.7},
-        #     "Summarization": {"start": 0.3, "end": 0.6},
-        # }
+        self.num_sparsity_warmup_steps = math.ceil(self.sparsity_warmup_ratio * self.args.max_steps)
         self.task_sparsity_config = {
             "default": {"start": self.start_head_sparsity, "end": self.end_head_sparsity},
             "Code": {"start": 0, "end": 0.4},
@@ -302,7 +287,6 @@ class Trainer(HFTrainer):
             "Summarization": {"start": 0, "end": 0.7},
         }
         self.reverse_class_map = {0: 'Single QA', 1: 'MultiHop QA', 2: 'Summarization', 3: 'Code'}
-
 
         if not dist.is_initialized() or args.seq_parallel_size == dist.get_world_size():
             logger.info(f"Using world as sequence parallel group")
@@ -633,7 +617,7 @@ class Trainer(HFTrainer):
             optimizer_3_group = []  # mask params, decay
             optimizer_4_group = []  # reg params, decay
             optimizer_5_group = []  # mask params, decay
-
+            optimized_parameters = []
             for n, p in opt_model.named_parameters():
                 if not p.requires_grad:
                     continue
@@ -642,27 +626,34 @@ class Trainer(HFTrainer):
                         p.requires_grad = False
                     else:
                         optimizer_5_group.append(p)
+                        optimized_parameters.append(n)
                 elif "log_alpha" in n:
                     if self.freeze_mask_parameters:
                         p.requires_grad = False
                     else:
                         optimizer_3_group.append(p)
+                        optimized_parameters.append(n)
                 elif "sparsity_lambda" in n:
                     if self.freeze_mask_parameters:
                         p.requires_grad = False
                     else:
                         optimizer_4_group.append(p)
+                        optimized_parameters.append(n)
                 elif n in decay_parameters:
                     if self.freeze_non_mask_parameters:
                         p.requires_grad = False
                     else:
                         optimizer_2_group.append(p)
+                        optimized_parameters.append(n)
                 else:
                     if self.freeze_non_mask_parameters:
                         p.requires_grad = False
                     else:
                         optimizer_1_group.append(p)
+                        optimized_parameters.append(n)
+                        
             optimizer_grouped_parameters = []
+            
             if not self.freeze_non_mask_parameters:
                 optimizer_grouped_parameters.append(
                     {
@@ -678,6 +669,7 @@ class Trainer(HFTrainer):
                         "lr": self.learning_rate,
                     }
                 )
+            
             if not self.freeze_mask_parameters:
                 optimizer_grouped_parameters.append(
                     {
@@ -701,7 +693,10 @@ class Trainer(HFTrainer):
                         "lr": self.mask_learning_rate,
                     }
                 )
-
+            
+            logger.info("optimizer_grouped_parameters -> optimized parameters")
+            logger.info(optimized_parameters)
+            
             optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(
                 self.args, opt_model
             )
@@ -785,6 +780,7 @@ class Trainer(HFTrainer):
             return self.train_dataloader
 
         return super().get_train_dataloader()
+
     def prediction_step(
         self,
         model: nn.Module,
