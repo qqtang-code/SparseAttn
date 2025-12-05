@@ -284,7 +284,7 @@ class Trainer(HFTrainer):
             "Math": {"start": 0, "end": 0.6},
             "MultiHop QA": {"start": 0, "end": 0.2},
             "Single QA": {"start": 0, "end": 0.2},
-            "Summarization": {"start": 0, "end": 0.7},
+            "Summarization": {"start": 0, "end": 0.5},
         }
         self.reverse_class_map = {0: 'Single QA', 1: 'MultiHop QA', 2: 'Summarization', 3: 'Code'}
 
@@ -485,43 +485,21 @@ class Trainer(HFTrainer):
         distributed_task_ids = self.accelerator.gather(task_ids)
         distributed_model_sparsity = self.accelerator.gather(model_sparsity)
         distributed_loss = self.accelerator.gather(loss).mean()
-        # TODO:
+        distributed_lm_loss = self.accelerator.gather(lm_loss).mean()
+        distributed_reg_loss = self.accelerator.gather(reg_loss).mean()
+        distributed_contrastive_loss = self.accelerator.gather(contrastive_loss).mean()
+        distributed_target_sparsity = self.accelerator.gather(target_sparsity)
             
         if self.log_loss and self.accelerator.is_main_process:
             model_sparsity = (
                 outputs["model_sparsity"] if isinstance(outputs, dict) else outputs[-3]
             )
             # Fetch diagnostics if present
-            exp_sparsity = (
-                outputs.get("expected_model_sparsity", None)
-                if isinstance(outputs, dict)
-                else None
-            )
             lambda1 = (
                 outputs.get("lambda1", None) if isinstance(outputs, dict) else None
             )
             lambda2 = (
                 outputs.get("lambda2", None) if isinstance(outputs, dict) else None
-            )
-            ez_mean = (
-                outputs.get("expected_z_mean", None)
-                if isinstance(outputs, dict)
-                else None
-            )
-            ez_std = (
-                outputs.get("expected_z_std", None)
-                if isinstance(outputs, dict)
-                else None
-            )
-            la_mean = (
-                outputs.get("log_alpha_mean", None)
-                if isinstance(outputs, dict)
-                else None
-            )
-            la_std = (
-                outputs.get("log_alpha_std", None)
-                if isinstance(outputs, dict)
-                else None
             )
 
             extra = []
@@ -531,9 +509,9 @@ class Trainer(HFTrainer):
                 )
 
             logger.info(
-                f"@ {self.state.global_step} | Loss: {distributed_loss} | LM Loss: {lm_loss} | "
-                f"Reg Loss: {reg_loss} | contrastive_loss: {contrastive_loss} | "
-                f"Target Sparsity: {target_sparsity} | Model Sparsity: {model_sparsity}"
+                f"@ {self.state.global_step} | Loss: {distributed_loss} | LM Loss: {distributed_lm_loss} | "
+                f"Reg Loss: {distributed_reg_loss} | contrastive_loss: {distributed_contrastive_loss} | "
+                f"Target Sparsity: {distributed_target_sparsity} | Model Sparsity: {distributed_model_sparsity}"
                 + (" | " + " | ".join(extra) if len(extra) else "")
             )
             
@@ -556,25 +534,25 @@ class Trainer(HFTrainer):
             ):
                 train_metrics = {
                     "lm_loss": float(
-                        lm_loss.detach().item()
-                        if isinstance(lm_loss, torch.Tensor)
-                        else lm_loss
+                        distributed_lm_loss.detach().item()
+                        if isinstance(distributed_lm_loss, torch.Tensor)
+                        else distributed_lm_loss
                     ),
                     "reg_loss": float(
-                        reg_loss.detach().item()
-                        if isinstance(reg_loss, torch.Tensor)
-                        else reg_loss
+                        distributed_reg_loss.detach().item()
+                        if isinstance(distributed_reg_loss, torch.Tensor)
+                        else distributed_reg_loss
                     ),
                     "loss": float(
-                        loss.detach().item() if isinstance(loss, torch.Tensor) else loss
+                        distributed_loss.detach().item() if isinstance(distributed_loss, torch.Tensor) else distributed_loss
                     ),
                     "contrastive_loss": float(
-                        contrastive_loss.detach().item()
-                        if isinstance(contrastive_loss, torch.Tensor)
-                        else contrastive_loss
+                        distributed_contrastive_loss.detach().item()
+                        if isinstance(distributed_contrastive_loss, torch.Tensor)
+                        else distributed_contrastive_loss
                     ),
-                    "target_sparsity": target_sparsity.detach().float().mean().item(),
-                    "model_sparsity": model_sparsity.detach().float().mean().item(),
+                    "target_sparsity": distributed_target_sparsity.detach().float().mean().item(),
+                    "model_sparsity": distributed_model_sparsity.detach().float().mean().item(),
                     "step": self.state.global_step,
                 }
                 train_metrics.update(new_task_sparsity_statistic)
