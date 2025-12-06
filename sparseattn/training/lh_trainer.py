@@ -573,24 +573,13 @@ class Trainer(HFTrainer):
                     "target_sparsity": distributed_target_sparsity.detach().float().mean().item(),
                     "model_sparsity": distributed_model_sparsity.detach().float().mean().item(),
                     "step": self.state.global_step,
+                    "lambda1 Single QA": lambda1[0].detach().item(),
+                    "lambda2 MultiHop QA": lambda1[1].detach().item(),
+                    "lambda3 Summarization": lambda1[2].detach().item(),
+                    "lambda4 Code": lambda1[3].detach().item(),
                 }
                 train_metrics.update(new_task_sparsity_statistic)
                 train_metrics.update(new_task_sparsity_loss_statistic)
-                
-                if isinstance(outputs, dict):
-                    for k in [
-                        "lambda1",
-                        "lambda2",
-                    ]:
-                        v = outputs.get(k, None)
-                        if v is not None:
-                            if isinstance(v, torch.Tensor):
-                                v = v.detach()
-                                if v.numel() == 1:
-                                    v = v.item()
-                                else:
-                                    v = float(v.mean().item())
-                            train_metrics[k] = v
                 
                 self.log(train_metrics)
 

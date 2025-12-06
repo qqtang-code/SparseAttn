@@ -1842,9 +1842,11 @@ class Qwen3Model(Qwen3PreTrainedModel):
         
         self.num_tasks = 4
 
-        # per-task λ1 and λ2
-        lambda1_init = torch.rand(self.num_tasks, dtype=self._dtype) * 0.5
-        lambda2_init = torch.rand(self.num_tasks, dtype=self._dtype) * 0.5
+        lambda1_init = torch.zeros(self.num_tasks, dtype=self._dtype)
+        lambda2_init = torch.zeros(self.num_tasks, dtype=self._dtype)
+
+        lambda1_init += torch.rand(self.num_tasks, dtype=self._dtype) * 0.5
+        lambda2_init += torch.rand(self.num_tasks, dtype=self._dtype) * 0.5
 
         self.sparsity_lambda1_task = nn.Parameter(lambda1_init)
         self.sparsity_lambda2_task = nn.Parameter(lambda2_init)
@@ -2138,7 +2140,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
         if self.training and (dist.get_rank() == 0) and (current_step % save_interval == 0):
             try:
-                save_dir = os.path.join("/data1/lcm_lab/qqt/SparseAttn/sparseattn/", "nolambda_abs")
+                save_dir = os.path.join("/data1/lcm_lab/qqt/SparseAttn/sparseattn/", "nolambda_abs*100")
                 os.makedirs(save_dir, exist_ok=True)
 
                 import time
@@ -2231,69 +2233,6 @@ class Qwen3Model(Qwen3PreTrainedModel):
             layerwise_model_sparsity = None
             layerwise_target = None
             layerwise_loss = None
-        
-        if (
-            target_sparsity is not None
-            and self.config.enable_layerwise_sparsity
-            and layerwise_model_sparsity is not None
-            and compute_sparsity
-        ):
-            L = layerwise_model_sparsity.numel()
-            device = layerwise_model_sparsity.device
-
-            # new
-            path = erank_analysis_path or getattr(
-                self.config, "erank_analysis_path", None
-            )
-            if not path.endswith(".pt"):
-                idxs = torch.arange(L, device=device, dtype=torch.float32)
-                denom = max(L - 1, 1)
-                x = torch.sin(torch.pi * (idxs / denom))
-                x = x.pow(float(self.config.layerwise_sparsity_power))
-
-                min_r = float(self.config.layerwise_sparsity_min_ratio)
-                max_r = float(self.config.layerwise_sparsity_max_ratio)
-                sched = getattr(
-                    self.config, "layerwise_sparsity_schedule", "low-high-low"
-                )
-                if sched == "high-low-high":
-                    ratios = max_r - (max_r - min_r) * x
-                else:
-                    ratios = min_r + (max_r - min_r) * x
-                
-                layerwise_target = torch.clamp(
-                    ratios * float(target_sparsity), min=0.0, max=1.0
-                )
-            else:
-                avg_erank = self._get_avg_erank(path)  # [L, H] on CPU
-                E = avg_erank.mean(dim=1).to(device)  # [L] 每层平均有效秩
-
-                assert E.numel() == L, (
-                    f"Mismatch: got {E.numel()} layers from erank but model has {L}"
-                )
-
-                E_norm = (E - E.min()) / (E.max() - E.min() + 1e-8)
-                inv_E = (1.0 / (E_norm + 1e-3)) ** 0.5
-                w = inv_E
-
-                L = layerwise_model_sparsity.numel()
-                layerwise_target = (w / w.sum()) * (target_sparsity * L)
-                layerwise_target = torch.clamp(layerwise_target, 0.0, 1.0)
-                s = layerwise_target.sum()
-                if s > 0:
-                    layerwise_target = layerwise_target / s * (target_sparsity * L)
-
-            diffs = layerwise_model_sparsity - layerwise_target
-
-            per_layer_loss = self.sparsity_lambda_1.reshape(
-                []
-            ) * diffs + self.sparsity_lambda_2.reshape([]) * (diffs**2)
-            layerwise_loss = (
-                float(self.config.layerwise_sparsity_weight) * per_layer_loss.mean()
-            )
-
-            # z_loss = layerwise_loss if z_loss is None else (z_loss + layerwise_loss)
-            z_loss = layerwise_loss
         
         if z_loss is not None:
             z_loss = z_loss.mean()
