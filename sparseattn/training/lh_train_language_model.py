@@ -200,28 +200,6 @@ def main():
                 torch_dtype=torch.bfloat16,
                 compute_contrastive_loss=training_args.enable_contrastive_loss,
             )
-            # config = model.config
-            # config._attn_implementation = "flash_attention_2"
-            # config.compress_type = "linear"#"avgpool","weightedpool"
-            # config.kernel_size = 32
-            # config.kernel_stride = 16
-            # config.block_size = 64
-            # config.topk = 8
-            # config.init_blocks = 1
-            # config.local_blocks = 2
-            # config.window_size = 500
-            # for i, layer in enumerate(model.model.layers):
-            #     original_attn = layer.self_attn
-
-            #     original_dtype = next(original_attn.parameters()).dtype
-            #     device = next(original_attn.parameters()).device
-
-            #     new_attn = LlamaNSA(config, layer_idx=original_attn.layer_idx)
-            #     new_attn.load_state_dict(original_attn.state_dict(), strict=False)
-            #     new_attn = new_attn.to(device).to(original_dtype)
-
-            #     layer.self_attn = new_attn
-
         elif "qwen" in script_args.model_name_or_path.lower():
             model = PawQwen3ForCausalLM.from_pretrained(
                 script_args.model_name_or_path,
@@ -324,9 +302,6 @@ def main():
     
     # load_datasets
     if training_args.do_train:
-        # train_dataset = build_dataset(
-        #     script_args.tokenized_mds_train, training_args, data_args, is_training=True
-        # )
         train_dataset = build_dataset(
             script_args.tokenized_mds_train,
             tokenizer=tokenizer,
@@ -362,6 +337,7 @@ def main():
                 dataset=train_dataset,
                 shuffle=True,
             )
+            
         train_dataloader = torch.utils.data.DataLoader(
             dataset=train_dataset,
             batch_size=training_args.per_device_train_batch_size,
