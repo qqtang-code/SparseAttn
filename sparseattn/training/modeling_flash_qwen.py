@@ -1839,6 +1839,15 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 torch.tensor([0.0], dtype=self._dtype)
             )
         self.sparsity_lambda_2 = nn.Parameter(torch.tensor([0.0], dtype=self._dtype))
+        
+        self.num_tasks = 4
+
+        # per-task λ1 and λ2
+        lambda1_init = torch.rand(self.num_tasks, dtype=self._dtype) * 0.5
+        lambda2_init = torch.rand(self.num_tasks, dtype=self._dtype) * 0.5
+
+        self.sparsity_lambda1_task = nn.Parameter(lambda1_init)
+        self.sparsity_lambda2_task = nn.Parameter(lambda2_init)
 
         self.threshold_for_deterministic = None
         if config.suggested_sparsity is not None:
@@ -2301,8 +2310,8 @@ class Qwen3Model(Qwen3PreTrainedModel):
                     model_sparsity,
                     target_sparsity,
                     z_loss,
-                    self.sparsity_lambda_1.reshape([]),
-                    self.sparsity_lambda_2.reshape([]),
+                    self.sparsity_lambda1_task,
+                    self.sparsity_lambda2_task,
                 ]
                 if v is not None
             )
@@ -2314,8 +2323,8 @@ class Qwen3Model(Qwen3PreTrainedModel):
             model_sparsity=model_sparsity,
             target_sparsity=target_sparsity,
             sparsity_loss=z_loss,
-            lambda1=self.sparsity_lambda_1.reshape([]),
-            lambda2=self.sparsity_lambda_2.reshape([]),
+            lambda1=self.sparsity_lambda1_task,
+            lambda2=self.sparsity_lambda2_task,
             layerwise_model_sparsity=layerwise_model_sparsity,
             layerwise_target_sparsity=layerwise_target,
             contrastive_loss=contrastive_loss,
