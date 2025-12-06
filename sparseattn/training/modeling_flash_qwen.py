@@ -1838,6 +1838,15 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 torch.tensor([0.0], dtype=self._dtype)
             )
         self.sparsity_lambda_2 = nn.Parameter(torch.tensor([0.0], dtype=self._dtype))
+        
+        self.num_tasks = 4
+
+        # per-task λ1 and λ2
+        lambda1_init = torch.rand(self.num_tasks, dtype=self._dtype) * 0.5
+        lambda2_init = torch.rand(self.num_tasks, dtype=self._dtype) * 0.5
+
+        self.sparsity_lambda1_task = nn.Parameter(lambda1_init)
+        self.sparsity_lambda2_task = nn.Parameter(lambda2_init)
 
         self.threshold_for_deterministic = None
         if config.suggested_sparsity is not None:
@@ -2208,78 +2217,34 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 #     * ((model_sparsity - target_sparsity) ** 2).mean()
                 # )
                 
-                z_loss = (
-                    (model_sparsity * 100 - target_sparsity * 100).abs().mean()
-                    + ((model_sparsity * 100 - target_sparsity * 100) ** 2).mean()
+                # z_loss = (
+                #     (model_sparsity * 100 - target_sparsity * 100).abs().mean()
+                #     + ((model_sparsity * 100 - target_sparsity * 100) ** 2).mean()
+                # )
+                
+                diff = (model_sparsity * 100 - target_sparsity * 100)
+
+                lambda1_per_sample = self.sparsity_lambda1_task[task_ids]   # [B]
+                # lambda2_per_sample = self.sparsity_lambda2_task[task_ids]   # [B]
+
+                # per-sample loss
+                per_sample_loss = (
+                    lambda1_per_sample * diff
+                    # + lambda2_per_sample * diff.pow(2)
                 )
+
+                task_losses = []
+                for task_id in range(self.num_tasks):
+                    mask = (task_ids == task_id)
+                    if mask.sum() > 0:
+                        task_losses.append(per_sample_loss[mask].mean())
+
+                z_loss = torch.stack(task_losses).mean()
                 
         else:
             layerwise_model_sparsity = None
             layerwise_target = None
             layerwise_loss = None
-        
-        if (
-            target_sparsity is not None
-            and self.config.enable_layerwise_sparsity
-            and layerwise_model_sparsity is not None
-            and compute_sparsity
-        ):
-            L = layerwise_model_sparsity.numel()
-            device = layerwise_model_sparsity.device
-
-            # new
-            path = erank_analysis_path or getattr(
-                self.config, "erank_analysis_path", None
-            )
-            if not path.endswith(".pt"):
-                idxs = torch.arange(L, device=device, dtype=torch.float32)
-                denom = max(L - 1, 1)
-                x = torch.sin(torch.pi * (idxs / denom))
-                x = x.pow(float(self.config.layerwise_sparsity_power))
-
-                min_r = float(self.config.layerwise_sparsity_min_ratio)
-                max_r = float(self.config.layerwise_sparsity_max_ratio)
-                sched = getattr(
-                    self.config, "layerwise_sparsity_schedule", "low-high-low"
-                )
-                if sched == "high-low-high":
-                    ratios = max_r - (max_r - min_r) * x
-                else:
-                    ratios = min_r + (max_r - min_r) * x
-                
-                layerwise_target = torch.clamp(
-                    ratios * float(target_sparsity), min=0.0, max=1.0
-                )
-            else:
-                avg_erank = self._get_avg_erank(path)  # [L, H] on CPU
-                E = avg_erank.mean(dim=1).to(device)  # [L] 每层平均有效秩
-
-                assert E.numel() == L, (
-                    f"Mismatch: got {E.numel()} layers from erank but model has {L}"
-                )
-
-                E_norm = (E - E.min()) / (E.max() - E.min() + 1e-8)
-                inv_E = (1.0 / (E_norm + 1e-3)) ** 0.5
-                w = inv_E
-
-                L = layerwise_model_sparsity.numel()
-                layerwise_target = (w / w.sum()) * (target_sparsity * L)
-                layerwise_target = torch.clamp(layerwise_target, 0.0, 1.0)
-                s = layerwise_target.sum()
-                if s > 0:
-                    layerwise_target = layerwise_target / s * (target_sparsity * L)
-
-            diffs = layerwise_model_sparsity - layerwise_target
-
-            per_layer_loss = self.sparsity_lambda_1.reshape(
-                []
-            ) * diffs + self.sparsity_lambda_2.reshape([]) * (diffs**2)
-            layerwise_loss = (
-                float(self.config.layerwise_sparsity_weight) * per_layer_loss.mean()
-            )
-
-            # z_loss = layerwise_loss if z_loss is None else (z_loss + layerwise_loss)
-            z_loss = layerwise_loss
         
         if z_loss is not None:
             z_loss = z_loss.mean()
@@ -2296,8 +2261,8 @@ class Qwen3Model(Qwen3PreTrainedModel):
                     model_sparsity,
                     target_sparsity,
                     z_loss,
-                    self.sparsity_lambda_1.reshape([]),
-                    self.sparsity_lambda_2.reshape([]),
+                    self.sparsity_lambda1_task,
+                    self.sparsity_lambda2_task,
                 ]
                 if v is not None
             )
@@ -2309,8 +2274,8 @@ class Qwen3Model(Qwen3PreTrainedModel):
             model_sparsity=model_sparsity,
             target_sparsity=target_sparsity,
             sparsity_loss=z_loss,
-            lambda1=self.sparsity_lambda_1.reshape([]),
-            lambda2=self.sparsity_lambda_2.reshape([]),
+            lambda1=self.sparsity_lambda1_task,
+            lambda2=self.sparsity_lambda2_task,
             layerwise_model_sparsity=layerwise_model_sparsity,
             layerwise_target_sparsity=layerwise_target,
             contrastive_loss=contrastive_loss,
