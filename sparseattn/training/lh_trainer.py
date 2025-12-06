@@ -508,7 +508,7 @@ class Trainer(HFTrainer):
             extra = []
             if lambda1 is not None and lambda2 is not None:
                 extra.append(
-                    f"Lambda1: {lambda1.item():.4f} Lambda2: {lambda2.item():.4f}"
+                    f"Lambda1: {lambda1[0]} Lambda2: {lambda1[1]} Lambda3: {lambda1[2]} Lambda4: {lambda1[3]}"
                 )
 
             logger.info(
