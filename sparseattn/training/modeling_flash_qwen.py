@@ -1890,12 +1890,27 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 z_loss = None
             else:
                 
-                # z_loss = (
-                #     self.sparsity_lambda_1.reshape([])
-                #     * (model_sparsity - target_sparsity).mean()
-                #     + self.sparsity_lambda_2.reshape([]) 
-                #     * ((model_sparsity - target_sparsity) ** 2).mean()
+                # diff = (model_sparsity * 100 - target_sparsity * 100)
+
+                # # per-sample lambda
+                # lambda1_per_sample = self.sparsity_lambda1_task[task_ids]   # [B]
+                # # lambda2_per_sample = self.sparsity_lambda2_task[task_ids]   # [B]
+
+                # # per-sample loss
+                # per_sample_loss = (
+                #     lambda1_per_sample * diff
+                #     # + lambda2_per_sample * diff.pow(2)
                 # )
+
+                # log_z_loss = per_sample_loss.detach()
+
+                # task_losses = []
+                # for task_id in range(self.num_tasks):
+                #     mask = (task_ids == task_id)
+                #     if mask.sum() > 0:
+                #         task_losses.append(per_sample_loss[mask].mean())
+
+                # z_loss = torch.stack(task_losses).mean()
                 
                 z_loss = (
                     (model_sparsity * 100 - target_sparsity * 100).abs()
