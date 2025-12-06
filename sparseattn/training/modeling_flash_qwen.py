@@ -1793,6 +1793,7 @@ class BaseModelOutputWithPastAndSparsity(ModelOutput):
     layerwise_sparsity_loss: Optional[torch.FloatTensor] = None  # scalar
     # contrastive_loss
     contrastive_loss: Optional[torch.FloatTensor] = None
+    log_z_loss: Optional[torch.FloatTensor] = None
     
 
 class Qwen3Model(Qwen3PreTrainedModel):
@@ -2209,9 +2210,13 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 # )
                 
                 z_loss = (
-                    (model_sparsity * 100 - target_sparsity * 100).abs().mean()
-                    + ((model_sparsity * 100 - target_sparsity * 100) ** 2).mean()
+                    (model_sparsity * 100 - target_sparsity * 100).abs()
+                    # + ((model_sparsity - target_sparsity) ** 2)
                 )
+                
+                log_z_loss = z_loss.detach()
+                
+                z_loss = z_loss.mean() 
                 
         else:
             layerwise_model_sparsity = None
@@ -2314,6 +2319,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
             layerwise_model_sparsity=layerwise_model_sparsity,
             layerwise_target_sparsity=layerwise_target,
             contrastive_loss=contrastive_loss,
+            log_z_loss=log_z_loss,
         )
 
 
@@ -2343,6 +2349,7 @@ class CausalLMOutputWithPastAndSparsity(ModelOutput):
     contrastive_loss: Optional[torch.FloatTensor] = None  # scalar
     # task_ids
     task_ids: Optional[torch.FloatTensor] = None
+    log_z_loss: Optional[torch.FloatTensor] = None
 
 class KwargsForCausalLM(FlashAttentionKwargs, LossKwargs): ...
 
@@ -2627,6 +2634,7 @@ class PawQwen3ForCausalLM(Qwen3PreTrainedModel):
             layerwise_target_sparsity=outputs.layerwise_target_sparsity,
             contrastive_loss=outputs.contrastive_loss,
             task_ids=task_ids,
+            log_z_loss=outputs.log_z_loss,
         )
 
     def prepare_inputs_for_generation(
