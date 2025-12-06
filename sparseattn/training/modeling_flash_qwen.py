@@ -2128,7 +2128,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
         if self.training and (dist.get_rank() == 0) and (current_step % save_interval == 0):
             try:
-                save_dir = os.path.join("/data1/lcm_lab/qqt/SparseAttn/sparseattn/", "batch_dump_new")
+                save_dir = os.path.join("/data1/lcm_lab/qqt/SparseAttn/sparseattn/", "nolambda_abs")
                 os.makedirs(save_dir, exist_ok=True)
 
                 import time
@@ -2201,11 +2201,16 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 z_loss = None
             else:
                 
+                # z_loss = (
+                #     self.sparsity_lambda_1.reshape([])
+                #     * (model_sparsity - target_sparsity).mean()
+                #     + self.sparsity_lambda_2.reshape([]) 
+                #     * ((model_sparsity - target_sparsity) ** 2).mean()
+                # )
+                
                 z_loss = (
-                    self.sparsity_lambda_1.reshape([])
-                    * (model_sparsity - target_sparsity).mean()
-                    + self.sparsity_lambda_2.reshape([]) 
-                    * ((model_sparsity - target_sparsity) ** 2).mean()
+                    (model_sparsity * 100 - target_sparsity * 100).abs().mean()
+                    + ((model_sparsity * 100 - target_sparsity * 100) ** 2).mean()
                 )
                 
         else:
