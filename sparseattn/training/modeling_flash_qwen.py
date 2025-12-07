@@ -651,7 +651,14 @@ class AttentionRouter(nn.Module):
             nn.Linear(2 * d_feature, d_feature),
         )
         
-        self.cls_router_head_agnostic = nn.Linear(d_feature, 1)
+        self.cls_router_head_agnostic = nn.Sequential( 
+            nn.Linear(d_feature, 2 * d_feature),
+            nn.SiLU(),
+            nn.Dropout(0.3),
+            nn.Linear(2 * d_feature, d_feature),
+            nn.SiLU(),
+            nn.Linear(d_feature, 1)
+        )
         
         if self.use_task_emb:
             self.task_embedding = nn.Embedding(4, d_feature)
@@ -1237,14 +1244,22 @@ class Qwen3Attention(nn.Module):
             if unpadded_lengths is not None:
                 res = self.mask_allocator(q, unpadded_lengths[0], range_ids, task_ids)
                 z_kv_batch, pooled_hidden_states = res['sparse_mask'], res['pooled_hidden_states']
+                z_constrast = res['decisions']
             else:
                 res = self.mask_allocator(q, None, range_ids, task_ids)
                 z_kv_batch, pooled_hidden_states = res['sparse_mask'], res['pooled_hidden_states']
+                z_constrast = res['decisions']
             if z_kv_batch.shape[-1] == self.num_key_value_heads:
                 z_kv_batch = (
                     z_kv_batch.unsqueeze(-1)              # [B, num_kv, 1]
                     .expand(-1, -1, self.num_key_value_groups)  # [B, num_kv, num_groups]
                     .reshape(z_kv_batch.size(0), -1)      # [B, num_kv * num_groups]
+                )
+                
+                z_constrast = (
+                    z_constrast.unsqueeze(-1)              # [B, num_kv, 1]
+                    .expand(-1, -1, self.num_key_value_groups)  # [B, num_kv, num_groups]
+                    .reshape(z_constrast.size(0), -1)      # [B, num_kv * num_groups]
                 )
 
             z = z_kv_batch
@@ -1314,10 +1329,10 @@ class Qwen3Attention(nn.Module):
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output.to(self.o_proj.weight.dtype))
 
-        attn_weights = None
-        
+        attn_weights = None        
+        # print(f"task id: {task_ids}, layer sparsity: {z.squeeze(-1).sum(dim=-1)}")
         # z: [B, H, 1] -> [B, H] -> [B]
-        return z.squeeze(-1).sum(dim=-1), pooled_hidden_states, attn_output, attn_weights, past_key_value
+        return z.squeeze(-1).sum(dim=-1), pooled_hidden_states, z_constrast.squeeze(-1), attn_output, attn_weights, past_key_value
 
 
 class Qwen3DecoderLayer(nn.Module):
@@ -1389,7 +1404,7 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        z_sum, pooled_hidden_states, hidden_states, self_attn_weights, present_key_value = self.self_attn(
+        z_sum, pooled_hidden_states, z_constrast, hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -1410,7 +1425,7 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
-        outputs = (z_sum, pooled_hidden_states, hidden_states,)
+        outputs = (z_sum, pooled_hidden_states, z_constrast, hidden_states,)
 
         if output_attentions:
             outputs += (self_attn_weights,)
@@ -1470,6 +1485,7 @@ class BaseModelOutputWithPastAndSparsity(ModelOutput):
     layerwise_sparsity_loss: Optional[torch.FloatTensor] = None  # scalar
     # contrastive_loss
     contrastive_loss: Optional[torch.FloatTensor] = None
+    head_contrastive_loss: Optional[torch.FloatTensor] = None
     log_z_loss: Optional[torch.FloatTensor] = None
     
 
@@ -1713,6 +1729,8 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
         layer_z_sums = []  # 收集每层 z_sum 以计算逐层稀疏度
         # all_pooled_hidden_states = []
+        
+        layer_z_constrast = []
 
         for idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
@@ -1754,22 +1772,56 @@ class Qwen3Model(Qwen3PreTrainedModel):
                     task_ids=task_ids,
                 )
 
-            z_layer_sum, pooled_hidden_states, hidden_states = layer_outputs[0], layer_outputs[1], layer_outputs[2]
+            z_layer_sum, pooled_hidden_states, z_constrast, hidden_states = layer_outputs[0], layer_outputs[1], layer_outputs[2], layer_outputs[3]
 
             if compute_sparsity:
                 z_sum += z_layer_sum
             layer_z_sums.append(z_layer_sum)
+            layer_z_constrast.append(z_constrast)
 
             if use_cache:
-                next_decoder_cache += (layer_outputs[3 if output_attentions else 2],)
+                next_decoder_cache += (layer_outputs[5 if output_attentions else 4],)
 
             if output_attentions:
-                all_self_attns += (layer_outputs[2],)
+                all_self_attns += (layer_outputs[4],)
 
         if enable_contrastive_loss:
+            def jsd(p, q, eps=1e-8):
+                """
+                p, q: [H]   soft mask for a task (mean across batch)
+                return scalar JSD
+                """
+                p = torch.clamp(p, eps, 1.0)
+                q = torch.clamp(q, eps, 1.0)
+                m = 0.5 * (p + q)
+                m = torch.clamp(m, eps, 1.0)
+                kl_pm = torch.sum(p * torch.log(p / m))
+                kl_qm = torch.sum(q * torch.log(q / m))
+                return 0.5 * (kl_pm + kl_qm)
+            head_contrastive_loss = torch.tensor(0.0, device=hidden_states.device)
+
             # all gather all pooled_hidden_states across all GPUs
             pooled_hidden_states = pooled_hidden_states.mean(dim=1) # [B, D]
             world_size = dist.get_world_size()
+            rank = dist.get_rank()
+            device = hidden_states.device
+            
+            # head contrastive loss
+            local_masks = torch.stack(layer_z_constrast, dim=0)
+            L, B, H = local_masks.shape
+            gather_list = [
+                torch.zeros_like(local_masks, device=device)
+                for _ in range(world_size)
+            ]
+            
+            # detached gather —— 但保留本 rank 的梯度
+            dist.all_gather(gather_list, local_masks.detach())
+            gather_list[rank] = local_masks
+            
+            global_masks = torch.cat(gather_list, dim=1)
+
+            # =============================================================================================================
+            
             
             global_pooled_hidden_states = [torch.zeros_like(pooled_hidden_states, device=hidden_states.device) for _ in range(world_size)]
             global_task_ids = [torch.zeros_like(task_ids, device=hidden_states.device) for _ in range(world_size)]
@@ -1808,9 +1860,56 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 contrastive_loss = F.cross_entropy(logits, mapped_labels)
             else:
                 contrastive_loss = torch.tensor(0.0, device=hidden_states.device)
+                
+            # head contrastive loss
+            task_profiles = {}  # t -> [H]
+
+            for t in unique_tasks:
+                idx = (global_task == t).nonzero(as_tuple=True)[0]  # indices
+                if idx.numel() == 0:
+                    continue
+
+                # [L, K, H]
+                m = global_masks[:, idx, :]  
+
+                # [L, H]
+                m = m.mean(dim=1)
+
+                # [H]
+                # m = m.mean(dim=0)
+                
+                task_profiles[int(t.item())] = m
+            
+            if len(task_profiles) < 2:
+                head_contrastive_loss = torch.tensor(0.0, device=device)
+            else:
+                tkeys = list(task_profiles.keys())
+                jsd_total = 0.0
+                count = 0
+
+                for i in range(len(tkeys)):
+                    for j in range(i + 1, len(tkeys)):
+                        mi = task_profiles[tkeys[i]]    # [L, H]
+                        mj = task_profiles[tkeys[j]]    # [L, H]
+
+                        # per-layer JSD: sum over layers
+                        L = mi.size(0)
+                        jsd_layers = 0.0
+
+                        for layer_idx in range(L):
+                            jsd_layers += jsd(mi[layer_idx], mj[layer_idx])
+
+                        jsd_total += jsd_layers
+                        count += 1
+
+
+                head_contrastive_loss = - (jsd_total / float(count))
         else:
             contrastive_loss = torch.tensor(0.0, device=hidden_states.device)
-    
+            head_contrastive_loss = torch.tensor(0.0, device=hidden_states.device)
+
+        
+        
         save_interval = 1
 
         current_step = getattr(self.config, "global_step", 0) 
@@ -1959,6 +2058,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
             layerwise_model_sparsity=layerwise_model_sparsity,
             layerwise_target_sparsity=layerwise_target,
             contrastive_loss=contrastive_loss,
+            head_contrastive_loss=head_contrastive_loss,
             log_z_loss=log_z_loss,
         )
 
@@ -1987,6 +2087,7 @@ class CausalLMOutputWithPastAndSparsity(ModelOutput):
     layerwise_sparsity_loss: Optional[torch.FloatTensor] = None  # scalar
     # contrastive_loss
     contrastive_loss: Optional[torch.FloatTensor] = None  # scalar
+    head_contrastive_loss: Optional[torch.FloatTensor] = None
     # task_ids
     task_ids: Optional[torch.FloatTensor] = None
     log_z_loss: Optional[torch.FloatTensor] = None
@@ -2273,6 +2374,7 @@ class PawQwen3ForCausalLM(Qwen3PreTrainedModel):
             layerwise_model_sparsity=outputs.layerwise_model_sparsity,
             layerwise_target_sparsity=outputs.layerwise_target_sparsity,
             contrastive_loss=outputs.contrastive_loss,
+            head_contrastive_loss=outputs.head_contrastive_loss,
             task_ids=task_ids,
             log_z_loss=outputs.log_z_loss,
         )

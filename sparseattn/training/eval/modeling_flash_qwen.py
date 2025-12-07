@@ -624,11 +624,31 @@ class AttentionRouter(nn.Module):
         self.pooling_mode = pooling_mode
         
         # binary cls
-        self.cls_net = nn.Sequential( 
-            nn.Linear(d_feature, d_feature),
+        # self.cls_net = nn.Sequential( 
+        #     nn.Linear(d_feature, 2 * d_feature),
+        #     nn.SiLU(),
+        #     nn.Linear(2 * d_feature, d_feature),
+        #     nn.SiLU(),
+        #     nn.Linear(d_feature, 1)
+        # )
+        
+        self.cls_feat_extractor = nn.Sequential( 
+            nn.Linear(d_feature, 2 * d_feature),
+            nn.SiLU(),
+            nn.Linear(2 * d_feature, d_feature),
+        )
+        
+        self.cls_router_head_agnostic = nn.Sequential( 
+            nn.Linear(d_feature, 2 * d_feature),
+            nn.SiLU(),
+            nn.Dropout(0.3),
+            nn.Linear(2 * d_feature, d_feature),
             nn.SiLU(),
             nn.Linear(d_feature, 1)
         )
+        
+        if self.use_task_emb:
+            self.task_embedding = nn.Embedding(4, d_feature)
 
         # ---- learnable temperature ----
         if learnable_temp:
@@ -641,7 +661,7 @@ class AttentionRouter(nn.Module):
         self, 
         x, 
         cu_seq_len=None,
-        range_ids: torch.Tensor = None                        , 
+        range_ids: torch.Tensor = None, 
         task_ids: Optional[torch.Tensor] = None
     ):
         """
@@ -662,11 +682,26 @@ class AttentionRouter(nn.Module):
         
         # 目前所有支持的pooling 方法
         if self.pooling_mode == 'first_token':
-            pooled_latent = self._segment_pooling(x, range_ids, ['first_token'])  # [B, H, D]
+            if cu_seq_len is not None:
+                pooled_latent = self._segment_pooling(
+                    x, range_ids, ['first_token'], cu_seq_len)  # [B, H, D]
+            else:
+                pooled_latent = self._segment_pooling_single_batch(
+                    x, range_ids, ['first_token'])
         else:
             raise ValueError(f"Unknown pooling_mode: {self.pooling_mode}")
         
-        binary_logits = self.cls_net(pooled_latent)  # [B, H, 2]
+        
+        if self.use_task_emb:
+            if self.training:
+                task_emb = self.task_embedding(task_ids) # [B, D]
+                task_emb_expanded = task_emb.unsqueeze(1) 
+                pooled_latent = pooled_latent + task_emb_expanded
+            else:
+                pooled_latent = pooled_latent
+                
+        pooled_hidden_states = self.cls_feat_extractor(pooled_latent)
+        binary_logits = self.cls_router_head_agnostic(pooled_hidden_states)  # [B, H, 2]
         
         if self.learnable_temp:
             tau = torch.exp(self.log_temp).clamp(0.3, 1.0)
@@ -700,22 +735,14 @@ class AttentionRouter(nn.Module):
             z_hard = (z_soft > 0.5).float()
             z = z_hard
 
-        # --- 4. 输出准备 ---
-        # sparse_mask: 用于计算的掩码，必须是 STE 后的 z (前向0/1，反向有梯度)
-        sparse_mask = z 
-
-        # decisions_out: 这里的 soft 值通常用于记录统计，但梯度的核心在 sparse_mask
-        decisions_out = z_soft 
         return {
-            'pooled_hidden_states': pooled_latent, # [B, H, D]
-            'decisions': decisions_out,
+            'pooled_hidden_states': pooled_hidden_states, # [B, H, D]
+            'decisions': z_soft,
             'hard_decisions': z_hard,
-            'sparse_mask': sparse_mask, # [B, H], 这是一个 STE Tensor
+            'sparse_mask': z, # [B, H], 这是一个 STE Tensor
             'logits': binary_logits,
         }
-        
-        
-    def _segment_pooling(self, pooled_input: torch.Tensor, range_ids: torch.Tensor, segments: list) -> torch.Tensor:
+    def _segment_pooling_single_batch(self, pooled_input: torch.Tensor, range_ids: torch.Tensor, segments: list) -> torch.Tensor:
         B, S, H, D = pooled_input.shape
         pooled_features_list = []
         
@@ -738,6 +765,55 @@ class AttentionRouter(nn.Module):
                 combined_feature = torch.stack(sample_features, dim=0).mean(dim=0) # [H, D]
             else:
                 combined_feature = torch.zeros(H, D, device=pooled_input.device)
+                
+            pooled_features_list.append(combined_feature)
+
+        return torch.stack(pooled_features_list, dim=0) # [B, H, D]
+        
+        
+    def _segment_pooling(
+        self, 
+        x: torch.Tensor, 
+        range_ids: torch.Tensor, 
+        segments: list[str],
+        cu_seq_len: torch.Tensor,
+    ) -> torch.Tensor:
+        """_summary_
+
+        Args:
+            x (torch.Tensor): [cu_seqlen, H, D]
+            range_ids (torch.Tensor): _description_
+            segments (list[str]): _description_
+            cu_seq_len (torch.Tensor): _description_
+
+        Returns:
+            torch.Tensor: _description_
+        """
+        POOL_MAP = {'first_token': (0, 1),'ctx': (2, 3), 'q': (4, 5), 'a': (6, 7)} 
+        
+        B = cu_seq_len.shape[0] - 1
+        H, D = x.shape[1:]
+        pooled_features_list = []
+        
+        for i in range(B):
+            sample_features = []
+            x_s, x_e = cu_seq_len[i], cu_seq_len[i + 1]
+            for seg in segments:
+                start_idx, end_idx = POOL_MAP[seg]
+                start, end = range_ids[i, start_idx:end_idx + 1].tolist()
+
+                if end >= start:
+                    seg_slice = x[x_s + start: x_s + end + 1,  : , :]
+                    seg_pooled = seg_slice.mean(dim=0)  # [H, D]
+                else:
+                    seg_pooled = torch.zeros(H, D, device=x.device)
+                
+                sample_features.append(seg_pooled)
+
+            if sample_features:
+                combined_feature = torch.stack(sample_features, dim=0).mean(dim=0) # [H, D]
+            else:
+                combined_feature = torch.zeros(H, D, device=x.device)
                 
             pooled_features_list.append(combined_feature)
 
@@ -917,217 +993,6 @@ class Qwen3Attention(nn.Module):
             .contiguous()
         )
 
-    def _topk_attn_nonvarlen(
-        self, q: torch.Tensor, kv: torch.Tensor, k_top: int
-    ) -> torch.Tensor:
-        """
-        q: [B, S, H, D]
-        kv: [B, S, 2, H, D]
-        return: [B, S, H, D]
-        """
-        B, S, H, D = q.shape
-        k = kv[:, :, 0, :, :]  # [B, S, H, D]
-        v = kv[:, :, 1, :, :]  # [B, S, H, D]
-
-        # [B, H, S, D]
-        q_bhsd = q.permute(0, 2, 1, 3).contiguous()
-        k_bhsd = k.permute(0, 2, 1, 3).contiguous()
-        v_bhsd = v.permute(0, 2, 1, 3).contiguous()
-
-        out_bhsd = torch.zeros(B, H, S, D, dtype=q.dtype, device=q.device)
-
-        K_keep = min(int(k_top), S)
-        q_chunk = max(int(getattr(self, "topk_q_chunk", 4096)), 1)
-        k_chunk = max(int(getattr(self, "topk_k_chunk", 4096)), 1)
-
-        scale = (1.0 / self.norm_factor).to(dtype=q.dtype)
-
-        # 新增：预先构建 batch/head 索引用于高级索引
-        b_idx = torch.arange(B, device=q.device).view(B, 1, 1, 1)
-        h_idx = torch.arange(H, device=q.device).view(1, H, 1, 1)
-
-        for qs in range(0, S, q_chunk):
-            qe = min(qs + q_chunk, S)
-            QB = qe - qs
-
-            q_blk = q_bhsd[:, :, qs:qe, :]  # [B, H, QB, D]
-            # 运行中的 top-k（值与全局索引）
-            run_vals = torch.full(
-                (B, H, QB, K_keep), float("-inf"), dtype=q.dtype, device=q.device
-            )
-            run_idx = torch.zeros((B, H, QB, K_keep), dtype=torch.long, device=q.device)
-
-            # 预先准备 query 的绝对位置
-            q_pos = torch.arange(qs, qe, device=q.device)  # [QB]
-
-            for ks in range(0, S, k_chunk):
-                ke = min(ks + k_chunk, S)
-                KB = ke - ks
-
-                k_blk = k_bhsd[:, :, ks:ke, :]  # [B, H, KB, D]
-
-                # 分块分数 [B, H, QB, KB]
-                scores_blk = torch.matmul(q_blk, k_blk.transpose(-1, -2)) * scale
-
-                # 因果掩码：仅允许 key_pos <= q_pos
-                k_pos = torch.arange(ks, ke, device=q.device)  # [KB]
-                causal_mask = k_pos.unsqueeze(0) > q_pos.unsqueeze(1)  # [QB, KB]
-                scores_blk = scores_blk.masked_fill(
-                    causal_mask.view(1, 1, QB, KB), float("-inf")
-                )
-
-                # 在当前 key 分块内取局部 top-k，然后与运行中的 top-k 合并
-                k_this = min(K_keep, KB)
-                blk_topv, blk_topi_local = torch.topk(
-                    scores_blk, k=k_this, dim=-1, largest=True, sorted=False
-                )
-                blk_topi = blk_topi_local + ks  # 转全局 key 索引
-
-                # 合并（拼接后再取 top-k）
-                cat_vals = torch.cat(
-                    [run_vals, blk_topv], dim=-1
-                )  # [B, H, QB, K_keep + k_this]
-                cat_idx = torch.cat(
-                    [run_idx, blk_topi], dim=-1
-                )  # [B, H, QB, K_keep + k_this]
-                run_vals, pick = torch.topk(
-                    cat_vals, k=K_keep, dim=-1, largest=True, sorted=False
-                )
-                run_idx = cat_idx.gather(-1, pick)
-
-                del (
-                    scores_blk,
-                    blk_topv,
-                    blk_topi_local,
-                    blk_topi,
-                    cat_vals,
-                    cat_idx,
-                    pick,
-                )
-
-            # 计算注意力并聚合 V
-            attn_probs = torch.softmax(run_vals, dim=-1)  # [B, H, QB, K_keep]
-            v_topk = v_bhsd[b_idx, h_idx, run_idx, :]  # [B, H, QB, K_keep, D]
-            out_blk = (attn_probs.unsqueeze(-1) * v_topk).sum(dim=-2)  # [B, H, QB, D]
-            out_bhsd[:, :, qs:qe, :] = out_blk
-
-            del run_vals, run_idx, q_blk, out_blk, attn_probs, v_topk
-
-        out = out_bhsd.permute(0, 2, 1, 3).contiguous()  # [B, S, H, D]
-        return out
-
-    def _topk_attn_varlen(
-        self,
-        q: torch.Tensor,
-        kv: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        k_top: int,
-    ) -> torch.Tensor:
-        """
-        q: [T, H, D]
-        kv: [T, 2, H, D]
-        cu_seqlens: [B+1]
-        return: [T, H, D]
-        """
-        T, H, D = q.shape
-        out = torch.zeros_like(q)
-        k_all = kv[:, 0, :, :]  # [T, H, D]
-        v_all = kv[:, 1, :, :]  # [T, H, D]
-
-        q_chunk = max(int(getattr(self, "topk_q_chunk", 128)), 1)
-        k_chunk = max(int(getattr(self, "topk_k_chunk", 4096)), 1)
-        scale = (1.0 / self.norm_factor).to(dtype=q.dtype)
-
-        h_idx_full = torch.arange(H, device=q.device).view(H, 1, 1)
-
-        B = cu_seqlens.numel() - 1
-        for b in range(B):
-            s = int(cu_seqlens[b].item())
-            e = int(cu_seqlens[b + 1].item())
-            L = e - s
-            if L <= 0:
-                continue
-            q_b = q[s:e, :, :]  # [L, H, D]
-            k_b = k_all[s:e, :, :]  # [L, H, D]
-            v_b = v_all[s:e, :, :]  # [L, H, D]
-
-            # -> [H, L, D]
-            q_hld = q_b.permute(1, 0, 2).contiguous()
-            k_hld = k_b.permute(1, 0, 2).contiguous()
-            v_hld = v_b.permute(1, 0, 2).contiguous()
-
-            out_hld = torch.zeros(H, L, D, dtype=q.dtype, device=q.device)
-
-            K_keep = min(int(k_top), L)
-
-            for qs in range(0, L, q_chunk):
-                qe = min(qs + q_chunk, L)
-                QB = qe - qs
-
-                q_blk = q_hld[:, qs:qe, :]  # [H, QB, D]
-
-                run_vals = torch.full(
-                    (H, QB, K_keep), float("-inf"), dtype=q.dtype, device=q.device
-                )
-                run_idx = torch.zeros(
-                    (H, QB, K_keep), dtype=torch.long, device=q.device
-                )
-
-                q_pos = torch.arange(qs, qe, device=q.device)  # [QB]
-
-                for ks in range(0, L, k_chunk):
-                    ke = min(ks + k_chunk, L)
-                    KB = ke - ks
-
-                    k_blk = k_hld[:, ks:ke, :]  # [H, KB, D]
-                    scores_blk = (
-                        torch.matmul(q_blk, k_blk.transpose(-1, -2)) * scale
-                    )  # [H, QB, KB]
-
-                    k_pos = torch.arange(ks, ke, device=q.device)
-                    causal_mask = k_pos.unsqueeze(0) > q_pos.unsqueeze(1)  # [QB, KB]
-                    scores_blk = scores_blk.masked_fill(
-                        causal_mask.view(1, QB, KB), float("-inf")
-                    )
-
-                    k_this = min(K_keep, KB)
-                    blk_topv, blk_topi_local = torch.topk(
-                        scores_blk, k=k_this, dim=-1, largest=True, sorted=False
-                    )
-                    blk_topi = blk_topi_local + ks
-
-                    cat_vals = torch.cat(
-                        [run_vals, blk_topv], dim=-1
-                    )  # [H, QB, K_keep + k_this]
-                    cat_idx = torch.cat(
-                        [run_idx, blk_topi], dim=-1
-                    )  # [H, QB, K_keep + k_this]
-                    run_vals, pick = torch.topk(
-                        cat_vals, k=K_keep, dim=-1, largest=True, sorted=False
-                    )
-                    run_idx = cat_idx.gather(-1, pick)
-
-                    del (
-                        scores_blk,
-                        blk_topv,
-                        blk_topi_local,
-                        blk_topi,
-                        cat_vals,
-                        cat_idx,
-                        pick,
-                    )
-
-                attn_probs = torch.softmax(run_vals, dim=-1)  # [H, QB, K_keep]
-                v_topk = v_hld[h_idx_full, run_idx, :]  # [H, QB, K_keep, D]
-                out_blk = (attn_probs.unsqueeze(-1) * v_topk).sum(dim=-2)  # [H, QB, D]
-                out_hld[:, qs:qe, :] = out_blk
-
-                del run_vals, run_idx, q_blk, out_blk, attn_probs, v_topk
-
-            out[s:e, :, :] = out_hld.permute(1, 0, 2).contiguous()
-
-        return out
-
     def interpolated_attention(self, q, kv, k, v, unpadded_lengths, z):
         if unpadded_lengths is not None:
             # varlen, ignore padding tokens, efficient for large batch with many paddings
@@ -1226,70 +1091,6 @@ class Qwen3Attention(nn.Module):
                     return_attn_probs=False,
                     window_size=(self.context_window_toggle - 1, 0),
                 )
-        elif self.toggle_type == "topk":
-            topk = getattr(self, "topk", 32)
-            scale = 1.0 / self.norm_factor
-
-            def topk_attention(q, kv, cu_seqlens=None, max_seqlen=None):
-                # kv: (total_k, 2, nheads_k, D)
-                k, v = kv[:, 0], kv[:, 1]
-                total_q, nheads, D = q.shape
-
-                if cu_seqlens is not None:
-                    B = cu_seqlens.numel() - 1
-                    outs = []
-                    for b in range(B):
-                        q_b = q[cu_seqlens[b] : cu_seqlens[b + 1]]  # (Lq, nheads, D)
-                        k_b = k[cu_seqlens[b] : cu_seqlens[b + 1]]  # (Lk, nheads_k, D)
-                        v_b = v[cu_seqlens[b] : cu_seqlens[b + 1]]
-
-                        # 支持 MQA / GQA
-                        if k_b.size(1) < q_b.size(1):
-                            repeat_factor = q_b.size(1) // k_b.size(1)
-                            k_b = k_b.repeat_interleave(repeat_factor, dim=1)
-                            v_b = v_b.repeat_interleave(repeat_factor, dim=1)
-
-                        # 注意力分数 (Lq, Lk, nheads)
-                        scores = torch.einsum("ihd,jhd->ijh", q_b * scale, k_b)
-
-                        # causal mask
-                        causal_mask = torch.tril(torch.ones_like(scores[..., 0]))
-                        scores = scores * causal_mask.unsqueeze(-1) + (
-                            1 - causal_mask.unsqueeze(-1)
-                        ) * (-1e9)
-
-                        topk_vals, topk_idx = torch.topk(scores, k=topk, dim=1)
-                        mask = torch.full_like(scores, float("-inf"))
-                        mask.scatter_(1, topk_idx, topk_vals)
-                        attn_probs = torch.softmax(mask, dim=1)
-
-                        out_b = torch.einsum("ijh,jhd->ihd", attn_probs, v_b)
-                        outs.append(out_b)
-
-                    return torch.cat(outs, dim=0)
-                else:
-                    # 非 varlen：假设 q=(B, L, nH, D)
-                    B, L, nH, D = q.shape
-                    k, v = kv[:, 0], kv[:, 1]
-                    # k,v:(B,L,nH,D)
-                    scores = torch.einsum("blhd,bmhd->bhlm", q * scale, k)
-                    causal_mask = torch.tril(torch.ones(L, L, device=q.device))
-                    scores = scores * causal_mask.unsqueeze(0).unsqueeze(0) + (
-                        1 - causal_mask.unsqueeze(0).unsqueeze(0)
-                    ) * (-1e9)
-
-                    topk_vals, topk_idx = torch.topk(scores, k=topk, dim=-1)
-                    mask = torch.full_like(scores, float("-inf"))
-                    mask.scatter_(-1, topk_idx, topk_vals)
-                    attn_probs = torch.softmax(mask, dim=-1)
-                    out = torch.einsum("bhlm,bmhd->blhd", attn_probs, v)
-                    return out
-
-            if unpadded_lengths is not None:
-                cu_seqlens, max_seqlen = unpadded_lengths
-                cw_attn_output = topk_attention(q, kv, cu_seqlens, max_seqlen)
-            else:
-                cw_attn_output = topk_attention(q, kv)
         elif self.toggle_type == "xattn":  
 
             if not self.training :
@@ -1392,53 +1193,7 @@ class Qwen3Attention(nn.Module):
             )[:,None,...]
 
         return effective_attn_output
-    def transform_unpadded_to_batched(self, target_x, unpadded_lengths):
-        if unpadded_lengths is None:
-            if target_x.dim() == 3:
-                return target_x.unsqueeze(0)
-            return target_x
 
-        cu_seqlens, seq_lengths = unpadded_lengths
-        B = cu_seqlens.numel() - 1
-        if B == 0:
-            return torch.empty((0,) + target_x.shape[1:], device=target_x.device, dtype=target_x.dtype)
-
-        max_seq_len = seq_lengths
-        
-        batched_list = []
-
-        for b in range(B):
-            s, e = int(cu_seqlens[b]), int(cu_seqlens[b + 1])
-            seq_len = e - s
-
-            if seq_len > 0:
-                current_sequence = target_x[s:e]
-
-                padding_len = max_seq_len - seq_len
-
-                padding_shape = (padding_len,) + current_sequence.shape[1:]
-                padding_tensor = torch.zeros(
-                    padding_shape, 
-                    dtype=current_sequence.dtype, 
-                    device=current_sequence.device
-                )
-
-                padded_sequence = torch.cat([current_sequence, padding_tensor], dim=0)
-                
-            else:
-                other_dims = target_x.shape[1:]
-
-                padded_sequence = torch.zeros(
-                    (max_seq_len,) + other_dims,
-                    dtype=target_x.dtype,
-                    device=target_x.device
-                )
-            
-            batched_list.append(padded_sequence)
-
-        target_x = torch.stack(batched_list, dim=0)
-        
-        return target_x
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1553,6 +1308,9 @@ class Qwen3Attention(nn.Module):
         attn_output = self.o_proj(attn_output.to(self.o_proj.weight.dtype))
 
         attn_weights = None
+        
+        if not has_layer_past:
+            print(f"task_ids: {task_ids}, head allocate: {[x.tolist() for x in z]}")
         
         # z: [B, H, 1] -> [B, H] -> [B]
         return z.squeeze(-1).sum(dim=-1), pooled_hidden_states, attn_output, attn_weights, past_key_value

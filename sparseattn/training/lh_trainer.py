@@ -473,8 +473,9 @@ class Trainer(HFTrainer):
 
         reg_loss = outputs["sparsity_loss"] if isinstance(outputs, dict) else outputs[-2]
         contrastive_loss = outputs["contrastive_loss"] if isinstance(outputs, dict) else outputs[-1]
+        head_contrastive_loss = outputs["head_contrastive_loss"] if isinstance(outputs, dict) else outputs[-3]
         
-        loss = lm_loss + reg_loss + contrastive_loss
+        loss = lm_loss + reg_loss + contrastive_loss + head_contrastive_loss
         model_sparsity = outputs["model_sparsity"]
         print(f"Rank {torch.distributed.get_rank() if torch.distributed.is_initialized() else 0}: "f"[Step {self.state.global_step}] Task={tasks} | model_sparsity={model_sparsity} | reg_loss={reg_loss}")
         
@@ -491,6 +492,7 @@ class Trainer(HFTrainer):
         distributed_lm_loss = self.accelerator.gather(lm_loss).mean()
         distributed_reg_loss = self.accelerator.gather(reg_loss).mean()
         distributed_contrastive_loss = self.accelerator.gather(contrastive_loss).mean()
+        distributed_head_contrastive_loss = self.accelerator.gather(head_contrastive_loss).mean()
         distributed_target_sparsity = self.accelerator.gather(target_sparsity)
             
         if self.log_loss and self.accelerator.is_main_process:
@@ -513,7 +515,7 @@ class Trainer(HFTrainer):
 
             logger.info(
                 f"@ {self.state.global_step} | Loss: {distributed_loss} | LM Loss: {distributed_lm_loss} | "
-                f"Reg Loss: {distributed_reg_loss} | contrastive_loss: {distributed_contrastive_loss} | "
+                f"Reg Loss: {distributed_reg_loss} | contrastive_loss: {distributed_contrastive_loss} | head_contrastive_loss: {distributed_head_contrastive_loss} |"
                 f"Target Sparsity: {distributed_target_sparsity} | Model Sparsity: {distributed_model_sparsity}"
                 + (" | " + " | ".join(extra) if len(extra) else "")
             )
@@ -569,6 +571,11 @@ class Trainer(HFTrainer):
                         distributed_contrastive_loss.detach().item()
                         if isinstance(distributed_contrastive_loss, torch.Tensor)
                         else distributed_contrastive_loss
+                    ),
+                    "head_contrastive_loss": float(
+                        distributed_head_contrastive_loss.detach().item()
+                        if isinstance(distributed_head_contrastive_loss, torch.Tensor)
+                        else distributed_head_contrastive_loss
                     ),
                     "target_sparsity": distributed_target_sparsity.detach().float().mean().item(),
                     "model_sparsity": distributed_model_sparsity.detach().float().mean().item(),
