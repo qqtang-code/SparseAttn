@@ -663,12 +663,13 @@ class AttentionRouter(nn.Module):
         else:
             self.register_buffer("log_temp", torch.log(torch.tensor(temp)))
             self.tau = torch.exp(self.log_temp).clamp(0.3, 1.0)
+    
     def reset_parameters(self):
         # for layer in self.cls_feat_extractor:
         #     if isinstance(layer, nn.Linear):
         #         nn.init.zeros_(layer.bias)
         #         nn.init.normal_(layer.weight, std=1e-6)
-        nn.init.constant_(self.cls_router_head_agnostic.bias, 10.0)
+        nn.init.zeros_(self.cls_router_head_agnostic.bias)
         nn.init.zeros_(self.cls_router_head_agnostic.weight)
         if self.cls_router_head_agnostic.weight.device != torch.device('meta'):
             print(f"[Router Init] bias = {self.cls_router_head_agnostic.bias.item():.1f}")
@@ -707,7 +708,6 @@ class AttentionRouter(nn.Module):
         else:
             raise ValueError(f"Unknown pooling_mode: {self.pooling_mode}")
         
-        
         if self.use_task_emb:
             if self.training:
                 task_emb = self.task_embedding(task_ids) # [B, D]
@@ -719,7 +719,6 @@ class AttentionRouter(nn.Module):
         pooled_hidden_states = self.cls_feat_extractor(pooled_latent)
 
         binary_logits = self.cls_router_head_agnostic(pooled_hidden_states)
-
         
         if self.learnable_temp:
             tau = torch.exp(self.log_temp).clamp(0.3, 1.0)
@@ -752,6 +751,7 @@ class AttentionRouter(nn.Module):
             z_soft = torch.sigmoid(binary_logits / tau) 
             z_hard = (z_soft > 0.5).float()
             z = z_hard
+        
         return {
             'pooled_hidden_states': pooled_hidden_states, # [B, H, D]
             'decisions': z_soft,
@@ -759,6 +759,7 @@ class AttentionRouter(nn.Module):
             'sparse_mask': z, # [B, H], 这是一个 STE Tensor
             'logits': binary_logits,
         }
+        
     def _segment_pooling_single_batch(self, pooled_input: torch.Tensor, range_ids: torch.Tensor, segments: list) -> torch.Tensor:
         B, S, H, D = pooled_input.shape
         pooled_features_list = []
@@ -1253,6 +1254,7 @@ class Qwen3Attention(nn.Module):
                 res = self.mask_allocator(q, None, range_ids, task_ids)
                 z_kv_batch, pooled_hidden_states = res['sparse_mask'], res['pooled_hidden_states']
                 z_constrast = res['decisions']
+                
             if z_kv_batch.shape[-1] == self.num_key_value_heads:
                 z_kv_batch = (
                     z_kv_batch.unsqueeze(-1)              # [B, num_kv, 1]
@@ -1788,7 +1790,9 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
             if output_attentions:
                 all_self_attns += (layer_outputs[4],)
+        
         if enable_contrastive_loss:
+            
             def jsd(p, q, eps=1e-8):
                 """
                 p, q: [H]   soft mask for a task (mean across batch)
@@ -1801,6 +1805,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 kl_pm = torch.sum(p * torch.log(p / m))
                 kl_qm = torch.sum(q * torch.log(q / m))
                 return 0.5 * (kl_pm + kl_qm)
+            
             head_contrastive_loss = torch.tensor(0.0, device=hidden_states.device)
 
             # all gather all pooled_hidden_states across all GPUs
@@ -1846,7 +1851,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
             
             # 聚合所有的task，获得task 表征
             unique_tasks = torch.unique(global_task)  # e.g., tensor([0, 1, 3])
-            K_eff = unique_tasks.size(0)
+
             if unique_tasks.numel() > 1:
                 prototypes = torch.stack([
                     global_hidden[global_task == t].mean(dim=0)
@@ -1944,6 +1949,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
             all_hidden_states += (hidden_states,)
 
         next_cache = next_decoder_cache if use_cache else None
+        
         if compute_sparsity:
             
             # model_sparsity = 1 - (z_sum / self.total_num_heads)
@@ -1981,7 +1987,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
         if compute_sparsity:
             layerwise_model_sparsity = None
             layerwise_target = None
-            layerwise_loss = None
+
             if len(layer_z_sums) > 0:
                 per_layer_heads = self.config.num_attention_heads
                 layerwise_model_sparsity = (

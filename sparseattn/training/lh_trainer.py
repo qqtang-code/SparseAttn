@@ -472,11 +472,23 @@ class Trainer(HFTrainer):
             lm_loss = lm_loss / self.state.avg_num_valid_tokens_per_device
 
         reg_loss = outputs["sparsity_loss"] if isinstance(outputs, dict) else outputs[-2]
+        
+        gather_list = [
+            torch.zeros_like(reg_loss, device=reg_loss.device)
+            for _ in range(dist.get_world_size(group=self.seq_parallel_group))
+        ]
+        # detached gather —— 但保留本 rank 的梯度
+        dist.all_gather(gather_list, reg_loss.detach())
+        gather_list[dist.get_rank(group=self.seq_parallel_group)] = reg_loss
+        reg_loss = sum(gather_list)
+        
         contrastive_loss = outputs["contrastive_loss"] if isinstance(outputs, dict) else outputs[-1]
         head_contrastive_loss = outputs["head_contrastive_loss"] if isinstance(outputs, dict) else outputs[-3]
         
         loss = lm_loss + reg_loss + contrastive_loss + head_contrastive_loss
+        
         model_sparsity = outputs["model_sparsity"]
+        
         print(f"Rank {torch.distributed.get_rank() if torch.distributed.is_initialized() else 0}: "f"[Step {self.state.global_step}] Task={tasks} | model_sparsity={model_sparsity} | reg_loss={reg_loss}")
         
         task_ids = outputs['task_ids']
