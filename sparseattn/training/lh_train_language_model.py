@@ -18,7 +18,7 @@ import torch
 from transformers import LlamaForCausalLM, AutoTokenizer
 
 from .modeling_flash_llama import PawLlamaForCausalLM, PawLlamaConfig
-from .modeling_flash_qwen import PawQwen3ForCausalLM, PawQwen3Config, AttentionRouter
+from .modeling_flash_qwen import PawQwen3ForCausalLM, PawQwen3Config, Qwen3Model, AttentionRouter
 
 from .modeling_flash_phi import PawPhi3ForCausalLM, PawPhi3Config
 from .lh_trainer import Trainer
@@ -253,6 +253,8 @@ def main():
         model.reset_masks()
     
     def init_all_routers(module):
+        if isinstance(module, Qwen3Model):
+            module.reset_parameters()
         if isinstance(module, AttentionRouter):
             module.reset_parameters()
         for child in module.children():
