@@ -550,12 +550,10 @@ class Trainer(HFTrainer):
             new_task_sparsity_statistic = {
                 f"Spa-{task_name} sparsity": task_sparsity.detach().item()
                 for task_name, task_sparsity in task_sparsity_statistic.items()
-
             }
             new_task_target_sparsity_statistic = {
                 f"Spa-{task_name} target_sparsity": task_target_sparsity.detach().item()
                 for task_name, task_target_sparsity in task_target_sparsity_statistic.items()
-                if task_target_sparsity > 0
             }
             
             for task_name, task_sparsity in task_sparsity_statistic.items():
@@ -691,14 +689,14 @@ class Trainer(HFTrainer):
                     {
                         "params": optimizer_3_group,
                         "weight_decay": self.args.weight_decay,
-                        "lr": self.mask_learning_rate,
+                        # "lr": self.mask_learning_rate,
                     }
                 )
                 optimizer_grouped_parameters.append(
                     {
                         "params": optimizer_4_group,
                         "weight_decay": self.args.weight_decay,
-                        "lr": self.reg_learning_rate,
+                        # "lr": self.reg_learning_rate,
                         "maximize": True,
                     }
                 )
@@ -706,7 +704,7 @@ class Trainer(HFTrainer):
                     {
                         "params": optimizer_5_group,
                         "weight_decay": self.args.weight_decay,
-                        "lr": self.mask_learning_rate,
+                        # "lr": self.mask_learning_rate,
                     }
                 )
             
