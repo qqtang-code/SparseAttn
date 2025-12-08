@@ -669,7 +669,7 @@ class AttentionRouter(nn.Module):
         #     if isinstance(layer, nn.Linear):
         #         nn.init.zeros_(layer.bias)
         #         nn.init.normal_(layer.weight, std=1e-6)
-        nn.init.constant_(self.cls_router_head_agnostic.bias, 5.0)
+        nn.init.constant_(self.cls_router_head_agnostic.bias, 1.0)
         nn.init.zeros_(self.cls_router_head_agnostic.weight)
         if self.cls_router_head_agnostic.weight.device != torch.device('meta'):
             print(f"[Router Init] bias = {self.cls_router_head_agnostic.bias.item():.1f}")
@@ -2027,7 +2027,6 @@ class Qwen3Model(Qwen3PreTrainedModel):
                     (model_sparsity * 10 - target_sparsity * 10).abs()
                     # + ((model_sparsity - target_sparsity) ** 2)
                 )
-                
                 log_z_loss = z_loss.detach()
                 
                 z_loss = z_loss.mean() 
