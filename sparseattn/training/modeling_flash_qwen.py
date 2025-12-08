@@ -644,21 +644,15 @@ class AttentionRouter(nn.Module):
         #     nn.SiLU(),
         #     nn.Linear(d_feature, 1)
         # )
-        
+
         self.cls_feat_extractor = nn.Sequential( 
             nn.Linear(d_feature, 2 * d_feature),
             nn.SiLU(),
             nn.Linear(2 * d_feature, d_feature),
         )
         
-        self.cls_router_head_agnostic = nn.Sequential( 
-            nn.Linear(d_feature, 2 * d_feature),
-            nn.SiLU(),
-            nn.Dropout(0.3),
-            nn.Linear(2 * d_feature, d_feature),
-            nn.SiLU(),
-            nn.Linear(d_feature, 1)
-        )
+        self.cls_router_head_agnostic = nn.Linear(d_feature, 1)
+
         
         if self.use_task_emb:
             self.task_embedding = nn.Embedding(4, d_feature)
@@ -669,6 +663,15 @@ class AttentionRouter(nn.Module):
         else:
             self.register_buffer("log_temp", torch.log(torch.tensor(temp)))
             self.tau = torch.exp(self.log_temp).clamp(0.3, 1.0)
+    def reset_parameters(self):
+        # for layer in self.cls_feat_extractor:
+        #     if isinstance(layer, nn.Linear):
+        #         nn.init.zeros_(layer.bias)
+        #         nn.init.normal_(layer.weight, std=1e-6)
+        nn.init.constant_(self.cls_router_head_agnostic.bias, 10.0)
+        nn.init.zeros_(self.cls_router_head_agnostic.weight)
+        if self.cls_router_head_agnostic.weight.device != torch.device('meta'):
+            print(f"[Router Init] bias = {self.cls_router_head_agnostic.bias.item():.1f}")
         
     def forward(
         self, 
@@ -712,9 +715,11 @@ class AttentionRouter(nn.Module):
                 pooled_latent = pooled_latent + task_emb_expanded
             else:
                 pooled_latent = pooled_latent
-                
+                                
         pooled_hidden_states = self.cls_feat_extractor(pooled_latent)
-        binary_logits = self.cls_router_head_agnostic(pooled_hidden_states)  # [B, H, 2]
+
+        binary_logits = self.cls_router_head_agnostic(pooled_hidden_states)
+
         
         if self.learnable_temp:
             tau = torch.exp(self.log_temp).clamp(0.3, 1.0)
@@ -747,7 +752,6 @@ class AttentionRouter(nn.Module):
             z_soft = torch.sigmoid(binary_logits / tau) 
             z_hard = (z_soft > 0.5).float()
             z = z_hard
-
         return {
             'pooled_hidden_states': pooled_hidden_states, # [B, H, D]
             'decisions': z_soft,
@@ -1784,7 +1788,6 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
             if output_attentions:
                 all_self_attns += (layer_outputs[4],)
-
         if enable_contrastive_loss:
             def jsd(p, q, eps=1e-8):
                 """

@@ -638,14 +638,8 @@ class AttentionRouter(nn.Module):
             nn.Linear(2 * d_feature, d_feature),
         )
         
-        self.cls_router_head_agnostic = nn.Sequential( 
-            nn.Linear(d_feature, 2 * d_feature),
-            nn.SiLU(),
-            nn.Dropout(0.3),
-            nn.Linear(2 * d_feature, d_feature),
-            nn.SiLU(),
-            nn.Linear(d_feature, 1)
-        )
+        self.cls_router_head_agnostic = nn.Linear(d_feature, 1)
+
         
         if self.use_task_emb:
             self.task_embedding = nn.Embedding(4, d_feature)

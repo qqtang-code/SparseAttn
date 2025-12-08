@@ -18,7 +18,8 @@ import torch
 from transformers import LlamaForCausalLM, AutoTokenizer
 
 from .modeling_flash_llama import PawLlamaForCausalLM, PawLlamaConfig
-from .modeling_flash_qwen import PawQwen3ForCausalLM, PawQwen3Config
+from .modeling_flash_qwen import PawQwen3ForCausalLM, PawQwen3Config, AttentionRouter
+
 from .modeling_flash_phi import PawPhi3ForCausalLM, PawPhi3Config
 from .lh_trainer import Trainer
 # from .lh_trainer_nsa import Trainer as NSATrainer
@@ -250,6 +251,27 @@ def main():
             
     if hasattr(model, "reset_masks"):
         model.reset_masks()
+    
+    def init_all_routers(module):
+        if isinstance(module, AttentionRouter):
+            module.reset_parameters()
+        for child in module.children():
+            init_all_routers(child)
+    
+    def find_routers(module, name=""):
+        if isinstance(module, AttentionRouter):
+            print(f"🔍 Found router at: {name}")
+            return [module]
+        routers = []
+        for child_name, child in module.named_children():
+            routers.extend(find_routers(child, f"{name}.{child_name}" if name else child_name))
+        return routers
+
+    routers = find_routers(model)
+    print(f"✅ Total routers found: {len(routers)}")
+
+    init_all_routers(model)
+    print("✅ All AttentionRouter instances initialized to near-zero.")
 
     if training_args.stripe_init_width_1 is not None:
         # We should initialize with a striped pattern
