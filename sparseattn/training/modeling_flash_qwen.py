@@ -651,7 +651,11 @@ class AttentionRouter(nn.Module):
             nn.Linear(2 * d_feature, d_feature),
         )
         
-        self.cls_router_head_agnostic = nn.Linear(d_feature, 1)
+        self.cls_router_head_agnostic = nn.Sequential( 
+            nn.Linear(d_feature, d_feature),
+            nn.SiLU(),
+            nn.Linear(d_feature, 1),
+        )
 
         
         if self.use_task_emb:
@@ -665,14 +669,12 @@ class AttentionRouter(nn.Module):
             self.tau = torch.exp(self.log_temp).clamp(0.3, 1.0)
     
     def reset_parameters(self):
-        # for layer in self.cls_feat_extractor:
-        #     if isinstance(layer, nn.Linear):
-        #         nn.init.zeros_(layer.bias)
-        #         nn.init.normal_(layer.weight, std=1e-6)
-        nn.init.constant_(self.cls_router_head_agnostic.bias, 1.0)
-        nn.init.zeros_(self.cls_router_head_agnostic.weight)
-        if self.cls_router_head_agnostic.weight.device != torch.device('meta'):
-            print(f"[Router Init] bias = {self.cls_router_head_agnostic.bias.item():.1f}")
+        nn.init.kaiming_uniform_(self.cls_router_head_agnostic[0].weight, a=math.sqrt(5))
+        nn.init.zeros_(self.cls_router_head_agnostic[0].bias)
+
+        nn.init.zeros_(self.cls_router_head_agnostic[2].weight)
+        nn.init.constant_(self.cls_router_head_agnostic[2].bias, 1.0)
+
         
     def forward(
         self, 
