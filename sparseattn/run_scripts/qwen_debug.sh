@@ -1,4 +1,4 @@
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export CUDA_VISIBLE_DEVICES=3
 
 # Model and training configuration
 model=${MODEL:-"/data2/hf_models/Qwen3-4B"}
@@ -20,7 +20,7 @@ fsdp=${FSDP:-"5"}
 gc=${GC:-"1"}
 
 # PruLong-specific arguments
-max_toks=${MAX_TOKS:-32768}
+max_toks=${MAX_TOKS:-8000}
 # max_toks=${MAX_TOKS:-256}
 start_head_sparsity=${START_HEAD_SPARSITY:-0.5}
 end_head_sparsity=${END_HEAD_SPARSITY:-0.3}
@@ -67,7 +67,7 @@ out_dir="checkpoints/$run_name"
 mkdir -p $out_dir
 
 # Calculate GPU and node configuration
-num_gpus=8
+num_gpus=1
 
 num_nodes=$(scontrol show hostnames "$SLURM_JOB_NODELIST" 2>/dev/null | wc -l)
 if [ $num_nodes == 0 ]; then
@@ -89,7 +89,7 @@ accu=$(($bsz / $seq / $num_gpus / $num_nodes))
 
 # Environment variables
 export OMP_NUM_THREADS=$num_gpus
-export SWANLAB_API_KEY="t0PmOeLpVom1LRBDAKHaA"
+export SWANLAB_API_KEY="9zQZYeYLNfHlEYBMHqXve"
 export SWANLAB_LOG_DIR=$out_dir
 export SWANLAB_MODE="cloud"
 export TOKENIZERS_PARALLELISM=true
@@ -97,7 +97,7 @@ export LOGIT_BLOCK_SIZE=2048
 
 # Training arguments
 base_arguments=(
-    --report_to tensorboard
+    --report_to swanlab
     --do_train
     --model_name $model
     --tokenizer_name $model
