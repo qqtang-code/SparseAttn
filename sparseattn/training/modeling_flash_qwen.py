@@ -669,7 +669,7 @@ class AttentionRouter(nn.Module):
         #     if isinstance(layer, nn.Linear):
         #         nn.init.zeros_(layer.bias)
         #         nn.init.normal_(layer.weight, std=1e-6)
-        nn.init.constant_(self.cls_router_head_agnostic.bias, 10.0)
+        nn.init.constant_(self.cls_router_head_agnostic.bias, 5.0)
         nn.init.zeros_(self.cls_router_head_agnostic.weight)
         if self.cls_router_head_agnostic.weight.device != torch.device('meta'):
             print(f"[Router Init] bias = {self.cls_router_head_agnostic.bias.item():.1f}")
@@ -1540,15 +1540,13 @@ class Qwen3Model(Qwen3PreTrainedModel):
         self.sparsity_lambda_2 = nn.Parameter(torch.tensor([0.0], dtype=self._dtype))
         
         self.num_tasks = 4
+        self.sparsity_lambda1_task = nn.Parameter(
+            torch.zeros(self.num_tasks, dtype=self._dtype)
+        )
+        self.sparsity_lambda2_task = nn.Parameter(
+            torch.zeros(self.num_tasks, dtype=self._dtype)
+        )
 
-        lambda1_init = torch.zeros(self.num_tasks, dtype=self._dtype)
-        lambda2_init = torch.zeros(self.num_tasks, dtype=self._dtype)
-
-        lambda1_init += torch.rand(self.num_tasks, dtype=self._dtype) * 0.5
-        lambda2_init += torch.rand(self.num_tasks, dtype=self._dtype) * 0.5
-
-        self.sparsity_lambda1_task = nn.Parameter(lambda1_init)
-        self.sparsity_lambda2_task = nn.Parameter(lambda2_init)
 
         self.threshold_for_deterministic = None
         if config.suggested_sparsity is not None:
@@ -1557,6 +1555,11 @@ class Qwen3Model(Qwen3PreTrainedModel):
         self._erank_cache = {}
         # Initialize weights and apply final processing
         self.post_init()
+
+    @torch.no_grad()
+    def reset_parameters(self):
+        self.sparsity_lambda1_task.data.copy_(torch.rand_like(self.sparsity_lambda1_task) * 0.5)
+        self.sparsity_lambda2_task.data.copy_(torch.rand_like(self.sparsity_lambda2_task) * 0.5)
 
     @torch.no_grad()
     def set_threshold_for_deterministic(self, threshold_for_deterministic):
@@ -2021,7 +2024,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 # z_loss = torch.stack(task_losses).mean()
                 
                 z_loss = (
-                    (model_sparsity - target_sparsity).abs()
+                    (model_sparsity * 10 - target_sparsity * 10).abs()
                     # + ((model_sparsity - target_sparsity) ** 2)
                 )
                 
