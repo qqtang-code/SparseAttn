@@ -596,8 +596,8 @@ class Trainer(HFTrainer):
                         if isinstance(distributed_head_contrastive_loss, torch.Tensor)
                         else distributed_head_contrastive_loss
                     ),
-                    "target_sparsity": distributed_target_sparsity.detach().float().mean().item(),
-                    "model_sparsity": distributed_model_sparsity.detach().float().mean().item(),
+                    "target_sparsity(avg)": distributed_target_sparsity.detach().float().mean().item(),
+                    "model_sparsity(avg)": distributed_model_sparsity.detach().float().mean().item(),
                     "step": self.state.global_step,
                     "lambda1 Single QA": lambda1[0].detach().item(),
                     "lambda2 MultiHop QA": lambda1[1].detach().item(),
