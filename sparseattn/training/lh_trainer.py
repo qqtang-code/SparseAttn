@@ -546,12 +546,11 @@ class Trainer(HFTrainer):
             new_task_sparsity_loss_statistic = {
                 f"Spa-{task_name} log_z_loss": log_z_loss.detach().item()
                 for task_name, log_z_loss in task_sparsity_loss_statistic.items()
-                if log_z_loss > 0
             }
             new_task_sparsity_statistic = {
                 f"Spa-{task_name} sparsity": task_sparsity.detach().item()
                 for task_name, task_sparsity in task_sparsity_statistic.items()
-                if task_sparsity > 0
+
             }
             new_task_target_sparsity_statistic = {
                 f"Spa-{task_name} target_sparsity": task_target_sparsity.detach().item()
