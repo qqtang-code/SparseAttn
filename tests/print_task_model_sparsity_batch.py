@@ -8,18 +8,21 @@ task_configs = {
     "Code": {"start": 0.0, "end": 0.4},
     "MultiHop QA": {"start": 0.0, "end": 0.2},
     "Single QA": {"start": 0.0, "end": 0.2},
-    "Summarization": {"start": 0.0, "end": 0.7},
+    "Summarization": {"start": 0.0, "end": 0.5},
 }
 
-LOG_PATH="/data1/lcm_lab/qqt/SparseAttn/sparseattn/checkpoints/masksonly_Qwen3-8B_bsz64_steps125_lr1e-5_warmup0.1_sp0.3_cw2048_mlr1.0_rlr1.0sft3_pretrain_64k_xattn_mlp_linear_first_token_10reg_16k_batch3_12.5_wfrozen/log.out"
+LOG_PATH = "/data1/lcm_lab/qqt/SparseAttn/sparseattn/checkpoints/steps125_qwen_mix_sft_32K_xattn_mlp_linear_first_token_10reg_nolambda_abs*100_head_contrast_wfrozen/log.out"
 
 TOTAL_STEPS = 125
 WARMUP_RATIO = 0.8
 WARMUP_STEPS = int(TOTAL_STEPS * WARMUP_RATIO)
 
-# ================= 1. 数据提取 =================
+# ================= 1. 数据提取 (已修改) =================
 def extract_log_data(log_text):
-    # 正则表达式匹配：Rank X: [Step Y] Task=['Name'] | model_sparsity=tensor([Value]...
+    # 正则表达式说明：
+    # group(1): Step
+    # group(2): Task 列表内部字符串，如 "'MultiHop QA', 'Summarization'"
+    # group(3): Sparsity 列表内部字符串，如 "0.3941, 0.4002"
     pattern = r"Rank \d+: \[Step (\d+)\] Task=\['(.*?)'\] \| model_sparsity=tensor\(\[(.*?)\]"
     
     # 数据结构: data[step][task] = [sparsity1, sparsity2, ...]
@@ -28,20 +31,35 @@ def extract_log_data(log_text):
     for line in log_text.split('\n'):
         match = re.search(pattern, line)
         if match:
-            step = int(match.group(1))
-            task = match.group(2)
-            sparsity = float(match.group(3))
-            data[step][task].append(sparsity)
+            try:
+                step = int(match.group(1))
+                task_str = match.group(2)
+                sparsity_str = match.group(3)
+
+                # 1. 解析任务列表：按逗号分割，去除首尾空格和引号
+                tasks = [t.strip().strip("'").strip('"') for t in task_str.split(',')]
+                
+                # 2. 解析稀疏度列表：按逗号分割，转为 float
+                sparsities = [float(s.strip()) for s in sparsity_str.split(',')]
+
+                # 3. 一一对应并存储
+                # 只有当任务数量和稀疏度数量一致时才记录，防止日志打印截断导致错误
+                if len(tasks) == len(sparsities):
+                    for t, s in zip(tasks, sparsities):
+                        data[step][t].append(s)
+            except ValueError:
+                # 忽略解析错误的行
+                continue
     
     # 计算每个Step每个Task的平均值
     avg_data = defaultdict(dict)
-    for step, tasks in data.items():
-        for task, values in tasks.items():
+    for step, tasks_dict in data.items():
+        for task, values in tasks_dict.items():
             avg_data[step][task] = np.mean(values)
             
     return avg_data
 
-# ================= 2. 辅助函数 =================
+# ================= 2. 辅助函数 (保持不变) =================
 def get_target_sparsity(step, task_name):
     """计算指定步数的各项任务 Target Sparsity (线性增长)"""
     cfg = task_configs.get(task_name)
@@ -55,13 +73,17 @@ def get_target_sparsity(step, task_name):
     progress = step / WARMUP_STEPS
     return cfg['start'] + (cfg['end'] - cfg['start']) * progress
 
-# ================= 3. 绘图逻辑 =================
+# ================= 3. 绘图逻辑 (保持不变) =================
 def plot_results(avg_data):
     # 获取所有出现的 Step 并排序
     extracted_steps = sorted(avg_data.keys())
+    if not extracted_steps:
+        print("未提取到任何数据，请检查日志格式或路径。")
+        return
+
     tasks = list(task_configs.keys())
     
-    # 用于绘制 Target 曲线的 X 轴 (1 到 125)
+    # 用于绘制 Target 曲线的 X 轴
     all_theoretical_steps = np.arange(1, TOTAL_STEPS + 1)
 
     # --- 图表 1: 所有任务的 Model Sparsity 变化 ---
@@ -76,7 +98,7 @@ def plot_results(avg_data):
                 y.append(avg_data[s][task])
         
         if x:
-            plt.plot(x, y, marker='o', label=task)
+            plt.plot(x, y, marker='.', label=task) # 改用'.'减少密集点的大小
             
     plt.title('Actual Model Sparsity per Task (Averaged over Ranks)')
     plt.xlabel('Step')
@@ -84,7 +106,7 @@ def plot_results(avg_data):
     plt.legend()
     plt.grid(True, linestyle='--', alpha=0.7)
     plt.tight_layout()
-    plt.savefig('model_sparsity_overview.png')
+    plt.savefig('model_sparsity_overview_batch.pdf')
     print("生成图表: model_sparsity_overview.png")
 
     # --- 图表 2: 每个任务 Actual vs Target ---
@@ -107,10 +129,7 @@ def plot_results(avg_data):
                 y.append(avg_data[s][task])
         
         if x:
-            ax.plot(x, y, marker='o', color='blue', linewidth=2, label='Model Sparsity')
-            # # 在数据点旁标注数值
-            # for sx, sy in zip(x, y):
-            #     ax.text(sx, sy, f'{sy:.4f}', fontsize=9, ha='right', va='bottom')
+            ax.plot(x, y, marker='.', color='blue', linewidth=1, label='Model Sparsity')
 
         ax.set_title(f'Task: {task}')
         ax.set_xlabel('Step')
@@ -119,25 +138,25 @@ def plot_results(avg_data):
         ax.grid(True, linestyle='--', alpha=0.5)
 
     plt.tight_layout()
-    plt.savefig('sparsity_comparison.png')
+    plt.savefig('sparsity_comparison_batch.pdf')
     print("生成图表: sparsity_comparison.png")
 
 # ================= 主程序 =================
 if __name__ == "__main__":
-    # 解析数据
-    # 注意：实际使用时，你可以取消下行注释来读取文件
-    with open(LOG_PATH, 'r') as f: log_content = f.read()
-    
-    # 只要将你的log粘贴到 log_content 变量中即可 (如果上面没有读文件)
-    # 为了演示，这里假设 log_content 已经被填充
-    
-    processed_data = extract_log_data(log_content)
-    
-    # 打印Step 1的提取结果示例
-    print("Extraction Preview (Step 1):")
-    if 1 in processed_data:
-        for task, val in processed_data[1].items():
-            print(f"  {task}: {val:.5f}")
+    # 读取文件
+    try:
+        with open(LOG_PATH, 'r') as f: 
+            log_content = f.read()
+            processed_data = extract_log_data(log_content)
             
-    # 绘图
-    plot_results(processed_data)
+            # 打印Step 0或1的提取结果示例，用于调试
+            check_step = 0 if 0 in processed_data else 1
+            print(f"Extraction Preview (Step {check_step}):")
+            if check_step in processed_data:
+                for task, val in processed_data[check_step].items():
+                    print(f"  {task}: {val:.5f}")
+            
+            # 绘图
+            plot_results(processed_data)
+    except FileNotFoundError:
+        print(f"错误: 找不到文件 {LOG_PATH}")
