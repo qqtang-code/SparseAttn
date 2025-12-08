@@ -46,7 +46,7 @@ def load_sparse_model(model_path):
 
 
 def main():
-    model_path = "/data1/lcm_lab/qqt/SparseAttn/sparseattn/checkpoints/masksonly_Qwen3-4B_bsz16_steps125_lr1e-5_warmup0.1_sp0.3_cw2048_mlr1.0_rlr1.0sft3_pretrain_64k_xattn_mlp_linear_first_token_10reg_64k_12.4_wfrozen/checkpoint-60"
+    model_path = "/data1/lcm_lab/qqt/SparseAttn/sparseattn/checkpoints/steps125_qwen_mix_sft_32K_xattn_mlp_linear_first_token_10reg_nolambda_abs*100_head_contrast_wfrozen"
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
@@ -83,7 +83,7 @@ def main():
         "context": "",                     # no context
         "question": prompt,                # your prompt
         "answer": "",                      # empty for inference
-        "metadata": {"task": "Single QA", "flag": "0"},
+        "metadata": {"task": "Summarization", "flag": "0"}, # Single QA, Summarization
     }
 
     input_ids, labels, attention_mask, segment_ids, range_ids, class_id = dataset._build_sft_input_and_labels(
