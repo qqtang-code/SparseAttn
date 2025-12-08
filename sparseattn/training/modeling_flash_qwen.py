@@ -2038,7 +2038,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
             layerwise_loss = None
         
         if z_loss is not None:
-            z_loss = z_loss.mean()
+            z_loss = z_loss.sum()
         
         if not return_dict:
             # return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns, model_sparsity, target_sparsity, z_loss] if v is not None)
