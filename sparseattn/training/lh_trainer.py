@@ -689,14 +689,14 @@ class Trainer(HFTrainer):
                     {
                         "params": optimizer_3_group,
                         "weight_decay": self.args.weight_decay,
-                        # "lr": self.mask_learning_rate,
+                        "lr": self.mask_learning_rate,
                     }
                 )
                 optimizer_grouped_parameters.append(
                     {
                         "params": optimizer_4_group,
                         "weight_decay": self.args.weight_decay,
-                        # "lr": self.reg_learning_rate,
+                        "lr": self.reg_learning_rate,
                         "maximize": True,
                     }
                 )
@@ -704,7 +704,7 @@ class Trainer(HFTrainer):
                     {
                         "params": optimizer_5_group,
                         "weight_decay": self.args.weight_decay,
-                        # "lr": self.mask_learning_rate,
+                        "lr": self.mask_learning_rate,
                     }
                 )
             
