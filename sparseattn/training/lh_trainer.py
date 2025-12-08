@@ -442,7 +442,8 @@ class Trainer(HFTrainer):
         outputs = model(**inputs, use_cache=False, target_sparsity=target_sparsity)
 
         lm_loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
-
+        target_sparsity = outputs["target_sparsity"]
+        
         if getattr(self.args, "token_scaled_loss", False):
             seq_parallel_world_size = (
                 dist.get_world_size(self.seq_parallel_group)
@@ -495,6 +496,7 @@ class Trainer(HFTrainer):
         log_z_loss = outputs['log_z_loss']
         task_sparsity_statistic = dict([(task_name, 0) for task_name in self.reverse_class_map.values()])
         task_sparsity_loss_statistic = dict([(task_name, 0) for task_name in self.reverse_class_map.values()])
+        task_target_sparsity_statistic = dict([(task_name, 0) for task_name in self.reverse_class_map.values()])
         
         # all gather task ids and model_sparsity
         distributed_log_z_loss = self.accelerator.gather(log_z_loss)
@@ -532,14 +534,15 @@ class Trainer(HFTrainer):
                 + (" | " + " | ".join(extra) if len(extra) else "")
             )
             
-            merged_list = [(distributed_log_z_loss[i], distributed_model_sparsity[i]) for i in range(len(distributed_task_ids))]
+            merged_list = [(distributed_log_z_loss[i], distributed_model_sparsity[i], distributed_target_sparsity[i]) for i in range(len(distributed_task_ids))]
             
             for task_id, item in zip(distributed_task_ids, merged_list):
-                log_z_loss, task_sparsity = item[0], item[1]
+                log_z_loss, task_sparsity, target_sparsity = item[0], item[1], item[2]
                 task_name = self.reverse_class_map[task_id.item()]
                 task_sparsity_statistic[task_name] = (task_sparsity_statistic[task_name] + task_sparsity) / 2
                 task_sparsity_loss_statistic[task_name] = (task_sparsity_loss_statistic[task_name] + log_z_loss) / 2
-            
+                task_target_sparsity_statistic[task_name] = (task_target_sparsity_statistic[task_name] + target_sparsity) / 2
+                
             new_task_sparsity_loss_statistic = {
                 f"Spa-{task_name} log_z_loss": log_z_loss.detach().item()
                 for task_name, log_z_loss in task_sparsity_loss_statistic.items()
@@ -550,15 +553,19 @@ class Trainer(HFTrainer):
                 for task_name, task_sparsity in task_sparsity_statistic.items()
                 if task_sparsity > 0
             }
+            new_task_target_sparsity_statistic = {
+                f"Spa-{task_name} target_sparsity": task_target_sparsity.detach().item()
+                for task_name, task_target_sparsity in task_target_sparsity_statistic.items()
+                if task_target_sparsity > 0
+            }
             
+            for task_name, task_sparsity in task_sparsity_statistic.items():
+                logger.info(f"Statistic -> {task_name} | Sparsity: {task_sparsity} | Target_Sparsity: {task_target_sparsity_statistic[task_name]} | z_loss: {task_sparsity_loss_statistic[task_name]}")
+
+
             del task_sparsity_statistic
             del task_sparsity_loss_statistic
-            
-            for task_name, task_sparsity in new_task_sparsity_statistic.items():
-                logger.info(f"Sparsity Statistic -> {task_name} | Sparsity: {task_sparsity}")
-
-            for task_name, task_sparsity in new_task_sparsity_loss_statistic.items():
-                logger.info(f"Sparsity Loss Statistic -> {task_name} | z_loss: {new_task_sparsity_loss_statistic[task_name]}")
+            del task_target_sparsity_statistic
 
             if (
                 not return_output_and_metrics
@@ -597,8 +604,10 @@ class Trainer(HFTrainer):
                     "lambda3 Summarization": lambda1[2].detach().item(),
                     "lambda4 Code": lambda1[3].detach().item(),
                 }
+                
                 train_metrics.update(new_task_sparsity_statistic)
                 train_metrics.update(new_task_sparsity_loss_statistic)
+                train_metrics.update(new_task_target_sparsity_statistic)
                 
                 self.log(train_metrics)
 

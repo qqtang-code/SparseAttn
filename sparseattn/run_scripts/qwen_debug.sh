@@ -1,4 +1,4 @@
-export CUDA_VISIBLE_DEVICES=3
+export CUDA_VISIBLE_DEVICES=6
 
 # Model and training configuration
 model=${MODEL:-"/data2/hf_models/Qwen3-4B"}
