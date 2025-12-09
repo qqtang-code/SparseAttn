@@ -112,6 +112,7 @@ class PawQwen3Config(Qwen3Config):
         # 新增：top-k 注意力的超参（每个 query 仅保留前 k 个 key）
         self.topk_k = kwargs.pop("topk_k", 32)
         self.pooling_seq = kwargs.pop("pooling_seq", True)
+        self.enable_lambda_task = kwargs.pop("enable_lambda_task", False)
 
         super().__init__(*args, **kwargs)
 
@@ -1543,7 +1544,6 @@ class Qwen3Model(Qwen3PreTrainedModel):
             )
         self.sparsity_lambda_2 = nn.Parameter(torch.tensor([0.0], dtype=self._dtype))
         
-        breakpoint()
         if self.config.enable_lambda_task:
             self.num_tasks = 4
             self.sparsity_lambda1_task = nn.Parameter(
