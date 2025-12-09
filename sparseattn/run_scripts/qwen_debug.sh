@@ -1,9 +1,9 @@
-# export CUDA_VISIBLE_DEVICES=6
+export CUDA_VISIBLE_DEVICES=6
 
 # Model and training configuration
 model=${MODEL:-"/data2/hf_models/Qwen3-4B"}
 bsz=${BSZ:-48}
-seq=${SEQ:-6}
+seq=${SEQ:-4}
 lr=${LR:-1e-3}
 steps=${STEPS:-200}
 save_steps=${SAVE:-5000}
@@ -67,7 +67,7 @@ out_dir="checkpoints/$run_name"
 mkdir -p $out_dir
 
 # Calculate GPU and node configuration
-num_gpus=8
+num_gpus=1
 
 num_nodes=$(scontrol show hostnames "$SLURM_JOB_NODELIST" 2>/dev/null | wc -l)
 if [ $num_nodes == 0 ]; then
@@ -97,7 +97,7 @@ export LOGIT_BLOCK_SIZE=2048
 
 # Training arguments
 base_arguments=(
-    --report_to swanlab
+    --report_to tensorboard
     --do_train
     --model_name $model
     --tokenizer_name $model
@@ -111,7 +111,7 @@ base_arguments=(
     --learning_rate $lr
     --min_lr_ratio $min_lr_ratio
     --lr_scheduler_type cosine
-    --max_grad_norm 1.0
+    --max_grad_norm 5.0
     --adam_beta1 0.9
     --adam_beta2 0.95
     --weight_decay 0.1
