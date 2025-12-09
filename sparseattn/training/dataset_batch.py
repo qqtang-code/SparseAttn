@@ -19,7 +19,7 @@ from typing import Optional, List, Dict
 import torch
 from torch.utils.data import Dataset, IterableDataset
 from transformers import AutoTokenizer
-from datasets import load_dataset
+from datasets import load_dataset,concatenate_datasets
 
 import ast
 
@@ -331,6 +331,9 @@ def build_dataset(paths, data_args, tokenizer=None, is_training=True, model_name
     max_len = min(max_len, 4096*250)  # hard clamp for safety
 
     raw = load_dataset("parquet", data_files=parquet_files, split="train", cache_dir=os.path.join(data_args.data_cache_dir, "raw") if data_args.data_cache_dir else None)
+    
+    repeated_datasets = [raw] * 10000
+    raw = concatenate_datasets(repeated_datasets)
 
     # filter short samples
     if data_args.min_seq_len is not None and not data_args.prepack:

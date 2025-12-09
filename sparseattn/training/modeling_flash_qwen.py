@@ -1543,13 +1543,18 @@ class Qwen3Model(Qwen3PreTrainedModel):
             )
         self.sparsity_lambda_2 = nn.Parameter(torch.tensor([0.0], dtype=self._dtype))
         
-        self.num_tasks = 4
-        self.sparsity_lambda1_task = nn.Parameter(
-            torch.zeros(self.num_tasks, dtype=self._dtype)
-        )
-        self.sparsity_lambda2_task = nn.Parameter(
-            torch.zeros(self.num_tasks, dtype=self._dtype)
-        )
+        breakpoint()
+        if self.config.enable_lambda_task:
+            self.num_tasks = 4
+            self.sparsity_lambda1_task = nn.Parameter(
+                torch.zeros(self.num_tasks, dtype=self._dtype)
+            )
+            self.sparsity_lambda2_task = nn.Parameter(
+                torch.zeros(self.num_tasks, dtype=self._dtype)
+            )
+        else:
+            self.sparsity_lambda1_task = None
+            self.sparsity_lambda2_task = None
 
 
         self.threshold_for_deterministic = None

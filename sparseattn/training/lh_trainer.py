@@ -596,10 +596,10 @@ class Trainer(HFTrainer):
                     "target_sparsity(avg)": distributed_target_sparsity.detach().float().mean().item(),
                     "model_sparsity(avg)": distributed_model_sparsity.detach().float().mean().item(),
                     "step": self.state.global_step,
-                    "lambda1 Single QA": lambda1[0].detach().item(),
-                    "lambda2 MultiHop QA": lambda1[1].detach().item(),
-                    "lambda3 Summarization": lambda1[2].detach().item(),
-                    "lambda4 Code": lambda1[3].detach().item(),
+                    "lambda1 Single QA": lambda1[0].detach().item() if lambda1 is not None else None,
+                    "lambda2 MultiHop QA": lambda1[1].detach().item() if lambda1 is not None else None,
+                    "lambda3 Summarization": lambda1[2].detach().item() if lambda1 is not None else None,
+                    "lambda4 Code": lambda1[3].detach().item() if lambda1 is not None else None,
                 }
                 
                 train_metrics.update(new_task_sparsity_statistic)

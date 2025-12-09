@@ -1,12 +1,12 @@
-export CUDA_VISIBLE_DEVICES=6
+# export CUDA_VISIBLE_DEVICES=6
 
 # Model and training configuration
 model=${MODEL:-"/data2/hf_models/Qwen3-4B"}
-bsz=${BSZ:-64}
-seq=${SEQ:-1}
+bsz=${BSZ:-48}
+seq=${SEQ:-6}
 lr=${LR:-1e-3}
-steps=${STEPS:-1000}
-save_steps=${SAVE:-500}
+steps=${STEPS:-200}
+save_steps=${SAVE:-5000}
 save_total_limit=3
 warmup=${WARMUP:-0.3}
 suffix=${SUFFIX:-""}
@@ -26,7 +26,7 @@ start_head_sparsity=${START_HEAD_SPARSITY:-0.5}
 end_head_sparsity=${END_HEAD_SPARSITY:-0.3}
 mask_learning_rate=${MASK_LEARNING_RATE:-1.0}
 reg_learning_rate=${REG_LEARNING_RATE:-1.0}
-sparsity_warmup_ratio=${SPARSITY_WARMUP_RATIO:-0.8}
+sparsity_warmup_ratio=${SPARSITY_WARMUP_RATIO:-0.4}
 disable_linear_reg_term=${DISABLE_LINEAR_REG_TERM:-true}
 # topk
 context_window_if_toggled=${CONTEXT_WINDOW_IF_TOGGLED:-2048}
@@ -61,13 +61,13 @@ if [[ $freeze_masks == "true" ]]; then
     extra_name="${extra_name}_mfrozen"
 fi
 
-run_name="overfit"
+run_name="overfit_quick_sparsity"
 
 out_dir="checkpoints/$run_name"
 mkdir -p $out_dir
 
 # Calculate GPU and node configuration
-num_gpus=1
+num_gpus=8
 
 num_nodes=$(scontrol show hostnames "$SLURM_JOB_NODELIST" 2>/dev/null | wc -l)
 if [ $num_nodes == 0 ]; then

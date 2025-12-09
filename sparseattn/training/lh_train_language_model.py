@@ -126,7 +126,7 @@ def main():
             pooling_mode=training_args.pooling_mode,
             use_task_emb_for_mask=training_args.use_task_emb_for_mask,
             enable_contrastive_loss=training_args.enable_contrastive_loss,
-            
+            enable_lambda_task=training_args.enable_lambda_task,
             enable_ada_sparsity=training_args.enable_ada_sparsity,
             enable_layerwise_sparsity=training_args.enable_layerwise_sparsity,
             erank_analysis_path=training_args.erank_analysis_path

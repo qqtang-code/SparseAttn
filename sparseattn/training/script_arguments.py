@@ -271,3 +271,8 @@ class TrainingArguments(HfTrainingArguments):
         default=False,
         metadata={"help": "Whether to enable contrastive loss."},
     )
+    
+    enable_lambda_task: bool = field(
+        default=False,
+        metadata={"help": "Whether to enable task-specific lambda."},
+    )
