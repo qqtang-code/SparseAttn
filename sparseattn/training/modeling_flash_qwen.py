@@ -83,6 +83,8 @@ class PawQwen3Config(Qwen3Config):
         
         # Head Router
         self.pooling_mode = kwargs.pop("pooling_mode", "first_token")
+        
+        self.use_task_emb_for_mask = kwargs.pop("use_task_emb_for_mask", False)
 
         # TriangleMix
         self.triangle_n_last = kwargs.pop("triangle_n_last", 128)
@@ -2039,7 +2041,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
             layerwise_loss = None
         
         if z_loss is not None:
-            z_loss = z_loss.mean()
+            z_loss = z_loss.sum()
         
         if not return_dict:
             # return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns, model_sparsity, target_sparsity, z_loss] if v is not None)
