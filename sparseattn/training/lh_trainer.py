@@ -287,6 +287,7 @@ class Trainer(HFTrainer):
             "Summarization": {"start": 0, "end": 0.5},
         }
         self.reverse_class_map = {0: 'Single QA', 1: 'MultiHop QA', 2: 'Summarization', 3: 'Code'}
+        self.use_softmax = args.use_softmax
 
         if not dist.is_initialized() or args.seq_parallel_size == dist.get_world_size():
             logger.info(f"Using world as sequence parallel group")
@@ -486,7 +487,7 @@ class Trainer(HFTrainer):
         contrastive_loss = outputs["contrastive_loss"] if isinstance(outputs, dict) else outputs[-1]
         head_contrastive_loss = outputs["head_contrastive_loss"] if isinstance(outputs, dict) else outputs[-3]
         
-        if self.args.use_softmax:
+        if self.use_softmax:
             loss = lm_loss + reg_loss + contrastive_loss + head_contrastive_loss 
         else:
             loss = lm_loss + reg_loss + contrastive_loss + head_contrastive_loss - 0.5 * head_entropy
