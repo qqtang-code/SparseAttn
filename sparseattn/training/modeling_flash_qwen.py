@@ -2016,7 +2016,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 z_loss = None
             else:
                 if self.config.enable_lambda_task:
-                    diff = (model_sparsity * 100 - target_sparsity * 100)
+                    diff = (model_sparsity - target_sparsity)
 
                     # per-sample lambda
                     lambda1_per_sample = self.sparsity_lambda1_task[task_ids]   # [B]
