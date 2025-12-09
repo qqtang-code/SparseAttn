@@ -1567,8 +1567,9 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
     @torch.no_grad()
     def reset_parameters(self):
-        self.sparsity_lambda1_task.data.copy_(torch.rand_like(self.sparsity_lambda1_task) * 0.5)
-        self.sparsity_lambda2_task.data.copy_(torch.rand_like(self.sparsity_lambda2_task) * 0.5)
+        if self.config.enable_lambda_task:
+            self.sparsity_lambda1_task.data.copy_(torch.rand_like(self.sparsity_lambda1_task) * 0.5)
+            self.sparsity_lambda2_task.data.copy_(torch.rand_like(self.sparsity_lambda2_task) * 0.5)
 
     @torch.no_grad()
     def set_threshold_for_deterministic(self, threshold_for_deterministic):
