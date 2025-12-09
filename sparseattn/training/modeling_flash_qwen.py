@@ -1789,7 +1789,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
             if compute_sparsity:
                 z_sum += z_layer_sum
-                head_entropy += entropy
+                head_entropy = (head_entropy + entropy) / 2
             layer_z_sums.append(z_layer_sum)
             layer_z_constrast.append(z_constrast)
 
