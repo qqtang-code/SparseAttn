@@ -494,9 +494,9 @@ class Trainer(HFTrainer):
         
         task_ids = outputs['task_ids']
         log_z_loss = outputs['log_z_loss']
-        task_sparsity_statistic = dict([(task_name, 0) for task_name in self.reverse_class_map.values()])
-        task_sparsity_loss_statistic = dict([(task_name, 0) for task_name in self.reverse_class_map.values()])
-        task_target_sparsity_statistic = dict([(task_name, 0) for task_name in self.reverse_class_map.values()])
+        task_sparsity_statistic = dict([(task_name, torch.tensor(0,)) for task_name in self.reverse_class_map.values()])
+        task_sparsity_loss_statistic = dict([(task_name, torch.tensor(0,)) for task_name in self.reverse_class_map.values()])
+        task_target_sparsity_statistic = dict([(task_name, torch.tensor(0,)) for task_name in self.reverse_class_map.values()])
         
         # all gather task ids and model_sparsity
         distributed_log_z_loss = self.accelerator.gather(log_z_loss)
@@ -542,9 +542,9 @@ class Trainer(HFTrainer):
                 task_sparsity_statistic[task_name] = (task_sparsity_statistic[task_name] + task_sparsity) / 2
                 task_sparsity_loss_statistic[task_name] = (task_sparsity_loss_statistic[task_name] + log_z_loss) / 2
                 task_target_sparsity_statistic[task_name] = (task_target_sparsity_statistic[task_name] + target_sparsity) / 2
-                
+            
             new_task_sparsity_loss_statistic = {
-                f"Spa-{task_name} log_z_loss": log_z_loss.detach().item()
+                f"Spa-{task_name} log_z_loss": log_z_loss.item()
                 for task_name, log_z_loss in task_sparsity_loss_statistic.items()
             }
             new_task_sparsity_statistic = {

@@ -3,7 +3,7 @@ export CUDA_VISIBLE_DEVICES=6
 # Model and training configuration
 model=${MODEL:-"/data2/hf_models/Qwen3-4B"}
 bsz=${BSZ:-64}
-seq=${SEQ:-2}
+seq=${SEQ:-1}
 lr=${LR:-1e-3}
 steps=${STEPS:-1000}
 save_steps=${SAVE:-500}
@@ -20,7 +20,7 @@ fsdp=${FSDP:-"5"}
 gc=${GC:-"1"}
 
 # PruLong-specific arguments
-max_toks=${MAX_TOKS:-8000}
+max_toks=${MAX_TOKS:-32768}
 # max_toks=${MAX_TOKS:-256}
 start_head_sparsity=${START_HEAD_SPARSITY:-0.5}
 end_head_sparsity=${END_HEAD_SPARSITY:-0.3}
@@ -51,7 +51,7 @@ layerwise_sparsity_weight=${LAYERWISE_SPARSITY_WEIGHT:-1.0}
 erank_analysis_path="/"
 
 # Dataset configuration
-dataset=${DATASET:-"/data2/public_data/mix_sft_64k"}
+dataset=${DATASET:-"/data2/public_data/qwen_mix_sft_32K_4task"}
 task_type="sft" # pretrain or sft
 extra_name="debug_11.30"
 if [[ $freeze_weights == "true" ]]; then
@@ -61,7 +61,7 @@ if [[ $freeze_masks == "true" ]]; then
     extra_name="${extra_name}_mfrozen"
 fi
 
-run_name="debug2"
+run_name="overfit"
 
 out_dir="checkpoints/$run_name"
 mkdir -p $out_dir
