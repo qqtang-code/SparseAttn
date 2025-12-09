@@ -486,7 +486,10 @@ class Trainer(HFTrainer):
         contrastive_loss = outputs["contrastive_loss"] if isinstance(outputs, dict) else outputs[-1]
         head_contrastive_loss = outputs["head_contrastive_loss"] if isinstance(outputs, dict) else outputs[-3]
         
-        loss = lm_loss + reg_loss + contrastive_loss + head_contrastive_loss - 0.5 * head_entropy
+        if self.args.use_softmax:
+            loss = lm_loss + reg_loss + contrastive_loss + head_contrastive_loss 
+        else:
+            loss = lm_loss + reg_loss + contrastive_loss + head_contrastive_loss - 0.5 * head_entropy
         
         model_sparsity = outputs["model_sparsity"]
         

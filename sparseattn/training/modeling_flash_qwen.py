@@ -113,7 +113,8 @@ class PawQwen3Config(Qwen3Config):
         self.topk_k = kwargs.pop("topk_k", 32)
         self.pooling_seq = kwargs.pop("pooling_seq", True)
         self.enable_lambda_task = kwargs.pop("enable_lambda_task", False)
-
+        self.use_softmax = kwargs.pop("use_softmax", False)
+        
         super().__init__(*args, **kwargs)
 
 
@@ -628,7 +629,7 @@ class AttentionRouter(nn.Module):
     def __init__(self, input_dim, num_key_value_heads, d_feature=128,
                  use_task_emb=False, temp=3/2, hard=False, 
                  router_type='mlp', use_gumbel=True, learnable_temp=False,
-                 dropout=0.1, layernorm=True, pooling_mode='ctx_q'):
+                 dropout=0.1, use_softmax=True, pooling_mode='ctx_q'):
         super().__init__()
         self.num_kv = num_key_value_heads
         self.use_task_emb = use_task_emb
@@ -636,15 +637,7 @@ class AttentionRouter(nn.Module):
         self.use_gumbel = use_gumbel
         self.learnable_temp = learnable_temp
         self.pooling_mode = pooling_mode
-        
-        # binary cls
-        # self.cls_net = nn.Sequential( 
-        #     nn.Linear(d_feature, 2 * d_feature),
-        #     nn.SiLU(),
-        #     nn.Linear(2 * d_feature, d_feature),
-        #     nn.SiLU(),
-        #     nn.Linear(d_feature, 1)
-        # )
+        self.use_softmax = use_softmax
 
         self.cls_feat_extractor = nn.Sequential( 
             nn.Linear(d_feature, 2 * d_feature),
@@ -652,15 +645,25 @@ class AttentionRouter(nn.Module):
             nn.Linear(2 * d_feature, d_feature),
         )
         
-        self.cls_router_head_agnostic = nn.Sequential( 
-            nn.Linear(d_feature, 2 * d_feature),
-            nn.SiLU(),
-            nn.Linear(2 * d_feature, d_feature),
-            nn.SiLU(),
-            nn.Linear(d_feature, 1),
-            nn.LayerNorm([self.num_kv, 1], elementwise_affine=False)
-        )
-
+        if self.use_softmax:
+            logger.info("using softmax for attention router")
+            self.cls_router_head_agnostic = nn.Sequential( 
+                nn.Linear(d_feature, 2 * d_feature),
+                nn.SiLU(),
+                nn.Linear(2 * d_feature, d_feature),
+                nn.SiLU(),
+                nn.Linear(d_feature, 2),
+            )
+        else:
+            logger.info("use sigmoid function for attention router")
+            self.cls_router_head_agnostic = nn.Sequential( 
+                nn.Linear(d_feature, 2 * d_feature),
+                nn.SiLU(),
+                nn.Linear(2 * d_feature, d_feature),
+                nn.SiLU(),
+                nn.Linear(d_feature, 1),
+                nn.LayerNorm([self.num_kv, 1], elementwise_affine=False)
+            )
         
         if self.use_task_emb:
             self.task_embedding = nn.Embedding(4, d_feature)
@@ -744,22 +747,30 @@ class AttentionRouter(nn.Module):
             eps = 1e-8
             g = -torch.log(-torch.log(u + eps) + eps)
             
-            z_soft = torch.sigmoid((binary_logits + g) / tau)
-            
-            z_hard = (z_soft > 0.5).float()
-            
-            # --- 3. STE (Straight-Through Estimator) ---
-            # 前向传播：使用 z_hard (真正的 0/1)
-            # 反向传播：梯度通过 z_soft (z_hard 的梯度为0，加上 (z_soft - z_soft.detach()) 后，梯度等于 z_soft 的梯度)
-            z = z_hard + (z_soft - z_soft.detach())
-            entropy = -(z_soft * torch.log(z_soft + eps) + (1 - z_soft) * torch.log(1 - z_soft + eps))
+            if not self.use_softmax:
+                z_soft = torch.sigmoid((binary_logits + g) / tau)
+                z_hard = (z_soft > 0.5).float()
+                z = z_hard + (z_soft - z_soft.detach())  # [B, H, 1]
+                entropy = -(z_soft * torch.log(z_soft + eps) + (1 - z_soft) * torch.log(1 - z_soft + eps))
+            else:
+                z_soft = F.softmax((binary_logits + g) / tau, dim=-1)
+                z_hard = torch.zeros_like(z_soft).scatter_(-1, z_soft.argmax(-1, keepdim=True), 1.0)
+                z = z_hard + (z_soft - z_soft.detach())  # [B, H, 2]
+                z = z[..., 1]  # [B, H]
+                entropy = -(z_soft * torch.log(z_soft + eps)).sum(dim=-1).mean() 
+                # 如果采用softmax，不要打开entropy
         else:
             # 推理阶段：直接根据 Logit 确定 (相当于 tau -> 0)
             # 或者也可以用 sigmoid(logit/tau) > 0.5，但在 deterministic 模式下 logit > 0 即可
-            z_soft = torch.sigmoid(binary_logits / tau) 
-            z_hard = (z_soft > 0.5).float()
-            z = z_hard
-            entropy = None
+            # z_soft = torch.sigmoid(binary_logits / tau) 
+            if not self.use_softmax:
+                z_soft = torch.sigmoid(binary_logits / tau)
+                z_hard = (z_soft > 0.5).float()
+                z = z_hard
+            else:
+                z_soft = F.softmax(binary_logits / tau, dim=-1)
+                z_hard = z_soft.argmax(-1)
+                z = z_hard
         
         return {
             'pooled_hidden_states': pooled_hidden_states, # [B, H, D]
@@ -924,6 +935,7 @@ class Qwen3Attention(nn.Module):
             temp=getattr(config, "mask_temp", 3/2),
             hard=getattr(config, "mask_hard_sample", False),
             pooling_mode=getattr(config, "pooling_mode", "first_token"),
+            use_softmax=getattr(config, "use_softmax", False)
         )
 
         self.context_window_toggle = context_window_toggle

@@ -276,3 +276,8 @@ class TrainingArguments(HfTrainingArguments):
         default=False,
         metadata={"help": "Whether to enable task-specific lambda."},
     )
+    
+    use_softmax: bool = field(
+        default=False,
+        metadata={"help": "Whether to use softmax in attention routing."},
+    )
