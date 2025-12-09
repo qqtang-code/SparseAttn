@@ -428,8 +428,8 @@ class Trainer(HFTrainer):
         attn_mask = inputs["attention_mask"]
         valid_tokens = attn_mask.sum(dim=1)
         #print(attn_mask.shape)
-        print(f"Rank {torch.distributed.get_rank() if torch.distributed.is_initialized() else 0}: "
-            f"valid tokens per sample = {valid_tokens.tolist()}, total = {valid_tokens.sum().item()}")
+        # print(f"Rank {torch.distributed.get_rank() if torch.distributed.is_initialized() else 0}: "
+        #     f"valid tokens per sample = {valid_tokens.tolist()}, total = {valid_tokens.sum().item()}")
         
         #inputs['input_ids'].require_grad
         try:

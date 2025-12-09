@@ -433,15 +433,15 @@ class Trainer(HFTrainer):
         
         inputs = self.get_sequence_parallel_inputs(inputs)
         
-        print(f"[Step {self.state.global_step}] Sample tasks: {tasks} → sparsity: {[f'{s:.3f}' for s in target_sparsity.tolist()]}")
+        logger.info(f"[Step {self.state.global_step}] Sample tasks: {tasks} → Target Sparsity: {[f'{s:.3f}' for s in target_sparsity.tolist()]}")
+        
         attention_mask = inputs.get("attention_mask")
         valid_tokens = attention_mask.sum(dim=1)
-        print(f"Rank {torch.distributed.get_rank() if torch.distributed.is_initialized() else 0}: "
-            f"valid tokens per sample = {valid_tokens.tolist()}, total = {valid_tokens.sum().item()}")
 
         outputs = model(**inputs, use_cache=False, target_sparsity=target_sparsity)
 
         lm_loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+        head_entropy = outputs["head_entropy"]
         target_sparsity = outputs["target_sparsity"]
         
         if getattr(self.args, "token_scaled_loss", False):
@@ -474,19 +474,19 @@ class Trainer(HFTrainer):
 
         reg_loss = outputs["sparsity_loss"] if isinstance(outputs, dict) else outputs[-2]
         
-        gather_list = [
-            torch.zeros_like(reg_loss, device=reg_loss.device)
-            for _ in range(dist.get_world_size(group=self.seq_parallel_group))
-        ]
-        # detached gather —— 但保留本 rank 的梯度
-        dist.all_gather(gather_list, reg_loss.detach())
-        gather_list[dist.get_rank(group=self.seq_parallel_group)] = reg_loss
-        reg_loss = sum(gather_list)
+        # gather_list = [
+        #     torch.zeros_like(reg_loss, device=reg_loss.device)
+        #     for _ in range(dist.get_world_size(group=self.seq_parallel_group))
+        # ]
+        # # detached gather —— 但保留本 rank 的梯度
+        # dist.all_gather(gather_list, reg_loss.detach())
+        # gather_list[dist.get_rank(group=self.seq_parallel_group)] = reg_loss
+        # reg_loss = sum(gather_list)
         
         contrastive_loss = outputs["contrastive_loss"] if isinstance(outputs, dict) else outputs[-1]
         head_contrastive_loss = outputs["head_contrastive_loss"] if isinstance(outputs, dict) else outputs[-3]
         
-        loss = lm_loss + reg_loss + contrastive_loss + head_contrastive_loss
+        loss = lm_loss + reg_loss + contrastive_loss + head_contrastive_loss - 0.5 * head_entropy
         
         model_sparsity = outputs["model_sparsity"]
         
@@ -529,8 +529,7 @@ class Trainer(HFTrainer):
 
             logger.info(
                 f"@ {self.state.global_step} | Loss: {distributed_loss} | LM Loss: {distributed_lm_loss} | "
-                f"Reg Loss: {distributed_reg_loss} | contrastive_loss: {distributed_contrastive_loss} | head_contrastive_loss: {distributed_head_contrastive_loss} |"
-                f"Target Sparsity: {distributed_target_sparsity} | Model Sparsity: {distributed_model_sparsity}"
+                f"Reg Loss: {distributed_reg_loss} | contrastive_loss: {distributed_contrastive_loss} | head_contrastive_loss: {distributed_head_contrastive_loss} | Head Entropy: {head_entropy}"
                 + (" | " + " | ".join(extra) if len(extra) else "")
             )
             
@@ -593,6 +592,7 @@ class Trainer(HFTrainer):
                         if isinstance(distributed_head_contrastive_loss, torch.Tensor)
                         else distributed_head_contrastive_loss
                     ),
+                    "head_entropy": head_entropy.detach().item(),
                     "target_sparsity(avg)": distributed_target_sparsity.detach().float().mean().item(),
                     "model_sparsity(avg)": distributed_model_sparsity.detach().float().mean().item(),
                     "step": self.state.global_step,
