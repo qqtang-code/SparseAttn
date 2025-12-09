@@ -124,6 +124,7 @@ def main():
             topk_k=training_args.topk_k,
             disable_linear_regularization_term=training_args.disable_linear_regularization_term,
             pooling_mode=training_args.pooling_mode,
+            use_task_emb_for_mask=training_args.use_task_emb_for_mask,
             enable_contrastive_loss=training_args.enable_contrastive_loss,
             
             enable_ada_sparsity=training_args.enable_ada_sparsity,

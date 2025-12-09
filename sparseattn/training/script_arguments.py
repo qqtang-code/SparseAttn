@@ -198,6 +198,13 @@ class TrainingArguments(HfTrainingArguments):
         },
     )
 
+    use_task_emb_for_mask: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to use task embeddings for masking."
+        },
+    )
+    
     ## Streaming
     toggle_type: str = field(
         default="streaming",

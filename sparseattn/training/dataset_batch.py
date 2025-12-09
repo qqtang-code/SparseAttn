@@ -37,7 +37,7 @@ class DataArguments:
     apply_instruct_masks: bool = False
     prepack: bool = False
     streaming: bool = False
-    min_seq_len: Optional[int] = None
+    min_seq_len: Optional[int] = 1000
     task_type: str = "pretrain" 
     use_packing: bool = False
     data_cache_dir: Optional[str] = None
