@@ -433,7 +433,7 @@ class Trainer(HFTrainer):
         
         inputs = self.get_sequence_parallel_inputs(inputs)
         
-        print(f"[Step {self.state.global_step}] Sample tasks: {tasks[:3]} → sparsity: {[f'{s:.3f}' for s in target_sparsity[:3].tolist()]}")
+        print(f"[Step {self.state.global_step}] Sample tasks: {tasks} → sparsity: {[f'{s:.3f}' for s in target_sparsity.tolist()]}")
         attention_mask = inputs.get("attention_mask")
         valid_tokens = attention_mask.sum(dim=1)
         print(f"Rank {torch.distributed.get_rank() if torch.distributed.is_initialized() else 0}: "

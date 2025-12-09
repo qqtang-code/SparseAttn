@@ -655,7 +655,9 @@ class AttentionRouter(nn.Module):
         )
         
         self.cls_router_head_agnostic = nn.Sequential( 
-            nn.Linear(d_feature, d_feature),
+            nn.Linear(d_feature, 2 * d_feature),
+            nn.SiLU(),
+            nn.Linear(2 * d_feature, d_feature),
             nn.SiLU(),
             nn.Linear(d_feature, 1),
         )
@@ -674,9 +676,12 @@ class AttentionRouter(nn.Module):
     def reset_parameters(self):
         nn.init.kaiming_uniform_(self.cls_router_head_agnostic[0].weight, a=math.sqrt(5))
         nn.init.zeros_(self.cls_router_head_agnostic[0].bias)
+        
+        nn.init.kaiming_uniform_(self.cls_router_head_agnostic[2].weight, a=math.sqrt(5))
+        nn.init.zeros_(self.cls_router_head_agnostic[2].bias)
 
-        nn.init.zeros_(self.cls_router_head_agnostic[2].weight)
-        nn.init.constant_(self.cls_router_head_agnostic[2].bias, 1.0)
+        nn.init.zeros_(self.cls_router_head_agnostic[4].weight)
+        nn.init.constant_(self.cls_router_head_agnostic[4].bias, 1.0)
 
         
     def forward(
@@ -738,11 +743,8 @@ class AttentionRouter(nn.Module):
             eps = 1e-8
             g = -torch.log(-torch.log(u + eps) + eps)
             
-            # 连续松弛 (Continuous Relaxation): z_soft \in (0, 1)
-            # 公式: sigmoid((logit + g) / tau)
             z_soft = torch.sigmoid((binary_logits + g) / tau)
             
-            # 硬化 (Hard Thresholding): z_hard \in {0, 1}
             z_hard = (z_soft > 0.5).float()
             
             # --- 3. STE (Straight-Through Estimator) ---
@@ -1252,28 +1254,17 @@ class Qwen3Attention(nn.Module):
             z = z_kv.unsqueeze(-1).expand(-1, self.num_key_value_groups).reshape(-1)
         else:
             if unpadded_lengths is not None:
-                res = self.mask_allocator(q, unpadded_lengths[0], range_ids, task_ids)
+                res = self.mask_allocator(k, unpadded_lengths[0], range_ids, task_ids)
                 z_kv_batch, pooled_hidden_states = res['sparse_mask'], res['pooled_hidden_states']
                 z_constrast = res['decisions']
             else:
-                res = self.mask_allocator(q, None, range_ids, task_ids)
+                res = self.mask_allocator(k, None, range_ids, task_ids)
                 z_kv_batch, pooled_hidden_states = res['sparse_mask'], res['pooled_hidden_states']
                 z_constrast = res['decisions']
-                
-            if z_kv_batch.shape[-1] == self.num_key_value_heads:
-                z_kv_batch = (
-                    z_kv_batch.unsqueeze(-1)              # [B, num_kv, 1]
-                    .expand(-1, -1, self.num_key_value_groups)  # [B, num_kv, num_groups]
-                    .reshape(z_kv_batch.size(0), -1)      # [B, num_kv * num_groups]
-                )
-                
-                z_constrast = (
-                    z_constrast.unsqueeze(-1)              # [B, num_kv, 1]
-                    .expand(-1, -1, self.num_key_value_groups)  # [B, num_kv, num_groups]
-                    .reshape(z_constrast.size(0), -1)      # [B, num_kv * num_groups]
-                )
 
-            z = z_kv_batch
+            if z_kv_batch.shape[-2] == self.num_key_value_heads:
+                z_kv_batch = z_kv_batch.repeat_interleave(self.num_key_value_groups, 1)
+
         has_layer_past = past_key_value is not None
         if has_layer_past:
             past_kv = past_key_value[0]
@@ -1336,14 +1327,14 @@ class Qwen3Attention(nn.Module):
             attention_func = self.interpolated_attention
             kwargs = {}
 
-        attn_output = attention_func(q, kv, k, v, unpadded_lengths, z, **kwargs)
+        attn_output = attention_func(q, kv, k, v, unpadded_lengths, z_kv_batch, **kwargs)
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output.to(self.o_proj.weight.dtype))
 
         attn_weights = None        
         # print(f"task id: {task_ids}, layer sparsity: {z.squeeze(-1).sum(dim=-1)}")
         # z: [B, H, 1] -> [B, H] -> [B]
-        return z.squeeze(-1).sum(dim=-1), pooled_hidden_states, z_constrast.squeeze(-1), attn_output, attn_weights, past_key_value
+        return z_kv_batch.squeeze(-1).sum(dim=-1), pooled_hidden_states, z_constrast.squeeze(-1), attn_output, attn_weights, past_key_value
 
 
 class Qwen3DecoderLayer(nn.Module):
