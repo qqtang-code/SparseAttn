@@ -1276,8 +1276,6 @@ class Qwen3Attention(nn.Module):
             
             z_kv_batch, entropy, pooled_hidden_states = res['sparse_mask'], res['entropy'], res['pooled_hidden_states']
             z_constrast = res['decisions']
-            
-            breakpoint()
 
             if z_kv_batch.shape[-2] == self.num_key_value_heads:
                 z_kv_batch = z_kv_batch.repeat_interleave(self.num_key_value_groups, 1)
