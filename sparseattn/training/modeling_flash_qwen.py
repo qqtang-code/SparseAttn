@@ -757,6 +757,7 @@ class AttentionRouter(nn.Module):
                 z_hard = torch.zeros_like(z_soft).scatter_(-1, z_soft.argmax(-1, keepdim=True), 1.0)
                 z = z_hard + (z_soft - z_soft.detach())  # [B, H, 2]
                 z = z[..., 1]  # [B, H]
+                z = z.unsqueeze(-1)
                 entropy = -(z_soft * torch.log(z_soft + eps)).sum(dim=-1).mean() 
                 # 如果采用softmax，不要打开entropy
         else:
@@ -1275,6 +1276,8 @@ class Qwen3Attention(nn.Module):
             
             z_kv_batch, entropy, pooled_hidden_states = res['sparse_mask'], res['entropy'], res['pooled_hidden_states']
             z_constrast = res['decisions']
+            
+            breakpoint()
 
             if z_kv_batch.shape[-2] == self.num_key_value_heads:
                 z_kv_batch = z_kv_batch.repeat_interleave(self.num_key_value_groups, 1)
