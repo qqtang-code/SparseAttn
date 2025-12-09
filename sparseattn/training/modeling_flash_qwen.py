@@ -2003,36 +2003,36 @@ class Qwen3Model(Qwen3PreTrainedModel):
             if target_sparsity is None:
                 z_loss = None
             else:
-                
-                # diff = (model_sparsity * 100 - target_sparsity * 100)
+                if self.config.enable_lambda_task:
+                    diff = (model_sparsity * 100 - target_sparsity * 100)
 
-                # # per-sample lambda
-                # lambda1_per_sample = self.sparsity_lambda1_task[task_ids]   # [B]
-                # # lambda2_per_sample = self.sparsity_lambda2_task[task_ids]   # [B]
+                    # per-sample lambda
+                    lambda1_per_sample = self.sparsity_lambda1_task[task_ids]   # [B]
+                    lambda2_per_sample = self.sparsity_lambda2_task[task_ids]   # [B]
 
-                # # per-sample loss
-                # per_sample_loss = (
-                #     lambda1_per_sample * diff
-                #     # + lambda2_per_sample * diff.pow(2)
-                # )
+                    # per-sample loss
+                    per_sample_loss = (
+                        lambda1_per_sample * diff
+                        + lambda2_per_sample * diff.pow(2)
+                    )
 
-                # log_z_loss = per_sample_loss.detach()
+                    log_z_loss = per_sample_loss.detach()
 
-                # task_losses = []
-                # for task_id in range(self.num_tasks):
-                #     mask = (task_ids == task_id)
-                #     if mask.sum() > 0:
-                #         task_losses.append(per_sample_loss[mask].mean())
+                    task_losses = []
+                    for task_id in range(self.num_tasks):
+                        mask = (task_ids == task_id)
+                        if mask.sum() > 0:
+                            task_losses.append(per_sample_loss[mask].mean())
 
-                # z_loss = torch.stack(task_losses).mean()
-                
-                z_loss = (
-                    (model_sparsity * 10 - target_sparsity * 10).abs()
-                    # + ((model_sparsity - target_sparsity) ** 2)
-                )
-                log_z_loss = z_loss.detach()
-                
-                z_loss = z_loss.mean() 
+                    z_loss = torch.stack(task_losses).mean()
+                else:
+                    z_loss = (
+                        (model_sparsity * 10 - target_sparsity * 10).abs()
+                        # + ((model_sparsity - target_sparsity) ** 2)
+                    )
+                    log_z_loss = z_loss.detach()
+                    
+                    z_loss = z_loss.mean() 
                 
         else:
             layerwise_model_sparsity = None
