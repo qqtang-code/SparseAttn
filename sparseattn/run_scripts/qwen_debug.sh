@@ -53,13 +53,6 @@ erank_analysis_path="/"
 # Dataset configuration
 dataset=${DATASET:-"/data2/public_data/qwen_mix_sft_32K_4task"}
 task_type="sft" # pretrain or sft
-extra_name="debug_11.30"
-if [[ $freeze_weights == "true" ]]; then
-    extra_name="${extra_name}_wfrozen"
-fi
-if [[ $freeze_masks == "true" ]]; then
-    extra_name="${extra_name}_mfrozen"
-fi
 
 run_name="overfit_quick_sparsity_v2"
 
