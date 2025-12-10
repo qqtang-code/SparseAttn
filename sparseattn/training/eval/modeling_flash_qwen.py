@@ -1331,27 +1331,32 @@ class Qwen3Attention(nn.Module):
         q = self.q_norm(self.q_proj(hidden_states).view(hidden_shape))
         k = self.k_norm(self.k_proj(hidden_states).view(hidden_shape))
         v = self.v_proj(hidden_states).view(hidden_shape)
-        if not self.config.enable_ada_sparsity:
-            z_kv = get_mask(
-                self.attn_mask_log_alphas,
-                training=self.training,
-                threshold_for_deterministic=self.threshold_for_deterministic,
-            )  # (num_key_value_heads,)
-            # Next: expand z_kv to (num_key_value_heads, num_key_value_groups) and then flatten it to (num_heads)
-            z = z_kv.unsqueeze(-1).expand(-1, self.num_key_value_groups).reshape(-1)
-        else:
-            if unpadded_lengths is not None:
-                res = self.mask_allocator(k, unpadded_lengths[0], range_ids, task_ids)
-            else:
-                res = self.mask_allocator(k, None, range_ids, task_ids)
-            
-            z_kv_batch, entropy, pooled_hidden_states = res['sparse_mask'], res['entropy'], res['pooled_hidden_states']
-            z_constrast = res['decisions']
-
-            if z_kv_batch.shape[-2] == self.num_key_value_heads:
-                z_kv_batch = z_kv_batch.repeat_interleave(self.num_key_value_groups, 1)
-
         has_layer_past = past_key_value is not None
+        
+        if not has_layer_past:
+            if not self.config.enable_ada_sparsity:
+                z_kv = get_mask(
+                    self.attn_mask_log_alphas,
+                    training=self.training,
+                    threshold_for_deterministic=self.threshold_for_deterministic,
+                )  # (num_key_value_heads,)
+                # Next: expand z_kv to (num_key_value_heads, num_key_value_groups) and then flatten it to (num_heads)
+                z = z_kv.unsqueeze(-1).expand(-1, self.num_key_value_groups).reshape(-1)
+            else:
+                if unpadded_lengths is not None:
+                    res = self.mask_allocator(k, unpadded_lengths[0], range_ids, task_ids)
+                else:
+                    res = self.mask_allocator(k, None, range_ids, task_ids)
+                
+                z_kv_batch, entropy, pooled_hidden_states = res['sparse_mask'], res['entropy'], res['pooled_hidden_states']
+                z_constrast = res['decisions']
+
+                if z_kv_batch.shape[-2] == self.num_key_value_heads:
+                    z_kv_batch = z_kv_batch.repeat_interleave(self.num_key_value_groups, 1)
+        else:
+            # decode
+            z_kv_batch = past_key_value[2]
+
         if has_layer_past:
             past_kv = past_key_value[0]
             past_len = past_key_value[1]
@@ -1390,30 +1395,91 @@ class Qwen3Attention(nn.Module):
             kv = past_kv[:, :new_len]
         else:
             past_kv = kv
-        past_key_value = (past_kv, past_len + q.size(1)) if use_cache else None
+        past_key_value = (past_kv, past_len + q.size(1), z_kv_batch) if use_cache else None
+             
+        if not has_layer_past:
 
-        if (
-            seq_parallel_group is not None
-            and dist.is_initialized()
-            and dist.get_world_size(seq_parallel_group) > 1
-        ):
-            attention_func = self.distributed_attn_func
-            kwargs = {
-                "group": seq_parallel_group,
-                "gather_idx": (0 if unpadded_lengths is not None else 1),
-            }
-            if not self.config.enable_ada_sparsity:
-                z = torch.split(
-                    z, self.num_heads // dist.get_world_size(seq_parallel_group), dim=0
-                )[dist.get_rank(seq_parallel_group)]
+            is_vlen_input = (q.dim() == 3) and (unpadded_lengths is not None)
+
+            if is_vlen_input:
+                k = k.repeat_interleave(self.num_key_value_groups, dim=1)
+                v = v.repeat_interleave(self.num_key_value_groups, dim=1)
+                q, k, v = q.transpose(0, 1).contiguous(), k.transpose(0, 1).contiguous(), v.transpose(0, 1).contiguous() 
             else:
-                z_splits = torch.split(z, self.num_heads // dist.get_world_size(seq_parallel_group), dim=1)
-                z = z_splits[dist.get_rank(seq_parallel_group)]
-        else:
-            attention_func = self.interpolated_attention
-            kwargs = {}
+                k = k.repeat_interleave(self.num_key_value_groups, dim=2)
+                v = v.repeat_interleave(self.num_key_value_groups, dim=2)
+                q, k, v = q.transpose(1, 2).contiguous(), k.transpose(1, 2).contiguous(), v.transpose(1, 2).contiguous() 
+                
+            stride = self.xattn_params["stride"]
+            threshold = self.xattn_params["threshold"]
+            norm = self.xattn_params["norm"]
 
-        attn_output = attention_func(q, kv, k, v, unpadded_lengths, z_kv_batch, **kwargs)
+            if unpadded_lengths is not None:
+                cu_seqlens, max_seqlen = unpadded_lengths
+                cw_attn_output = Xattention_prefill_dim3(
+                    q,
+                    k,
+                    v,
+                    stride,
+                    cu_seqlens,
+                    norm,
+                    threshold,
+                    use_triton=True,
+                )
+
+            else:
+                bsz,_,seqlen,_ = q.size()
+                if not torch.is_tensor(seqlen):
+                    seqlen = torch.tensor(seqlen, dtype=torch.int32, device=q.device)
+                max_seqlen = torch.max(seqlen).item()
+
+                cu_seqlens = torch.arange(
+                    0, (bsz + 1) * seqlen, step=seqlen, dtype=torch.int32, device=q.device
+                )
+                unpadded_lengths = (cu_seqlens, max_seqlen)
+
+                cu_seqlens, max_seqlen = unpadded_lengths
+                
+                head_mask_type = (1 - z_kv_batch[0, :, 0]).int()# block sparse attention must
+                attn_output = Xattention_prefill_dim4(
+                    q,
+                    k,
+                    v,
+                    stride,
+                    cu_seqlens,
+                    norm,
+                    threshold,
+                    use_triton=True,
+                    head_mask_type=head_mask_type
+                ).transpose(1, 2)  # B, T, H, D
+        else:
+            if unpadded_lengths is not None:
+                # varlen, ignore padding tokens, efficient for large batch with many paddings
+                cu_seqlens, max_seqlen = unpadded_lengths
+
+                attn_output, _, attn_probs = flash_attn_varlen_kvpacked_func(
+                    q,
+                    kv,
+                    cu_seqlens,
+                    cu_seqlens,
+                    max_seqlen,
+                    max_seqlen,
+                    dropout_p=0.0,
+                    softmax_scale=1.0 / self.norm_factor,
+                    causal=True,
+                    return_attn_probs=True,
+                )
+            else:
+                attn_output, _, attn_probs = flash_attn_kvpacked_func(
+                    q,
+                    kv,
+                    dropout_p=0.0,
+                    softmax_scale=1.0 / self.norm_factor,
+                    causal=True,
+                    return_attn_probs=True,
+                )
+        
+        
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output.to(self.o_proj.weight.dtype))
 
@@ -1423,7 +1489,7 @@ class Qwen3Attention(nn.Module):
             print(f"task_ids: {task_ids}, head allocate: {[x.tolist() for x in z_kv_batch]}")
         
         # z: [B, H, 1] -> [B, H] -> [B]
-        return z_kv_batch.squeeze(-1).sum(dim=-1), entropy.mean(), pooled_hidden_states, z_constrast.squeeze(-1), attn_output, attn_weights, past_key_value
+        return z_kv_batch.squeeze(-1).sum(dim=-1), None, None, None, attn_output, attn_weights, past_key_value
 
 
 class Qwen3DecoderLayer(nn.Module):

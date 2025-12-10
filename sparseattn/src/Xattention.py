@@ -824,6 +824,7 @@ def Xattention_prefill_dim4(
     chunk_size=None,
     keep_sink=False,
     keep_recent=False,
+    head_mask_type=None,
 ):
     batch_size, num_heads, max_q_len, head_dim = query_states.shape
     _, _, max_k_len, _ = key_states.shape
@@ -965,7 +966,7 @@ def Xattention_prefill_dim4(
     key_states = unpadded_key_states
     value_states = unpadded_value_states
     
-    head_mask_type = torch.tensor(
+    head_mask_type = head_mask_type if head_mask_type is not None else torch.tensor(
         [1 for _ in range(num_heads)], device=query_states.device, dtype=torch.int32
     )
     assert head_mask_type.device == query_states.device
@@ -976,6 +977,11 @@ def Xattention_prefill_dim4(
     
     max_q_block_num = (max_q_len + block_size - 1) // block_size
     max_k_block_num = (max_k_len + block_size - 1) // block_size
+    
+    # head_mask_type
+    mask = (head_mask_type == 1)
+    blockmask = approx_simple_mask[:, mask, :max_q_block_num, :max_k_block_num].contiguous()
+    
     attn_output = block_sparse_attn_func(
         query_states,
         key_states,
@@ -984,7 +990,7 @@ def Xattention_prefill_dim4(
         cu_seq_lens,
         head_mask_type,
         None,
-        approx_simple_mask[:, :, :max_q_block_num, :max_k_block_num].contiguous(),
+        blockmask,
         max_q_len,
         max_k_len, 
         p_dropout=0.0,
