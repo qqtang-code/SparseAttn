@@ -1364,8 +1364,6 @@ class Qwen3Attention(nn.Module):
         q, k = self.rotary_emb(q, k, past_len, unpadded_lengths)
         
         kv = torch.stack([k, v], -3)
-        if self.num_key_value_groups > 1:
-            kv = kv.repeat_interleave(self.num_key_value_groups, dim=-2)
 
         # Cache QKV values
         if has_layer_past:
@@ -1448,6 +1446,8 @@ class Qwen3Attention(nn.Module):
                     head_mask_type=head_mask_type
                 ).transpose(1, 2)  # B, T, H, D
         else:
+            if self.num_key_value_groups > 1:
+                kv = kv.repeat_interleave(self.num_key_value_groups, dim=-2)
             if unpadded_lengths is not None:
                 # varlen, ignore padding tokens, efficient for large batch with many paddings
                 cu_seqlens, max_seqlen = unpadded_lengths

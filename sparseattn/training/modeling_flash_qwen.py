@@ -770,6 +770,8 @@ class AttentionRouter(nn.Module):
                 z_hard = torch.zeros_like(z_soft).scatter_(-1, z_soft.argmax(-1, keepdim=True), 1.0)
                 z = z_hard + (z_soft - z_soft.detach())  # [B, H, 2]
                 z = z[..., 1]  # [B, H]
+                z_soft = z_soft[..., 1]
+                z_soft = z_soft.unsqueeze(-1)
                 z = z.unsqueeze(-1)
                 entropy = -(z_soft * torch.log(z_soft + eps)).sum(dim=-1).mean() 
         else:
