@@ -722,12 +722,7 @@ class AttentionRouter(nn.Module):
                 pooled_latent = self._segment_pooling_single_batch(
                     x, range_ids, ['q'])
         elif self.pooling_mode == 'ctx_q':
-            if cu_seq_len is not None:
-                pooled_latent = self._segment_pooling(
-                    x, range_ids, ['ctx', 'q'], cu_seq_len)  # [B, H, D]
-            else:
-                pooled_latent = self._segment_pooling_single_batch(
-                    x, range_ids, ['ctx', 'q'])
+            pooled_latent = x.mean(dim=1)
         else:
             raise ValueError(f"Unknown pooling_mode: {self.pooling_mode}")
         
@@ -1457,7 +1452,7 @@ class Qwen3Attention(nn.Module):
                 # varlen, ignore padding tokens, efficient for large batch with many paddings
                 cu_seqlens, max_seqlen = unpadded_lengths
 
-                attn_output, _, attn_probs = flash_attn_varlen_kvpacked_func(
+                attn_output = flash_attn_varlen_kvpacked_func(
                     q,
                     kv,
                     cu_seqlens,
@@ -1467,16 +1462,16 @@ class Qwen3Attention(nn.Module):
                     dropout_p=0.0,
                     softmax_scale=1.0 / self.norm_factor,
                     causal=True,
-                    return_attn_probs=True,
+                    return_attn_probs=False,
                 )
             else:
-                attn_output, _, attn_probs = flash_attn_kvpacked_func(
+                attn_output = flash_attn_kvpacked_func(
                     q,
                     kv,
                     dropout_p=0.0,
                     softmax_scale=1.0 / self.norm_factor,
                     causal=True,
-                    return_attn_probs=True,
+                    return_attn_probs=False,
                 )
         
         
@@ -1485,8 +1480,8 @@ class Qwen3Attention(nn.Module):
 
         attn_weights = None
         
-        if not has_layer_past:
-            print(f"task_ids: {task_ids}, head allocate: {[x.tolist() for x in z_kv_batch]}")
+        # if not has_layer_past:
+        #     print(f"task_ids: {task_ids}, head allocate: {[x.tolist() for x in z_kv_batch]}")
         
         # z: [B, H, 1] -> [B, H] -> [B]
         return z_kv_batch.squeeze(-1).sum(dim=-1), None, None, None, attn_output, attn_weights, past_key_value
@@ -2259,7 +2254,7 @@ class PawQwen3ForCausalLM(Qwen3PreTrainedModel):
 
             logits = None
         else:
-            logits = self.lm_head(hidden_states)
+            logits = self.lm_head(hidden_states[:, -1:, :])
             loss = None
         if not return_dict:
             output = (logits,) + outputs[1:]
