@@ -74,7 +74,7 @@ def main():
 
     df = pd.read_parquet(file_path)
 
-    target_task = "Single QA"# Single QA, Summarization
+    target_task = "Summarization"# Single QA, Summarization
 
     df["task"] = df["metadata"].apply(get_task)
 

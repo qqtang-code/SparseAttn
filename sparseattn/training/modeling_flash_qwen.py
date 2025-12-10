@@ -81,6 +81,9 @@ class PawQwen3Config(Qwen3Config):
         self.toggle_type = kwargs.pop("toggle_type", "streaming")
         self.sink_size = kwargs.pop("sink_size", 128)
         
+        # retrieval_mode
+        self.retrieval_mode = kwargs.pop("retrieval_mode", "full")
+        
         # Head Router
         self.pooling_mode = kwargs.pop("pooling_mode", "first_token")
         
@@ -953,6 +956,8 @@ class Qwen3Attention(nn.Module):
         self.toggle_type = config.toggle_type
         self.sink_blocks = (config.sink_size + 127) // 128
         self.local_blocks = (config.local_window_size + 127) // 128
+        
+        self.retrieval_mode = getattr(config, "retrieval_mode", "full")
 
         if self.toggle_type == "streaming":
             self.streaming_info_kwargs = {
@@ -973,7 +978,7 @@ class Qwen3Attention(nn.Module):
             self.topk_k = int(getattr(config, "topk_k", 2048))
             self.topk_q_chunk = int(os.environ.get("TOPK_Q_CHUNK", 128))
             self.topk_k_chunk = int(os.environ.get("TOPK_K_CHUNK", 4096))
-        elif self.toggle_type == "xattn":
+        elif self.toggle_type == "xattn" or self.retrieval_mode == "xattn":
             from sparseattn.utils.ops.xattention_fa import xattn_flash_attn_func
             self.streaming_info_kwargs = {
                 "sink_block_num": self.sink_blocks,
@@ -1045,30 +1050,88 @@ class Qwen3Attention(nn.Module):
         )
 
     def interpolated_attention(self, q, kv, k, v, unpadded_lengths, z):
-        if unpadded_lengths is not None:
-            # varlen, ignore padding tokens, efficient for large batch with many paddings
-            cu_seqlens, max_seqlen = unpadded_lengths
-            attn_output = flash_attn_varlen_kvpacked_func(
-                q,
-                kv,
-                cu_seqlens,
-                cu_seqlens,
-                max_seqlen,
-                max_seqlen,
-                dropout_p=0.0,
-                softmax_scale=1.0 / self.norm_factor,
-                causal=True,
-                return_attn_probs=False,
-            )
+        if self.retrieval_mode == "full":
+            if unpadded_lengths is not None:
+                # varlen, ignore padding tokens, efficient for large batch with many paddings
+                cu_seqlens, max_seqlen = unpadded_lengths
+                attn_output = flash_attn_varlen_kvpacked_func(
+                    q,
+                    kv,
+                    cu_seqlens,
+                    cu_seqlens,
+                    max_seqlen,
+                    max_seqlen,
+                    dropout_p=0.0,
+                    softmax_scale=1.0 / self.norm_factor,
+                    causal=True,
+                    return_attn_probs=False,
+                )
+            else:
+                attn_output = flash_attn_kvpacked_func(
+                    q,
+                    kv,
+                    dropout_p=0.0,
+                    softmax_scale=1.0 / self.norm_factor,
+                    causal=True,
+                    return_attn_probs=False,
+                )
+        elif self.retrieval_mode == "xattn":
+            is_vlen_input = (q.dim() == 3) and (unpadded_lengths is not None)
+
+            if is_vlen_input:
+                k = k.repeat_interleave(self.num_key_value_groups, dim=1)
+                v = v.repeat_interleave(self.num_key_value_groups, dim=1)
+                q, k, v = q.transpose(0, 1).contiguous(), k.transpose(0, 1).contiguous(), v.transpose(0, 1).contiguous() 
+            else:
+                k = k.repeat_interleave(self.num_key_value_groups, dim=2)
+                v = v.repeat_interleave(self.num_key_value_groups, dim=2)
+                q, k, v = q.transpose(1, 2).contiguous(), k.transpose(1, 2).contiguous(), v.transpose(1, 2).contiguous() 
+                
+            stride = self.xattn_params["stride"]
+            threshold = self.xattn_params["threshold"]
+            norm = self.xattn_params["norm"]
+
+            if unpadded_lengths is not None:
+                cu_seqlens, max_seqlen = unpadded_lengths
+                attn_output = Xattention_prefill_dim3(
+                    q,
+                    k,
+                    v,
+                    stride,
+                    cu_seqlens,
+                    norm,
+                    threshold,
+                    use_triton=True,
+                )
+
+            else:
+                bsz,_,seqlen,_ = q.size()
+                if not torch.is_tensor(seqlen):
+                    seqlen = torch.tensor(seqlen, dtype=torch.int32, device=q.device)
+                max_seqlen = torch.max(seqlen).item()
+
+                cu_seqlens = torch.arange(
+                    0, (bsz + 1) * seqlen, step=seqlen, dtype=torch.int32, device=q.device
+                )
+                unpadded_lengths_xattn = (cu_seqlens, max_seqlen)
+
+                cu_seqlens, max_seqlen = unpadded_lengths_xattn
+                attn_output = Xattention_prefill_dim4(
+                    q,
+                    k,
+                    v,
+                    stride,
+                    cu_seqlens,
+                    norm,
+                    threshold,
+                    use_triton=True,
+                ).transpose(1, 2)  # B, T, H, D
+            if is_vlen_input:
+                q = q.transpose(0, 1).contiguous()
+            else:
+                q = q.transpose(1, 2).contiguous()
         else:
-            attn_output = flash_attn_kvpacked_func(
-                q,
-                kv,
-                dropout_p=0.0,
-                softmax_scale=1.0 / self.norm_factor,
-                causal=True,
-                return_attn_probs=False,
-            )
+            raise ValueError(f"Unknown retrieval mode: {self.retrieval_mode}")
 
         if self.toggle_type == "streaming" or self.toggle_type == "triangle":
             # breakpoint()

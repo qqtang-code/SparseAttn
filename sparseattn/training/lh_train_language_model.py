@@ -119,6 +119,7 @@ def main():
             revision=script_args.model_revision,
             use_auth_token=True if script_args.use_auth_token else None,
             toggle_type=training_args.toggle_type,
+            retrieval_mode=training_args.retrieval_mode,
             local_window_size=training_args.context_window_if_toggled,
             sink_size=training_args.sink_size,
             topk_k=training_args.topk_k,
