@@ -371,6 +371,7 @@ def main():
             collate_fn=data_collator,
             num_workers=training_args.dataloader_num_workers,
             pin_memory=training_args.dataloader_pin_memory,
+            drop_last=True, 
         )
         
     if training_args.do_eval:

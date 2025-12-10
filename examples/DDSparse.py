@@ -44,9 +44,20 @@ def load_sparse_model(model_path):
     )
     return model
 
+def get_task(metadata_str):
+    try:
+        if isinstance(metadata_str, str):
+            meta_dict = ast.literal_eval(metadata_str)
+        elif isinstance(metadata_str, dict):
+            meta_dict = metadata_str
+        else:
+            return None
+        return meta_dict.get('task')
+    except Exception:
+        return None
 
 def main():
-    model_path = "/data1/lcm_lab/qqt/SparseAttn/sparseattn/checkpoints/steps125_qwen_mix_sft_32K_xattn_mlp_linear_first_token_10reg_nolambda_abs*100_head_contrast_wfrozen"
+    model_path = "/data1/lcm_lab/qqt/SparseAttn/sparseattn/checkpoints/qwen3-4b-lm-reg-softmaxmlp"
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
@@ -54,6 +65,26 @@ def main():
     
     from datasets import Dataset as HFDataset
     from sparseattn.training.dataset_batch import ParquetDataset
+
+    import pandas as pd
+    import ast
+    import numpy as np
+
+    file_path = "/data2/public_data/qwen_mix_sft_32K/all.parquet"
+
+    df = pd.read_parquet(file_path)
+
+    target_task = "Single QA"# Single QA, Summarization
+
+    df["task"] = df["metadata"].apply(get_task)
+
+    df_target = df[df["task"] == target_task]
+
+    row = df_target.iloc[0]
+    prompt = row['question']
+    context = row['context']
+    answer = row['answer']
+    metadata = row['metadata']
 
     dummy_data = {
         "context": [""],
@@ -77,13 +108,11 @@ def main():
 
     model.eval()
 
-    prompt = "Hello, how are you?"
-
     fake_item = {
-        "context": "",                     # no context
-        "question": prompt,                # your prompt
-        "answer": "",                      # empty for inference
-        "metadata": {"task": "Summarization", "flag": "0"}, # Single QA, Summarization
+        "context": context,                  
+        "question": prompt,               
+        "answer": answer,           
+        "metadata": metadata,# Single QA, Summarization
     }
 
     input_ids, labels, attention_mask, segment_ids, range_ids, class_id = dataset._build_sft_input_and_labels(
@@ -108,7 +137,7 @@ def main():
     with torch.no_grad():
         outputs = model.generate(
             **model_inputs,
-            max_new_tokens=50,
+            max_new_tokens=10,
             use_cache=True,
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id,

@@ -19,14 +19,18 @@
 # limitations under the License.
 """PyTorch Qwen3 model."""
 
+from typing import List, Optional, Tuple, Union, Any
 
-import os
 import torch
-import math
 import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import nn
+from torch.nn import CrossEntropyLoss
+
 import torch.distributed as dist
+
+import os
+
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
@@ -37,10 +41,13 @@ from transformers.utils import logging, ModelOutput, LossKwargs
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.processing_utils import Unpack
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
+
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
 from flash_attn import flash_attn_kvpacked_func, flash_attn_varlen_kvpacked_func
 from flash_attn.bert_padding import unpad_input, pad_input
-from typing import List, Optional, Tuple, Union, Any
+import math
+
 try:
     from flash_attn.layers.rotary import apply_rotary_emb_func
 except ImportError:
@@ -70,6 +77,8 @@ class PawQwen3Config(Qwen3Config):
         
         # Head Router
         self.pooling_mode = kwargs.pop("pooling_mode", "first_token")
+        
+        self.use_task_emb_for_mask = kwargs.pop("use_task_emb_for_mask", False)
 
         # TriangleMix
         self.triangle_n_last = kwargs.pop("triangle_n_last", 128)
@@ -97,7 +106,9 @@ class PawQwen3Config(Qwen3Config):
         # 新增：top-k 注意力的超参（每个 query 仅保留前 k 个 key）
         self.topk_k = kwargs.pop("topk_k", 32)
         self.pooling_seq = kwargs.pop("pooling_seq", True)
-
+        self.enable_lambda_task = kwargs.pop("enable_lambda_task", False)
+        self.use_softmax = kwargs.pop("use_softmax", False)
+        
         super().__init__(*args, **kwargs)
 
 
@@ -610,36 +621,43 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 class AttentionRouter(nn.Module):
     def __init__(self, input_dim, num_key_value_heads, d_feature=128,
-                 use_task_emb=False, temp=2/3, hard=False, 
+                 use_task_emb=False, temp=3/2, hard=False, 
                  router_type='mlp', use_gumbel=True, learnable_temp=False,
-                 dropout=0.1, layernorm=True, pooling_mode='ctx_q'):
+                 dropout=0.1, use_softmax=True, pooling_mode='ctx_q'):
         super().__init__()
         self.num_kv = num_key_value_heads
-        self.temp = temp
-        self.hard = hard
         self.use_task_emb = use_task_emb
         self.router_type = router_type
         self.use_gumbel = use_gumbel
         self.learnable_temp = learnable_temp
         self.pooling_mode = pooling_mode
-        
-        # binary cls
-        # self.cls_net = nn.Sequential( 
-        #     nn.Linear(d_feature, 2 * d_feature),
-        #     nn.SiLU(),
-        #     nn.Linear(2 * d_feature, d_feature),
-        #     nn.SiLU(),
-        #     nn.Linear(d_feature, 1)
-        # )
-        
+        self.use_softmax = use_softmax
+
         self.cls_feat_extractor = nn.Sequential( 
             nn.Linear(d_feature, 2 * d_feature),
             nn.SiLU(),
             nn.Linear(2 * d_feature, d_feature),
         )
         
-        self.cls_router_head_agnostic = nn.Linear(d_feature, 1)
-
+        if self.use_softmax:
+            logger.info("using softmax for attention router")
+            self.cls_router_head_agnostic = nn.Sequential( 
+                nn.Linear(d_feature, 2 * d_feature),
+                nn.SiLU(),
+                nn.Linear(2 * d_feature, d_feature),
+                nn.SiLU(),
+                nn.Linear(d_feature, 2),
+            )
+        else:
+            logger.info("use sigmoid function for attention router")
+            self.cls_router_head_agnostic = nn.Sequential( 
+                nn.Linear(d_feature, 2 * d_feature),
+                nn.SiLU(),
+                nn.Linear(2 * d_feature, d_feature),
+                nn.SiLU(),
+                nn.Linear(d_feature, 1),
+                nn.LayerNorm([self.num_kv, 1], elementwise_affine=False)
+            )
         
         if self.use_task_emb:
             self.task_embedding = nn.Embedding(4, d_feature)
@@ -650,6 +668,17 @@ class AttentionRouter(nn.Module):
         else:
             self.register_buffer("log_temp", torch.log(torch.tensor(temp)))
             self.tau = torch.exp(self.log_temp).clamp(0.3, 1.0)
+    
+    def reset_parameters(self):
+        nn.init.kaiming_uniform_(self.cls_router_head_agnostic[0].weight, a=math.sqrt(5))
+        nn.init.zeros_(self.cls_router_head_agnostic[0].bias)
+        
+        nn.init.kaiming_uniform_(self.cls_router_head_agnostic[2].weight, a=math.sqrt(5))
+        nn.init.zeros_(self.cls_router_head_agnostic[2].bias)
+
+        nn.init.zeros_(self.cls_router_head_agnostic[4].weight)
+        nn.init.constant_(self.cls_router_head_agnostic[4].bias, 1.0)
+
         
     def forward(
         self, 
@@ -685,7 +714,6 @@ class AttentionRouter(nn.Module):
         else:
             raise ValueError(f"Unknown pooling_mode: {self.pooling_mode}")
         
-        
         if self.use_task_emb:
             if self.training:
                 task_emb = self.task_embedding(task_ids) # [B, D]
@@ -693,49 +721,65 @@ class AttentionRouter(nn.Module):
                 pooled_latent = pooled_latent + task_emb_expanded
             else:
                 pooled_latent = pooled_latent
-                
+                                
         pooled_hidden_states = self.cls_feat_extractor(pooled_latent)
-        binary_logits = self.cls_router_head_agnostic(pooled_hidden_states)  # [B, H, 2]
+
+        binary_logits = self.cls_router_head_agnostic(pooled_hidden_states)
+        
+        # print(f"Rank: {dist.get_rank()} Router logits mean: {binary_logits.mean()} | Router logits std: {binary_logits.std()} | Router logits min: {binary_logits.min()} | Router logits max: {binary_logits.max()}")
         
         if self.learnable_temp:
             tau = torch.exp(self.log_temp).clamp(0.3, 1.0)
         else:
             tau = self.tau
+        
+        # 生成 Gumbel 噪声: g = -log(-log(u))
+        # u ~ Uniform(0, 1)
+        u = torch.rand_like(binary_logits)
+        eps = 1e-8
+        g = -torch.log(-torch.log(u + eps) + eps)
 
         # --- Gumbel or Softmax routing ---
         if self.training:
-            # 生成 Gumbel 噪声: g = -log(-log(u))
-            # u ~ Uniform(0, 1)
-            u = torch.rand_like(binary_logits)
-            eps = 1e-8
-            g = -torch.log(-torch.log(u + eps) + eps)
             
-            # 连续松弛 (Continuous Relaxation): z_soft \in (0, 1)
-            # 公式: sigmoid((logit + g) / tau)
-            z_soft = torch.sigmoid((binary_logits + g) / tau)
             
-            # 硬化 (Hard Thresholding): z_hard \in {0, 1}
-            z_hard = (z_soft > 0.5).float()
-            
-            # --- 3. STE (Straight-Through Estimator) ---
-            # 前向传播：使用 z_hard (真正的 0/1)
-            # 反向传播：梯度通过 z_soft (z_hard 的梯度为0，加上 (z_soft - z_soft.detach()) 后，梯度等于 z_soft 的梯度)
-            z = z_hard + (z_soft - z_soft.detach())
-            
+            if not self.use_softmax:
+                z_soft = torch.sigmoid((binary_logits + g) / tau)
+                z_hard = (z_soft > 0.5).float()
+                z = z_hard + (z_soft - z_soft.detach())  # [B, H, 1]
+                entropy = -(z_soft * torch.log(z_soft + eps) + (1 - z_soft) * torch.log(1 - z_soft + eps))
+            else:
+                z_soft = F.softmax((binary_logits + g) / tau, dim=-1)
+                z_hard = torch.zeros_like(z_soft).scatter_(-1, z_soft.argmax(-1, keepdim=True), 1.0)
+                z = z_hard + (z_soft - z_soft.detach())  # [B, H, 2]
+                z = z[..., 1]  # [B, H]
+                z = z.unsqueeze(-1)
+                entropy = -(z_soft * torch.log(z_soft + eps)).sum(dim=-1).mean() 
+                # 如果采用softmax，不要打开entropy
         else:
             # 推理阶段：直接根据 Logit 确定 (相当于 tau -> 0)
             # 或者也可以用 sigmoid(logit/tau) > 0.5，但在 deterministic 模式下 logit > 0 即可
-            z_soft = torch.sigmoid(binary_logits / tau) 
-            z_hard = (z_soft > 0.5).float()
-            z = z_hard
-
+            # z_soft = torch.sigmoid(binary_logits / tau) 
+            if not self.use_softmax:
+                z_soft = torch.sigmoid(binary_logits / tau)
+                z_hard = (z_soft > 0.5).float()
+                z = z_hard
+            else:
+                z_soft = F.softmax(binary_logits / tau, dim=-1)
+                z_hard = z_soft.argmax(-1)
+                z = z_hard
+                z = z.unsqueeze(-1)
+            entropy = -(z_soft * torch.log(z_soft + eps)).sum(dim=-1).mean() 
+        
         return {
             'pooled_hidden_states': pooled_hidden_states, # [B, H, D]
             'decisions': z_soft,
             'hard_decisions': z_hard,
             'sparse_mask': z, # [B, H], 这是一个 STE Tensor
             'logits': binary_logits,
+            'entropy': entropy
         }
+        
     def _segment_pooling_single_batch(self, pooled_input: torch.Tensor, range_ids: torch.Tensor, segments: list) -> torch.Tensor:
         B, S, H, D = pooled_input.shape
         pooled_features_list = []
@@ -886,9 +930,10 @@ class Qwen3Attention(nn.Module):
             # head_dim = self.head_dim,
             d_feature=self.head_dim,
             use_task_emb=getattr(config, "use_task_emb_for_mask", False),
-            temp=getattr(config, "mask_temp", 2/3),
+            temp=getattr(config, "mask_temp", 3/2),
             hard=getattr(config, "mask_hard_sample", False),
             pooling_mode=getattr(config, "pooling_mode", "first_token"),
+            use_softmax=getattr(config, "use_softmax", False)
         )
 
         self.context_window_toggle = context_window_toggle
@@ -1187,7 +1232,7 @@ class Qwen3Attention(nn.Module):
             )[:,None,...]
 
         return effective_attn_output
-
+    
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1222,19 +1267,16 @@ class Qwen3Attention(nn.Module):
             z = z_kv.unsqueeze(-1).expand(-1, self.num_key_value_groups).reshape(-1)
         else:
             if unpadded_lengths is not None:
-                res = self.mask_allocator(q, unpadded_lengths[0], range_ids, task_ids)
-                z_kv_batch, pooled_hidden_states = res['sparse_mask'], res['pooled_hidden_states']
+                res = self.mask_allocator(k, unpadded_lengths[0], range_ids, task_ids)
             else:
-                res = self.mask_allocator(q, None, range_ids, task_ids)
-                z_kv_batch, pooled_hidden_states = res['sparse_mask'], res['pooled_hidden_states']
-            if z_kv_batch.shape[-1] == self.num_key_value_heads:
-                z_kv_batch = (
-                    z_kv_batch.unsqueeze(-1)              # [B, num_kv, 1]
-                    .expand(-1, -1, self.num_key_value_groups)  # [B, num_kv, num_groups]
-                    .reshape(z_kv_batch.size(0), -1)      # [B, num_kv * num_groups]
-                )
+                res = self.mask_allocator(k, None, range_ids, task_ids)
+            
+            z_kv_batch, entropy, pooled_hidden_states = res['sparse_mask'], res['entropy'], res['pooled_hidden_states']
+            z_constrast = res['decisions']
 
-            z = z_kv_batch
+            if z_kv_batch.shape[-2] == self.num_key_value_heads:
+                z_kv_batch = z_kv_batch.repeat_interleave(self.num_key_value_groups, 1)
+
         has_layer_past = past_key_value is not None
         if has_layer_past:
             past_kv = past_key_value[0]
@@ -1297,17 +1339,17 @@ class Qwen3Attention(nn.Module):
             attention_func = self.interpolated_attention
             kwargs = {}
 
-        attn_output = attention_func(q, kv, k, v, unpadded_lengths, z, **kwargs)
+        attn_output = attention_func(q, kv, k, v, unpadded_lengths, z_kv_batch, **kwargs)
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output.to(self.o_proj.weight.dtype))
 
         attn_weights = None
         
         if not has_layer_past:
-            print(f"task_ids: {task_ids}, head allocate: {[x.tolist() for x in z]}")
+            print(f"task_ids: {task_ids}, head allocate: {[x.tolist() for x in z_kv_batch]}")
         
         # z: [B, H, 1] -> [B, H] -> [B]
-        return z.squeeze(-1).sum(dim=-1), pooled_hidden_states, attn_output, attn_weights, past_key_value
+        return z_kv_batch.squeeze(-1).sum(dim=-1), entropy.mean(), pooled_hidden_states, z_constrast.squeeze(-1), attn_output, attn_weights, past_key_value
 
 
 class Qwen3DecoderLayer(nn.Module):
@@ -1379,7 +1421,7 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        z_sum, pooled_hidden_states, hidden_states, self_attn_weights, present_key_value = self.self_attn(
+        z_sum, entropy, pooled_hidden_states, z_constrast, hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -1400,7 +1442,7 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
-        outputs = (z_sum, pooled_hidden_states, hidden_states,)
+        outputs = (z_sum, entropy, pooled_hidden_states, z_constrast, hidden_states,)
 
         if output_attentions:
             outputs += (self_attn_weights,)
@@ -1459,8 +1501,11 @@ class BaseModelOutputWithPastAndSparsity(ModelOutput):
     layerwise_target_sparsity: Optional[torch.FloatTensor] = None  # (num_layers,)
     layerwise_sparsity_loss: Optional[torch.FloatTensor] = None  # scalar
     # contrastive_loss
-    contrastive_loss: Optional[torch.FloatTensor] = None# 
-
+    contrastive_loss: Optional[torch.FloatTensor] = None
+    head_contrastive_loss: Optional[torch.FloatTensor] = None
+    log_z_loss: Optional[torch.FloatTensor] = None
+    head_entropy: Optional[torch.FloatTensor] = None
+    
 
 class Qwen3Model(Qwen3PreTrainedModel):
     """
@@ -1473,12 +1518,11 @@ class Qwen3Model(Qwen3PreTrainedModel):
     def __init__(
         self,
         config: PawQwen3Config,
-        compute_contrastive_loss: bool = False,
     ):
         super().__init__(config)
         context_window_toggle = config.local_window_size
         disable_linear_regularization_term = config.disable_linear_regularization_term
-        self.compute_contrastive_loss = compute_contrastive_loss
+
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
@@ -1506,6 +1550,19 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 torch.tensor([0.0], dtype=self._dtype)
             )
         self.sparsity_lambda_2 = nn.Parameter(torch.tensor([0.0], dtype=self._dtype))
+        
+        if self.config.enable_lambda_task:
+            self.num_tasks = 4
+            self.sparsity_lambda1_task = nn.Parameter(
+                torch.zeros(self.num_tasks, dtype=self._dtype)
+            )
+            self.sparsity_lambda2_task = nn.Parameter(
+                torch.zeros(self.num_tasks, dtype=self._dtype)
+            )
+        else:
+            self.sparsity_lambda1_task = None
+            self.sparsity_lambda2_task = None
+
 
         self.threshold_for_deterministic = None
         if config.suggested_sparsity is not None:
@@ -1514,6 +1571,12 @@ class Qwen3Model(Qwen3PreTrainedModel):
         self._erank_cache = {}
         # Initialize weights and apply final processing
         self.post_init()
+
+    @torch.no_grad()
+    def reset_parameters(self):
+        if self.config.enable_lambda_task:
+            self.sparsity_lambda1_task.data.copy_(torch.rand_like(self.sparsity_lambda1_task) * 0.5)
+            self.sparsity_lambda2_task.data.copy_(torch.rand_like(self.sparsity_lambda2_task) * 0.5)
 
     @torch.no_grad()
     def set_threshold_for_deterministic(self, threshold_for_deterministic):
@@ -1640,6 +1703,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
         range_ids: Optional[torch.LongTensor] = None,
         task_ids: Optional[torch.LongTensor] = None,
         erank_analysis_path: Optional[str] = None,
+        enable_contrastive_loss: bool = False,
         **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         compute_sparsity = self.training
@@ -1691,6 +1755,8 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
         layer_z_sums = []  # 收集每层 z_sum 以计算逐层稀疏度
         # all_pooled_hidden_states = []
+        head_entropy = 0 if compute_sparsity else None
+        layer_z_constrast = []
 
         for idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
@@ -1732,23 +1798,59 @@ class Qwen3Model(Qwen3PreTrainedModel):
                     task_ids=task_ids,
                 )
 
-            z_layer_sum, pooled_hidden_states, hidden_states = layer_outputs[0], layer_outputs[1], layer_outputs[2]
+            z_layer_sum, entropy, pooled_hidden_states, z_constrast, hidden_states = layer_outputs[0], layer_outputs[1], layer_outputs[2], layer_outputs[3], layer_outputs[4]
 
             if compute_sparsity:
                 z_sum += z_layer_sum
+                head_entropy = (head_entropy + entropy) / 2
             layer_z_sums.append(z_layer_sum)
+            layer_z_constrast.append(z_constrast)
 
             if use_cache:
-                next_decoder_cache += (layer_outputs[4 if output_attentions else 3],)
+                next_decoder_cache += (layer_outputs[6 if output_attentions else 5],)
 
             if output_attentions:
-                all_self_attns += (layer_outputs[3],)
+                all_self_attns += (layer_outputs[5],)
+        
+        if enable_contrastive_loss:
+            
+            def jsd(p, q, eps=1e-8):
+                """
+                p, q: [H]   soft mask for a task (mean across batch)
+                return scalar JSD
+                """
+                p = torch.clamp(p, eps, 1.0)
+                q = torch.clamp(q, eps, 1.0)
+                m = 0.5 * (p + q)
+                m = torch.clamp(m, eps, 1.0)
+                kl_pm = torch.sum(p * torch.log(p / m))
+                kl_qm = torch.sum(q * torch.log(q / m))
+                return 0.5 * (kl_pm + kl_qm)
+            
+            head_contrastive_loss = torch.tensor(0.0, device=hidden_states.device)
 
-        # pooled_hidden_states = torch.cat(pooled_hidden_states, dim=1)
-        if self.compute_contrastive_loss:
             # all gather all pooled_hidden_states across all GPUs
             pooled_hidden_states = pooled_hidden_states.mean(dim=1) # [B, D]
             world_size = dist.get_world_size()
+            rank = dist.get_rank()
+            device = hidden_states.device
+            
+            # head contrastive loss
+            local_masks = torch.stack(layer_z_constrast, dim=0)
+            L, B, H = local_masks.shape
+            gather_list = [
+                torch.zeros_like(local_masks, device=device)
+                for _ in range(world_size)
+            ]
+            
+            # detached gather —— 但保留本 rank 的梯度
+            dist.all_gather(gather_list, local_masks.detach())
+            gather_list[rank] = local_masks
+            
+            global_masks = torch.cat(gather_list, dim=1)
+
+            # =============================================================================================================
+            
             
             global_pooled_hidden_states = [torch.zeros_like(pooled_hidden_states, device=hidden_states.device) for _ in range(world_size)]
             global_task_ids = [torch.zeros_like(task_ids, device=hidden_states.device) for _ in range(world_size)]
@@ -1757,6 +1859,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
             dist.all_gather(global_task_ids, task_ids.detach())
             
             global_pooled_hidden_states[torch.distributed.get_rank()] = pooled_hidden_states  # 用原始 x 替换当前 rank 的副本（保留梯度）
+            
             
             """
             global_pooled_hidden_states: [[B, D], [B, D], ..., [B, D]] # world_size * [B, D]
@@ -1769,7 +1872,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
             
             # 聚合所有的task，获得task 表征
             unique_tasks = torch.unique(global_task)  # e.g., tensor([0, 1, 3])
-            K_eff = unique_tasks.size(0)
+
             if unique_tasks.numel() > 1:
                 prototypes = torch.stack([
                     global_hidden[global_task == t].mean(dim=0)
@@ -1785,10 +1888,79 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 
                 contrastive_loss = F.cross_entropy(logits, mapped_labels)
             else:
-                contrastive_loss = torch.tensor(0.0, device=hidden_states)
+                contrastive_loss = torch.tensor(0.0, device=hidden_states.device)
+                
+            # head contrastive loss
+            task_profiles = {}  # t -> [H]
+
+            for t in unique_tasks:
+                idx = (global_task == t).nonzero(as_tuple=True)[0]  # indices
+                if idx.numel() == 0:
+                    continue
+
+                # [L, K, H]
+                m = global_masks[:, idx, :]  
+
+                # [L, H]
+                m = m.mean(dim=1)
+
+                # [H]
+                # m = m.mean(dim=0)
+                
+                task_profiles[int(t.item())] = m
+            
+            if len(task_profiles) < 2:
+                head_contrastive_loss = torch.tensor(0.0, device=device)
+            else:
+                tkeys = list(task_profiles.keys())
+                jsd_total = 0.0
+                count = 0
+
+                for i in range(len(tkeys)):
+                    for j in range(i + 1, len(tkeys)):
+                        mi = task_profiles[tkeys[i]]    # [L, H]
+                        mj = task_profiles[tkeys[j]]    # [L, H]
+
+                        # per-layer JSD: sum over layers
+                        L = mi.size(0)
+                        jsd_layers = 0.0
+
+                        for layer_idx in range(L):
+                            jsd_layers += jsd(mi[layer_idx], mj[layer_idx])
+
+                        jsd_total += jsd_layers
+                        count += 1
+
+
+                head_contrastive_loss = - ((jsd_total / float(count)) * 0.1)
         else:
-            contrastive_loss = None
-        
+            contrastive_loss = torch.tensor(0.0, device=hidden_states.device)
+            head_contrastive_loss = torch.tensor(0.0, device=hidden_states.device)
+
+        save_interval = 1
+
+        current_step = getattr(self.config, "global_step", 0) 
+
+        if self.training and (dist.get_rank() == 0) and (current_step % save_interval == 0):
+            try:
+                save_dir = os.path.join("/data1/lcm_lab/qqt/SparseAttn/sparseattn/", "nolambda_abs*100")
+                os.makedirs(save_dir, exist_ok=True)
+
+                import time
+                timestamp = int(time.time() * 1000)
+                save_path = os.path.join(save_dir, f"batch_step{current_step}_{timestamp}.pt")
+
+                torch.save({
+                    "global_hidden": global_hidden.detach().cpu().half(),
+                    "global_task": global_task.detach().cpu(),
+                    "unique_tasks": unique_tasks.cpu(),
+                    "loss_val": contrastive_loss.item() if isinstance(contrastive_loss, torch.Tensor) else contrastive_loss,
+                    "prototypes": prototypes.detach().cpu() if unique_tasks.numel() > 1 else None
+                }, save_path)
+
+                print(f"[Diagnostic] Saved batch analysis to {save_path}", flush=True)
+            except Exception as e:
+                print(f"[Diagnostic] Save failed: {e}", flush=True)
         hidden_states = self.norm(hidden_states)
 
         # add hidden states from the last decoder layer
@@ -1796,6 +1968,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
             all_hidden_states += (hidden_states,)
 
         next_cache = next_decoder_cache if use_cache else None
+        
         if compute_sparsity:
             
             # model_sparsity = 1 - (z_sum / self.total_num_heads)
@@ -1833,7 +2006,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
         if compute_sparsity:
             layerwise_model_sparsity = None
             layerwise_target = None
-            layerwise_loss = None
+
             if len(layer_z_sums) > 0:
                 per_layer_heads = self.config.num_attention_heads
                 layerwise_model_sparsity = (
@@ -1843,84 +2016,44 @@ class Qwen3Model(Qwen3PreTrainedModel):
             if target_sparsity is None:
                 z_loss = None
             else:
-                
-                z_loss = (
-                    self.sparsity_lambda_1.reshape([])
-                    * (model_sparsity - target_sparsity).mean()
-                    + self.sparsity_lambda_2.reshape([]) 
-                    * ((model_sparsity - target_sparsity) ** 2).mean()
-                )
+                if self.config.enable_lambda_task:
+                    diff = (model_sparsity - target_sparsity)
+
+                    # per-sample lambda
+                    lambda1_per_sample = self.sparsity_lambda1_task[task_ids]   # [B]
+                    lambda2_per_sample = self.sparsity_lambda2_task[task_ids]   # [B]
+
+                    # per-sample loss
+                    per_sample_loss = (
+                        lambda1_per_sample * diff
+                        + lambda2_per_sample * diff.pow(2)
+                    )
+
+                    log_z_loss = per_sample_loss.detach()
+
+                    task_losses = []
+                    for task_id in range(self.num_tasks):
+                        mask = (task_ids == task_id)
+                        if mask.sum() > 0:
+                            task_losses.append(per_sample_loss[mask].mean())
+
+                    z_loss = torch.stack(task_losses).mean()
+                else:
+                    z_loss = (
+                        (model_sparsity * 10 - target_sparsity * 10).abs()
+                        # + ((model_sparsity - target_sparsity) ** 2)
+                    )
+                    log_z_loss = z_loss.detach()
+                    
+                    z_loss = z_loss.mean() 
                 
         else:
             layerwise_model_sparsity = None
             layerwise_target = None
             layerwise_loss = None
         
-        if (
-            target_sparsity is not None
-            and self.config.enable_layerwise_sparsity
-            and layerwise_model_sparsity is not None
-            and compute_sparsity
-        ):
-            L = layerwise_model_sparsity.numel()
-            device = layerwise_model_sparsity.device
-
-            # new
-            path = erank_analysis_path or getattr(
-                self.config, "erank_analysis_path", None
-            )
-            if not path.endswith(".pt"):
-                idxs = torch.arange(L, device=device, dtype=torch.float32)
-                denom = max(L - 1, 1)
-                x = torch.sin(torch.pi * (idxs / denom))
-                x = x.pow(float(self.config.layerwise_sparsity_power))
-
-                min_r = float(self.config.layerwise_sparsity_min_ratio)
-                max_r = float(self.config.layerwise_sparsity_max_ratio)
-                sched = getattr(
-                    self.config, "layerwise_sparsity_schedule", "low-high-low"
-                )
-                if sched == "high-low-high":
-                    ratios = max_r - (max_r - min_r) * x
-                else:
-                    ratios = min_r + (max_r - min_r) * x
-                
-                layerwise_target = torch.clamp(
-                    ratios * float(target_sparsity), min=0.0, max=1.0
-                )
-            else:
-                avg_erank = self._get_avg_erank(path)  # [L, H] on CPU
-                E = avg_erank.mean(dim=1).to(device)  # [L] 每层平均有效秩
-
-                assert E.numel() == L, (
-                    f"Mismatch: got {E.numel()} layers from erank but model has {L}"
-                )
-
-                E_norm = (E - E.min()) / (E.max() - E.min() + 1e-8)
-                inv_E = (1.0 / (E_norm + 1e-3)) ** 0.5
-                w = inv_E
-
-                L = layerwise_model_sparsity.numel()
-                layerwise_target = (w / w.sum()) * (target_sparsity * L)
-                layerwise_target = torch.clamp(layerwise_target, 0.0, 1.0)
-                s = layerwise_target.sum()
-                if s > 0:
-                    layerwise_target = layerwise_target / s * (target_sparsity * L)
-
-            diffs = layerwise_model_sparsity - layerwise_target
-
-            per_layer_loss = self.sparsity_lambda_1.reshape(
-                []
-            ) * diffs + self.sparsity_lambda_2.reshape([]) * (diffs**2)
-            layerwise_loss = (
-                float(self.config.layerwise_sparsity_weight) * per_layer_loss.mean()
-            )
-
-            # z_loss = layerwise_loss if z_loss is None else (z_loss + layerwise_loss)
-            z_loss = layerwise_loss
-        
         if z_loss is not None:
-            z_loss = z_loss.mean()
+            z_loss = z_loss.sum()
         
         if not return_dict:
             # return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns, model_sparsity, target_sparsity, z_loss] if v is not None)
@@ -1934,8 +2067,8 @@ class Qwen3Model(Qwen3PreTrainedModel):
                     model_sparsity,
                     target_sparsity,
                     z_loss,
-                    self.sparsity_lambda_1.reshape([]),
-                    self.sparsity_lambda_2.reshape([]),
+                    self.sparsity_lambda1_task,
+                    self.sparsity_lambda2_task,
                 ]
                 if v is not None
             )
@@ -1944,14 +2077,6 @@ class Qwen3Model(Qwen3PreTrainedModel):
             past_key_values=next_cache,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
-            model_sparsity=model_sparsity,
-            target_sparsity=target_sparsity,
-            sparsity_loss=z_loss,
-            lambda1=self.sparsity_lambda_1.reshape([]),
-            lambda2=self.sparsity_lambda_2.reshape([]),
-            layerwise_model_sparsity=layerwise_model_sparsity,
-            layerwise_target_sparsity=layerwise_target,
-            contrastive_loss=contrastive_loss,
         )
 
 
@@ -1979,6 +2104,11 @@ class CausalLMOutputWithPastAndSparsity(ModelOutput):
     layerwise_sparsity_loss: Optional[torch.FloatTensor] = None  # scalar
     # contrastive_loss
     contrastive_loss: Optional[torch.FloatTensor] = None  # scalar
+    head_contrastive_loss: Optional[torch.FloatTensor] = None
+    # task_ids
+    task_ids: Optional[torch.FloatTensor] = None
+    log_z_loss: Optional[torch.FloatTensor] = None
+    head_entropy: Optional[torch.FloatTensor] = None
 
 class KwargsForCausalLM(FlashAttentionKwargs, LossKwargs): ...
 
@@ -1991,18 +2121,17 @@ class PawQwen3ForCausalLM(Qwen3PreTrainedModel):
     def __init__(
         self,
         config,
-        compute_contrastive_loss=False,
+        enable_contrastive_loss=False,
     ):
         super().__init__(config)
         self.model = Qwen3Model(
             config,
-            compute_contrastive_loss,
         )
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         self.logit_block_size = int(os.environ.get("LOGIT_BLOCK_SIZE", 16384))
-
+        self.enable_contrastive_loss = enable_contrastive_loss
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -2193,6 +2322,7 @@ class PawQwen3ForCausalLM(Qwen3PreTrainedModel):
             segment_ids=segment_ids,
             range_ids=range_ids,
             task_ids=task_ids,
+            enable_contrastive_loss=self.enable_contrastive_loss,
         )
         
         hidden_states = outputs[0]
@@ -2254,14 +2384,6 @@ class PawQwen3ForCausalLM(Qwen3PreTrainedModel):
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
-            model_sparsity=outputs.model_sparsity,
-            target_sparsity=outputs.target_sparsity,
-            sparsity_loss=outputs.sparsity_loss,
-            lambda1=outputs.lambda1,
-            lambda2=outputs.lambda2,
-            layerwise_model_sparsity=outputs.layerwise_model_sparsity,
-            layerwise_target_sparsity=outputs.layerwise_target_sparsity,
-            contrastive_loss=outputs.contrastive_loss,
         )
 
     def prepare_inputs_for_generation(
