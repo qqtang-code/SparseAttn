@@ -717,6 +717,20 @@ class AttentionRouter(nn.Module):
             else:
                 pooled_latent = self._segment_pooling_single_batch(
                     x, range_ids, ['first_token'])
+        elif self.pooling_mode == 'q':
+            if cu_seq_len is not None:
+                pooled_latent = self._segment_pooling(
+                    x, range_ids, ['q'], cu_seq_len)  # [B, H, D]
+            else:
+                pooled_latent = self._segment_pooling_single_batch(
+                    x, range_ids, ['q'])
+        elif self.pooling_mode == 'ctx_q':
+            if cu_seq_len is not None:
+                pooled_latent = self._segment_pooling(
+                    x, range_ids, ['ctx', 'q'], cu_seq_len)  # [B, H, D]
+            else:
+                pooled_latent = self._segment_pooling_single_batch(
+                    x, range_ids, ['ctx', 'q'])
         else:
             raise ValueError(f"Unknown pooling_mode: {self.pooling_mode}")
         
@@ -732,8 +746,6 @@ class AttentionRouter(nn.Module):
 
         binary_logits = self.cls_router_head_agnostic(pooled_hidden_states)
         
-        # print(f"Rank: {dist.get_rank()} Router logits mean: {binary_logits.mean()} | Router logits std: {binary_logits.std()} | Router logits min: {binary_logits.min()} | Router logits max: {binary_logits.max()}")
-        
         if self.learnable_temp:
             tau = torch.exp(self.log_temp).clamp(0.3, 1.0)
         else:
@@ -741,8 +753,6 @@ class AttentionRouter(nn.Module):
 
         # --- Gumbel or Softmax routing ---
         if self.training:
-            # 生成 Gumbel 噪声: g = -log(-log(u))
-            # u ~ Uniform(0, 1)
             u = torch.rand_like(binary_logits)
             eps = 1e-8
             g = -torch.log(-torch.log(u + eps) + eps)
@@ -759,7 +769,6 @@ class AttentionRouter(nn.Module):
                 z = z[..., 1]  # [B, H]
                 z = z.unsqueeze(-1)
                 entropy = -(z_soft * torch.log(z_soft + eps)).sum(dim=-1).mean() 
-                # 如果采用softmax，不要打开entropy
         else:
             # 推理阶段：直接根据 Logit 确定 (相当于 tau -> 0)
             # 或者也可以用 sigmoid(logit/tau) > 0.5，但在 deterministic 模式下 logit > 0 即可

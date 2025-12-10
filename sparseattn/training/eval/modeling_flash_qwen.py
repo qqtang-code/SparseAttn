@@ -761,11 +761,11 @@ class AttentionRouter(nn.Module):
             # 或者也可以用 sigmoid(logit/tau) > 0.5，但在 deterministic 模式下 logit > 0 即可
             # z_soft = torch.sigmoid(binary_logits / tau) 
             if not self.use_softmax:
-                z_soft = torch.sigmoid(binary_logits / tau)
+                z_soft = torch.sigmoid(binary_logits)
                 z_hard = (z_soft > 0.5).float()
                 z = z_hard
             else:
-                z_soft = F.softmax(binary_logits / tau, dim=-1)
+                z_soft = F.softmax(binary_logits, dim=-1)
                 z_hard = z_soft.argmax(-1)
                 z = z_hard
                 z = z.unsqueeze(-1)
