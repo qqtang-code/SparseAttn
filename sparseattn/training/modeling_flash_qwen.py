@@ -729,11 +729,19 @@ class AttentionRouter(nn.Module):
                     x, range_ids, ['q'])
         elif self.pooling_mode == 'ctx_q':
             if cu_seq_len is not None:
-                pooled_latent = self._segment_pooling(
-                    x, range_ids, ['ctx', 'q'], cu_seq_len)  # [B, H, D]
+                B = cu_seq_len.shape[0] - 1
+                H, D = x.shape[1:]
+                sample_features = []
+                for i in range(B):
+                    x_s, x_e = cu_seq_len[i], cu_seq_len[i + 1]
+                    seg_slice = x[x_s:x_e]              # [Ti, H, D]
+                    seg_pooled = seg_slice.mean(dim=0)  # [H, D]
+                    sample_features.append(seg_pooled)
+
+                pooled_latent = torch.stack(sample_features, dim=0)
             else:
-                pooled_latent = self._segment_pooling_single_batch(
-                    x, range_ids, ['ctx', 'q'])
+                pooled_latent = x.mean(dim=1)  # [H, D]
+
         else:
             raise ValueError(f"Unknown pooling_mode: {self.pooling_mode}")
         

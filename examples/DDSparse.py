@@ -57,7 +57,7 @@ def get_task(metadata_str):
         return None
 
 def main():
-    model_path = "/data1/lcm_lab/qqt/SparseAttn/sparseattn/checkpoints/qwen3-4b-lm-reg-softmaxmlp"
+    model_path = "/data1/lcm_lab/qqt/SparseAttn/sparseattn/checkpoints/test_ctx_qsteps125_qwen_mix_sft_32K_xattn_mlp_ctx_q_softmax_wfrozen"
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     if tokenizer.pad_token is None:

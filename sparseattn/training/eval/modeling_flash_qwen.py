@@ -706,7 +706,6 @@ class AttentionRouter(nn.Module):
         """
         bsz = (cu_seq_len.shape[0] - 1) if cu_seq_len is not None else 1
         
-        # 目前所有支持的pooling 方法
         if self.pooling_mode == 'first_token':
             if cu_seq_len is not None:
                 pooled_latent = self._segment_pooling(
@@ -1480,8 +1479,8 @@ class Qwen3Attention(nn.Module):
 
         attn_weights = None
         
-        # if not has_layer_past:
-        #     print(f"task_ids: {task_ids}, head allocate: {[x.tolist() for x in z_kv_batch]}")
+        if not has_layer_past:
+            print(f"task_ids: {task_ids}, head allocate: {[x.tolist() for x in z_kv_batch]}")
         
         # z: [B, H, 1] -> [B, H] -> [B]
         return z_kv_batch.squeeze(-1).sum(dim=-1), None, None, None, attn_output, attn_weights, past_key_value
