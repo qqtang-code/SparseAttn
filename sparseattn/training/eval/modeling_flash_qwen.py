@@ -721,7 +721,19 @@ class AttentionRouter(nn.Module):
                 pooled_latent = self._segment_pooling_single_batch(
                     x, range_ids, ['q'])
         elif self.pooling_mode == 'ctx_q':
-            pooled_latent = x.mean(dim=1)
+            if cu_seq_len is not None:
+                B = cu_seq_len.shape[0] - 1
+                H, D = x.shape[1:]
+                sample_features = []
+                for i in range(B):
+                    x_s, x_e = cu_seq_len[i], cu_seq_len[i + 1]
+                    seg_slice = x[x_s:x_e]              # [Ti, H, D]
+                    seg_pooled = seg_slice.mean(dim=0)  # [H, D]
+                    sample_features.append(seg_pooled)
+
+                pooled_latent = torch.stack(sample_features, dim=0)
+            else:
+                pooled_latent = x.mean(dim=1)  # [H, D]
         else:
             raise ValueError(f"Unknown pooling_mode: {self.pooling_mode}")
         
@@ -1479,8 +1491,8 @@ class Qwen3Attention(nn.Module):
 
         attn_weights = None
         
-        if not has_layer_past:
-            print(f"task_ids: {task_ids}, head allocate: {[x.tolist() for x in z_kv_batch]}")
+        # if not has_layer_past:
+        #     print(f"task_ids: {task_ids}, head allocate: {[x.tolist() for x in z_kv_batch]}")
         
         # z: [B, H, 1] -> [B, H] -> [B]
         return z_kv_batch.squeeze(-1).sum(dim=-1), None, None, None, attn_output, attn_weights, past_key_value
@@ -1885,6 +1897,8 @@ class Qwen3Model(Qwen3PreTrainedModel):
         all_self_attns = () if output_attentions else None
         next_decoder_cache = () if use_cache else None
 
+        z_sum = None
+
         for idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -1927,6 +1941,14 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
             z_layer_sum, entropy, pooled_hidden_states, z_constrast, hidden_states = layer_outputs[0], layer_outputs[1], layer_outputs[2], layer_outputs[3], layer_outputs[4]
 
+            z_layer_sum = z_layer_sum.to(hidden_states.device)
+            
+            if z_sum is None:
+                z_sum = z_layer_sum
+            else:
+                z_sum = z_sum.to(z_layer_sum.device)
+                z_sum = z_sum + z_layer_sum
+            
             if use_cache:
                 next_decoder_cache += (layer_outputs[6 if output_attentions else 5],)
 
@@ -1941,6 +1963,8 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
         next_cache = next_decoder_cache if use_cache else None
         
+        model_sparsity = 1 - (z_sum / self.total_num_heads)
+        
         if not return_dict:
             # return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns, model_sparsity, target_sparsity, z_loss] if v is not None)
             return tuple(
@@ -1950,6 +1974,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
                     next_cache,
                     all_hidden_states,
                     all_self_attns,
+                    model_sparsity,
                 ]
                 if v is not None
             )
@@ -1958,6 +1983,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
             past_key_values=next_cache,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
+            model_sparsity=model_sparsity
         )
 
 
@@ -2013,6 +2039,7 @@ class PawQwen3ForCausalLM(Qwen3PreTrainedModel):
 
         self.logit_block_size = int(os.environ.get("LOGIT_BLOCK_SIZE", 16384))
         self.enable_contrastive_loss = enable_contrastive_loss
+        self.prefill_sparsity = None
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -2205,6 +2232,9 @@ class PawQwen3ForCausalLM(Qwen3PreTrainedModel):
             task_ids=task_ids,
             enable_contrastive_loss=self.enable_contrastive_loss,
         )
+
+        if self.prefill_sparsity is None:
+            self.prefill_sparsity = outputs.model_sparsity.detach()
         
         hidden_states = outputs[0]
         if seq_lengths is None and unpadded_lengths is not None:
@@ -2265,6 +2295,7 @@ class PawQwen3ForCausalLM(Qwen3PreTrainedModel):
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
+            model_sparsity=outputs.model_sparsity,
         )
 
     def prepare_inputs_for_generation(
