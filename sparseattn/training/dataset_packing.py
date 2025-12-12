@@ -105,9 +105,10 @@ def _process_single_item(item, tokenizer, class_map):
         "input_ids": full_input_ids,
         "labels": labels,
         "task_id": class_id,
+        "task_type": task_type,
     }
 
-def _finalize_pack(tokenizer, input_ids, labels, task_ids, lengths):
+def _finalize_pack(tokenizer, input_ids, labels, task_ids, lengths, task_types):
     """打包收尾：Padding并转换为Tensor结构"""
     curr_len = len(input_ids)
     remainder = curr_len % 8
@@ -125,6 +126,7 @@ def _finalize_pack(tokenizer, input_ids, labels, task_ids, lengths):
         "labels": torch.tensor(labels, dtype=torch.long),
         "seq_lengths": torch.tensor(seq_lengths, dtype=torch.int32),
         "task_ids": torch.tensor(task_ids, dtype=torch.long),
+        "task_type": task_types,                                       
     }
 
 def worker_pack_chunk(chunk_dataset, tokenizer, max_seq_len, worker_id, temp_dir):
@@ -141,6 +143,7 @@ def worker_pack_chunk(chunk_dataset, tokenizer, max_seq_len, worker_id, temp_dir
     buf_labels = []
     buf_task_ids = []    
     buf_lengths = []     
+    buf_task_types = []
 
     # 遍历当前 chunk 的数据
     # 使用 tqdm 需要指定 position 避免多进程打印混乱，或者直接去掉
@@ -164,9 +167,10 @@ def worker_pack_chunk(chunk_dataset, tokenizer, max_seq_len, worker_id, temp_dir
             buf_labels.extend(processed["labels"])
             buf_task_ids.append(processed["task_id"])
             buf_lengths.append(p_len)
+            buf_task_types.append(processed["task_type"])
         else:
             # Buffer 满了，finalize
-            packed_item = _finalize_pack(tokenizer, buf_input_ids, buf_labels, buf_task_ids, buf_lengths)
+            packed_item = _finalize_pack(tokenizer, buf_input_ids, buf_labels, buf_task_ids, buf_lengths, buf_task_types)
             local_packed_data.append(packed_item)
             
             # Reset buffer
@@ -174,10 +178,11 @@ def worker_pack_chunk(chunk_dataset, tokenizer, max_seq_len, worker_id, temp_dir
             buf_labels = list(processed["labels"])
             buf_task_ids = [processed["task_id"]]
             buf_lengths = [p_len]
+            buf_task_types = [processed["task_type"]]
 
     # 处理最后一个 buffer
     if buf_input_ids:
-        packed_item = _finalize_pack(tokenizer, buf_input_ids, buf_labels, buf_task_ids, buf_lengths)
+        packed_item = _finalize_pack(tokenizer, buf_input_ids, buf_labels, buf_task_ids, buf_lengths, buf_task_types)
         local_packed_data.append(packed_item)
     
     if len(local_packed_data) > 0:
@@ -355,13 +360,17 @@ class PackedDataCollator:
         task_ids = None
         if 'task_ids' in batch[0]:
             task_ids = [item['task_ids'] for item in batch]
-
+            
+        task_types = None
+        if 'task_type' in batch[0]:
+            task_ids = [item['task_type'] for item in batch]
         
         res = {
             "input_ids": input_ids,
             "labels": labels,
             "seq_lengths": seq_lengths, # List[Tensor]
             "task_ids": task_ids,       # List[Tensor]
+            "task_types": task_types
         }
 
         return res
@@ -383,5 +392,6 @@ if __name__ == "__main__":
     )
     
     print(f"Dataset ready. Size: {len(dataset)}")
+    # breakpoint()
     # check one
-    # print(dataset[0])
+    print(dataset[0])
