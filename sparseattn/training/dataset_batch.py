@@ -41,6 +41,7 @@ class DataArguments:
     task_type: str = "pretrain" 
     use_packing: bool = False
     data_cache_dir: Optional[str] = None
+    preprocessing_num_workers: int = 16
 
 # =========================================================
 #  Datasets

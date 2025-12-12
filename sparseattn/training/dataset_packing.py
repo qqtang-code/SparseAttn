@@ -13,6 +13,7 @@ from tqdm import tqdm
 from torch.utils.data import Dataset
 from transformers import AutoTokenizer
 from datasets import load_dataset
+import shutil
 
 # 设置日志
 logger = logging.getLogger(__name__)
@@ -25,6 +26,20 @@ CLASS_MAP = {
     'Summarization': 2, 
     'Code': 3
 }
+
+@dataclass
+class DataArguments:
+    single_seq: bool = False
+    subsplit_length: Optional[int] = None
+    per_device_max_tokens: int = 128*1024
+    apply_instruct_masks: bool = False
+    prepack: bool = False
+    streaming: bool = False
+    min_seq_len: Optional[int] = 1000
+    task_type: str = "pretrain" 
+    use_packing: bool = False
+    data_cache_dir: Optional[str] = None
+    preprocessing_num_workers: int = 32
 
 # =========================================================
 #  独立的处理函数 (Worker Function)
@@ -90,9 +105,10 @@ def _process_single_item(item, tokenizer, class_map):
         "input_ids": full_input_ids,
         "labels": labels,
         "task_id": class_id,
+        "task_type": task_type,
     }
 
-def _finalize_pack(tokenizer, input_ids, labels, task_ids, lengths):
+def _finalize_pack(tokenizer, input_ids, labels, task_ids, lengths, task_types):
     """打包收尾：Padding并转换为Tensor结构"""
     curr_len = len(input_ids)
     remainder = curr_len % 8
@@ -110,9 +126,10 @@ def _finalize_pack(tokenizer, input_ids, labels, task_ids, lengths):
         "labels": torch.tensor(labels, dtype=torch.long),
         "seq_lengths": torch.tensor(seq_lengths, dtype=torch.int32),
         "task_ids": torch.tensor(task_ids, dtype=torch.long),
+        "task_type": task_types,                                       
     }
 
-def worker_pack_chunk(chunk_dataset, tokenizer, max_seq_len, worker_id=0):
+def worker_pack_chunk(chunk_dataset, tokenizer, max_seq_len, worker_id, temp_dir):
     """
     子进程执行的函数：处理分配给它的那一部分数据
     """
@@ -126,6 +143,7 @@ def worker_pack_chunk(chunk_dataset, tokenizer, max_seq_len, worker_id=0):
     buf_labels = []
     buf_task_ids = []    
     buf_lengths = []     
+    buf_task_types = []
 
     # 遍历当前 chunk 的数据
     # 使用 tqdm 需要指定 position 避免多进程打印混乱，或者直接去掉
@@ -149,9 +167,10 @@ def worker_pack_chunk(chunk_dataset, tokenizer, max_seq_len, worker_id=0):
             buf_labels.extend(processed["labels"])
             buf_task_ids.append(processed["task_id"])
             buf_lengths.append(p_len)
+            buf_task_types.append(processed["task_type"])
         else:
             # Buffer 满了，finalize
-            packed_item = _finalize_pack(tokenizer, buf_input_ids, buf_labels, buf_task_ids, buf_lengths)
+            packed_item = _finalize_pack(tokenizer, buf_input_ids, buf_labels, buf_task_ids, buf_lengths, buf_task_types)
             local_packed_data.append(packed_item)
             
             # Reset buffer
@@ -159,13 +178,19 @@ def worker_pack_chunk(chunk_dataset, tokenizer, max_seq_len, worker_id=0):
             buf_labels = list(processed["labels"])
             buf_task_ids = [processed["task_id"]]
             buf_lengths = [p_len]
+            buf_task_types = [processed["task_type"]]
 
     # 处理最后一个 buffer
     if buf_input_ids:
-        packed_item = _finalize_pack(tokenizer, buf_input_ids, buf_labels, buf_task_ids, buf_lengths)
+        packed_item = _finalize_pack(tokenizer, buf_input_ids, buf_labels, buf_task_ids, buf_lengths, buf_task_types)
         local_packed_data.append(packed_item)
-        
-    return local_packed_data
+    
+    if len(local_packed_data) > 0:
+        temp_file = os.path.join(temp_dir, f"chunk_{worker_id}.pt")
+        torch.save(local_packed_data, temp_file)
+        return temp_file
+    else:
+        return None
 
 # =========================================================
 #  主 Dataset 类
@@ -194,13 +219,24 @@ class PackedDataset(Dataset):
                 logger.warning(f"⚠️ 加载缓存失败 ({e})，准备重新打包...")
 
         logger.info(f"开始多进程 Packing... 目标长度: {max_seq_len}, 进程数: {num_proc}")
-        
-        # ================= 多进程处理逻辑 =================
-        self._parallel_pack_dataset(raw_dataset, num_proc)
-        # ================================================
 
+        # 准备临时目录
+        self.temp_dir = os.path.join(cache_dir if cache_dir else "./", "temp_packing_chunks")
+        if os.path.exists(self.temp_dir):
+            shutil.rmtree(self.temp_dir)
+        os.makedirs(self.temp_dir, exist_ok=True)
+
+        try:
+            self._parallel_pack_dataset(raw_dataset, num_proc)
+        finally:
+            # 清理临时文件
+            if os.path.exists(self.temp_dir):
+                logger.info("正在清理临时文件...")
+                shutil.rmtree(self.temp_dir)
+
+        # 保存最终大缓存
         if self.cache_path:
-            logger.info(f"💾 正在保存缓存到: {self.cache_path} ...")
+            logger.info(f"💾 正在保存最终缓存到: {self.cache_path} ...")
             try:
                 torch.save(self.packed_data, self.cache_path)
                 logger.info("✅ 缓存保存成功!")
@@ -208,46 +244,45 @@ class PackedDataset(Dataset):
                 logger.error(f"❌ 缓存保存失败: {e}")
 
     def _parallel_pack_dataset(self, raw_dataset, num_proc):
-        # 1. 切分数据集
-        # HuggingFace dataset 支持 .shard(), 或者简单的切片
-        # 为了更均匀，我们手动计算 indices 或使用 shard
         total_size = len(raw_dataset)
-        
-        # 确保进程数不超过数据量
         num_proc = min(num_proc, total_size)
         if num_proc < 1: num_proc = 1
         
         logger.info(f"Splitting dataset into {num_proc} chunks...")
         
-        # 使用 shard 切分，这是 HF Dataset 最高效的方式（Lazy）
         chunks = []
         for i in range(num_proc):
-            # contiguous=True is important for speed on read
             chunks.append(raw_dataset.shard(num_shards=num_proc, index=i, contiguous=True))
 
-        # 2. 提交任务到进程池
+        # 提交任务
         futures = []
         with ProcessPoolExecutor(max_workers=num_proc) as executor:
             for i, chunk in enumerate(chunks):
-                # 提交任务
-                # 注意：tokenizer 需要被 pickle 传过去，通常没问题
-                # raw_dataset 的 shard 也是 lazy 的，传输开销很小
+                # 传入 self.temp_dir
                 futures.append(
-                    executor.submit(worker_pack_chunk, chunk, self.tokenizer, self.max_seq_len, i)
+                    executor.submit(worker_pack_chunk, chunk, self.tokenizer, self.max_seq_len, i, self.temp_dir)
                 )
             
-            # 3. 收集结果
-            results = []
-            for f in tqdm(as_completed(futures), total=len(futures), desc="Waiting for workers"):
+            # 等待完成，收集文件名
+            temp_files = []
+            for f in tqdm(as_completed(futures), total=len(futures), desc="Waiting for workers to finish"):
                 try:
-                    res = f.result()
-                    results.extend(res)
+                    res = f.result() # 这里只返回文件名，非常快
+                    if res:
+                        temp_files.append(res)
                 except Exception as e:
                     logger.error(f"Worker failed with error: {e}")
                     raise e
         
-        self.packed_data = results
-        logger.info(f"多进程 Packing 完成。原始: {total_size} -> Packed: {len(self.packed_data)}")
+        logger.info(f"所有子进程处理完毕，开始合并 {len(temp_files)} 个临时文件...")
+        
+        # 主进程负责加载和合并
+        self.packed_data = []
+        for tmp_file in tqdm(temp_files, desc="Merging chunks"):
+            chunk_data = torch.load(tmp_file)
+            self.packed_data.extend(chunk_data)
+        
+        logger.info(f"Packing 完成。原始: {total_size} -> Packed: {len(self.packed_data)}")
 
     def __len__(self):
         return len(self.packed_data)
@@ -259,13 +294,6 @@ class PackedDataset(Dataset):
 #  Utilities & Main
 # =========================================================
 
-@dataclass
-class PackedDataArguments:
-    per_device_max_tokens: int = 32768
-    min_seq_len: Optional[int] = None
-    data_cache_dir: Optional[str] = None
-    # Add a param for num_proc
-    preprocessing_num_workers: int = 64
 
 def build_packed_dataset(paths, data_args, tokenizer=None):
     if isinstance(paths, str):
@@ -289,10 +317,10 @@ def build_packed_dataset(paths, data_args, tokenizer=None):
         cache_dir=os.path.join(data_args.data_cache_dir, "raw") if data_args.data_cache_dir else None
     )
 
-    # Filter short
-    if data_args.min_seq_len is not None:
-        # 过滤也可以考虑多进程: raw.filter(..., num_proc=os.cpu_count())
-        pass
+    # # Filter short
+    # if data_args.min_seq_len is not None:
+    #     # 过滤也可以考虑多进程: raw.filter(..., num_proc=os.cpu_count())
+    #     pass
 
     max_len = data_args.per_device_max_tokens
     
@@ -300,7 +328,7 @@ def build_packed_dataset(paths, data_args, tokenizer=None):
     return PackedDataset(
         raw, 
         tokenizer, 
-        max_seq_len=128*1024, # 根据需要调整
+        max_seq_len=max_len, # 根据需要调整
         cache_dir="data_cache",
         num_proc=data_args.preprocessing_num_workers # 使用参数控制核数
     )
@@ -332,22 +360,27 @@ class PackedDataCollator:
         task_ids = None
         if 'task_ids' in batch[0]:
             task_ids = [item['task_ids'] for item in batch]
-
+            
+        task_types = None
+        if 'task_type' in batch[0]:
+            task_ids = [item['task_type'] for item in batch]
         
         res = {
             "input_ids": input_ids,
             "labels": labels,
             "seq_lengths": seq_lengths, # List[Tensor]
             "task_ids": task_ids,       # List[Tensor]
+            "task_types": task_types
         }
 
         return res
+
 if __name__ == "__main__":
     # 多进程必须在 main block 下运行
     multiprocessing.set_start_method("spawn", force=True) # 推荐在 CUDA 环境或复杂库中使用 spawn
 
     path = "/data2/public_data/qwen_mix_sft_128K" 
-    data_args = PackedDataArguments(preprocessing_num_workers=64) # 设置为你机器的 CPU 核心数
+    data_args = DataArguments(preprocessing_num_workers=32) # 设置为你机器的 CPU 核心数
     tokenizer = AutoTokenizer.from_pretrained("/data2/hf_models/Qwen3-4B", trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -359,5 +392,6 @@ if __name__ == "__main__":
     )
     
     print(f"Dataset ready. Size: {len(dataset)}")
+    # breakpoint()
     # check one
-    # print(dataset[0])
+    print(dataset[0])

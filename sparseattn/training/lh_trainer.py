@@ -427,7 +427,7 @@ class Trainer(HFTrainer):
 
         Subclass and override for custom behavior.
         """
-        tasks = inputs.get("task_type", ["default"] * inputs["input_ids"].size(0))
+        tasks = inputs.get("task_types", ["default"] * inputs["input_ids"].size(0)) #[B]
         # tasks = ["default"] * inputs["input_ids"].size(0)
         target_sparsity = self.get_current_target_sparsity(self.state.global_step, tasks)
         target_sparsity = target_sparsity.to(model.device)  # [B]

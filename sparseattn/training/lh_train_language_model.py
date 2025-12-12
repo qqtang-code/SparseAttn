@@ -37,7 +37,8 @@ import json
 
 from csv import reader
 
-from .dataset_packing import build_packed_dataset, PackedDataArguments  
+from .dataset_packing import build_packed_dataset, PackedDataCollator 
+import multiprocessing
 
 # from fla.models.nsa import AutoModelForCausalLM as NSAAutoModelForCausalLM
 
@@ -69,9 +70,6 @@ def main():
     # We now keep distinct sets of script_args, for a cleaner separation of concerns.
     parser = HfArgumentParser((ScriptArguments, TrainingArguments, DataArguments))
     script_args, training_args, data_args = parser.parse_args_into_dataclasses()
-    
-    parser_packing = HfArgumentParser(PackedDataArguments)
-    data_packing_args = parser.parse_args_into_dataclasses()
     
     # Setup logging
     logging.basicConfig(
@@ -329,19 +327,20 @@ def main():
         else:
             logger.warning("skipping token_scaled_loss -- model does not support it")
 
-    data_collator = PackingDataCollator(tokenizer, data_args, max_seq_len=data_args.per_device_max_tokens)
     assert training_args.max_steps is not None, "max_steps must be set!"
     
     # load_datasets
     if training_args.do_train:
         if training_args.seq_parallel_size <= 1:
+            data_collator = PackingDataCollator(tokenizer, data_args, max_seq_len=data_args.per_device_max_tokens)
+            multiprocessing.set_start_method("spawn", force=True) 
             train_dataset = build_dataset(
                 script_args.tokenized_mds_train,
                 tokenizer=tokenizer,
                 data_args=data_args,
                 is_training=True,
             )
-            
+            # breakpoint()
             class_indices = train_dataset.get_class_indices()
             logger.info(f"Using stratified sampling. Class distribution: {[len(v) for v in class_indices.values()]}")
             
@@ -386,15 +385,15 @@ def main():
             # 目标：SP 组内的 GPU 必须加载相同的数据 (Batch=1)
             # =========================================================
             logger.info(f"Setting up dataset for Sequence Parallelism (Size={training_args.seq_parallel_size})")
-
+            # breakpoint()
             # 1. 构建 Dataset (与单卡逻辑相同)
+            data_collator = PackedDataCollator(tokenizer, data_args, max_seq_len=data_args.per_device_max_tokens)
             train_dataset = build_packed_dataset(
                 script_args.tokenized_mds_train,
                 tokenizer=tokenizer,
                 data_args=data_args,
-                is_training=True,
             )
-            breakpoint()
+            # breakpoint()
             
             if not dist.is_initialized():
                  raise SamplerConditionError("Sequence Parallelism requires distributed environment.")
@@ -423,14 +422,14 @@ def main():
             
             train_dataloader = torch.utils.data.DataLoader(
                 dataset=train_dataset,
-                batch_size=1,
+                batch_size=1, # 组内批次大小
                 sampler=sampler,
                 collate_fn=data_collator,
                 num_workers=training_args.dataloader_num_workers,
                 pin_memory=training_args.dataloader_pin_memory,
                 drop_last=True, 
             )
-            breakpoint()
+            # breakpoint()
     
 
     # Initialize our Trainer
