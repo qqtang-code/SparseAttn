@@ -13,7 +13,6 @@ from transformers import (
     set_seed,
 )
 
-from .block_sparse_attention_triton.native_sparse_attention.module.llama_nsa import LlamaNSA
 import torch
 from transformers import LlamaForCausalLM, AutoTokenizer
 
@@ -37,6 +36,8 @@ from transformers.trainer_utils import get_last_checkpoint
 import json
 
 from csv import reader
+
+from .dataset_packing import build_packed_dataset, PackedDataArguments  
 
 # from fla.models.nsa import AutoModelForCausalLM as NSAAutoModelForCausalLM
 
@@ -68,6 +69,10 @@ def main():
     # We now keep distinct sets of script_args, for a cleaner separation of concerns.
     parser = HfArgumentParser((ScriptArguments, TrainingArguments, DataArguments))
     script_args, training_args, data_args = parser.parse_args_into_dataclasses()
+    
+    parser_packing = HfArgumentParser(PackedDataArguments)
+    data_packing_args = parser.parse_args_into_dataclasses()
+    
     # Setup logging
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -119,6 +124,7 @@ def main():
             revision=script_args.model_revision,
             use_auth_token=True if script_args.use_auth_token else None,
             toggle_type=training_args.toggle_type,
+            retrieval_mode=training_args.retrieval_mode,
             local_window_size=training_args.context_window_if_toggled,
             sink_size=training_args.sink_size,
             topk_k=training_args.topk_k,
@@ -328,82 +334,103 @@ def main():
     
     # load_datasets
     if training_args.do_train:
-        train_dataset = build_dataset(
-            script_args.tokenized_mds_train,
-            tokenizer=tokenizer,
-            data_args=data_args,
-            is_training=True,
-        )
-        
-        class_indices = train_dataset.get_class_indices()
-        logger.info(f"Using stratified sampling. Class distribution: {[len(v) for v in class_indices.values()]}")
-        
-        if dist.is_initialized():
-            world_size = torch.distributed.get_world_size()
-        else:
-            world_size = training_args.n_gpu
-
-        try:
-            if not dist.is_initialized():
-                raise SamplerConditionError("Distributed environment not initialized.")
-
-            custom_sampler = CustomDistributedStratifiedSampler(
-                dataset=train_dataset,
-                class_indices=class_indices,
-                num_gpus=world_size,
-                required_per_class=2,
-                seed=42,
+        if training_args.seq_parallel_size <= 1:
+            train_dataset = build_dataset(
+                script_args.tokenized_mds_train,
+                tokenizer=tokenizer,
+                data_args=data_args,
+                is_training=True,
             )
-            sampler = custom_sampler
             
-        except SamplerConditionError as e:
-            print(f"⚠️ Sampler fallback triggered: {e}. Using default DistributedSampler instead.")
+            class_indices = train_dataset.get_class_indices()
+            logger.info(f"Using stratified sampling. Class distribution: {[len(v) for v in class_indices.values()]}")
+            
+            if dist.is_initialized():
+                world_size = torch.distributed.get_world_size()
+            else:
+                world_size = training_args.n_gpu
+
+            try:
+                if not dist.is_initialized():
+                    raise SamplerConditionError("Distributed environment not initialized.")
+
+                custom_sampler = CustomDistributedStratifiedSampler(
+                    dataset=train_dataset,
+                    class_indices=class_indices,
+                    num_gpus=world_size,
+                    required_per_class=2,
+                    seed=42,
+                )
+                sampler = custom_sampler
+                
+            except SamplerConditionError as e:
+                print(f"⚠️ Sampler fallback triggered: {e}. Using default DistributedSampler instead.")
+                from torch.utils.data.distributed import DistributedSampler
+                sampler = DistributedSampler(
+                    dataset=train_dataset,
+                    shuffle=True,
+                )
+                
+            train_dataloader = torch.utils.data.DataLoader(
+                dataset=train_dataset,
+                batch_size=training_args.per_device_train_batch_size,
+                sampler=sampler,
+                collate_fn=data_collator,
+                num_workers=training_args.dataloader_num_workers,
+                pin_memory=training_args.dataloader_pin_memory,
+                drop_last=True, 
+            )
+        else:
+            # =========================================================
+            # Sequence Parallelism > 1 的处理逻辑
+            # 目标：SP 组内的 GPU 必须加载相同的数据 (Batch=1)
+            # =========================================================
+            logger.info(f"Setting up dataset for Sequence Parallelism (Size={training_args.seq_parallel_size})")
+
+            # 1. 构建 Dataset (与单卡逻辑相同)
+            train_dataset = build_packed_dataset(
+                script_args.tokenized_mds_train,
+                tokenizer=tokenizer,
+                data_args=data_args,
+                is_training=True,
+            )
+            breakpoint()
+            
+            if not dist.is_initialized():
+                 raise SamplerConditionError("Sequence Parallelism requires distributed environment.")
+            
+            world_size = dist.get_world_size()
+            global_rank = dist.get_rank()
+            sp_size = training_args.seq_parallel_size
+            
+            if world_size % sp_size != 0:
+                raise ValueError(f"World size ({xworld_size}) must be divisible by SP size ({sp_size})")
+
+            # 计算逻辑上的 DP 组数量和当前 rank 所属的 DP 组 ID
+            # 举例: 4卡, SP=2. Rank0,1 -> dp_rank 0; Rank2,3 -> dp_rank 1
+            dp_size = world_size // sp_size
+            dp_rank = global_rank // sp_size
+            
             from torch.utils.data.distributed import DistributedSampler
             sampler = DistributedSampler(
                 dataset=train_dataset,
+                num_replicas=dp_size,   # 这里告诉 Sampler 总共有 dp_size 个分片
+                rank=dp_rank,           # 这里告诉 Sampler 我是第 dp_rank 个分片
                 shuffle=True,
+                seed=training_args.seed,
+                drop_last=True,
             )
             
-        train_dataloader = torch.utils.data.DataLoader(
-            dataset=train_dataset,
-            batch_size=training_args.per_device_train_batch_size,
-            sampler=sampler,
-            collate_fn=data_collator,
-            num_workers=training_args.dataloader_num_workers,
-            pin_memory=training_args.dataloader_pin_memory,
-        )
-        
-    if training_args.do_eval:
-        # eval_dataset = {
-        #     x.split("/")[-1]: build_dataset(
-        #         [x], training_args, data_args, is_training=False
-        #     )
-        #     for x in script_args.tokenized_mds_validation
-        # }
-        eval_dataset = {
-            x.split("/")[-1]: build_dataset(
-                [x],
-                tokenizer=tokenizer,
-                data_args=data_args,
-                training_args=training_args,
-                is_training=False,
+            train_dataloader = torch.utils.data.DataLoader(
+                dataset=train_dataset,
+                batch_size=1,
+                sampler=sampler,
+                collate_fn=data_collator,
+                num_workers=training_args.dataloader_num_workers,
+                pin_memory=training_args.dataloader_pin_memory,
+                drop_last=True, 
             )
-            for x in script_args.tokenized_mds_validation
-        }
-
-    if training_args.do_predict:
-        test_dataset = {
-            x.split("/")[-1]: build_dataset(
-                [x],
-                tokenizer=tokenizer,
-                data_args=data_args,
-                training_args=training_args,
-                is_training=False,
-            )
-            for x in script_args.tokenized_mds_test
-        }
-
-    # data_collator = DataCollator(tokenizer, data_args)
+            breakpoint()
     
 
     # Initialize our Trainer
@@ -423,7 +450,6 @@ def main():
             model=model,
             args=training_args,
             train_dataset=train_dataset if training_args.do_train else None,
-            eval_dataset=eval_dataset if training_args.do_eval else None,
             tokenizer=tokenizer,
             data_collator=data_collator,
             log_loss=script_args.should_log_loss,
@@ -457,24 +483,6 @@ def main():
         trainer.save_metrics("train", metrics)
         trainer.save_state()
 
-    # Evaluation
-    if training_args.do_eval:
-        logger.info("*** Evaluate ***")
-        metrics = trainer.evaluate(eval_dataset)
-        trainer.log_metrics("eval", metrics)
-        trainer.save_metrics("eval", metrics)
-
-    # Predict
-    if training_args.do_predict:
-        logger.info("*** Predict ***")
-        predictions = trainer.predict(test_dataset=test_dataset)
-        predictions = predictions.predictions
-        predictions = tokenizer.batch_decode(predictions, skip_special_tokens=True)
-
-        # Save predictions to output directory
-        output_file = os.path.join(training_args.output_dir, "predictions.json")
-        with open(output_file, "w") as f:
-            json.dump(predictions, f, indent=2)
 
 
 if __name__ == "__main__":
