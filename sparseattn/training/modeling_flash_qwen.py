@@ -81,6 +81,9 @@ class PawQwen3Config(Qwen3Config):
         self.toggle_type = kwargs.pop("toggle_type", "streaming")
         self.sink_size = kwargs.pop("sink_size", 128)
         
+        # retrieval_mode
+        self.retrieval_mode = kwargs.pop("retrieval_mode", "full")
+        
         # Head Router
         self.pooling_mode = kwargs.pop("pooling_mode", "first_token")
         
@@ -717,6 +720,21 @@ class AttentionRouter(nn.Module):
             else:
                 pooled_latent = self._segment_pooling_single_batch(
                     x, range_ids, ['first_token'])
+        elif self.pooling_mode == 'q':
+            if cu_seq_len is not None:
+                pooled_latent = self._segment_pooling(
+                    x, range_ids, ['q'], cu_seq_len)  # [B, H, D]
+            else:
+                pooled_latent = self._segment_pooling_single_batch(
+                    x, range_ids, ['q'])
+        elif self.pooling_mode == 'ctx_q':
+            if cu_seq_len is not None:
+                pooled_latent = self._segment_pooling(
+                    x, range_ids, ['ctx_q'], cu_seq_len)  # [B, H, D]
+            else:
+                pooled_latent = self._segment_pooling_single_batch(
+                    x, range_ids, ['ctx_q'])
+
         else:
             raise ValueError(f"Unknown pooling_mode: {self.pooling_mode}")
         
@@ -732,8 +750,6 @@ class AttentionRouter(nn.Module):
 
         binary_logits = self.cls_router_head_agnostic(pooled_hidden_states)
         
-        # print(f"Rank: {dist.get_rank()} Router logits mean: {binary_logits.mean()} | Router logits std: {binary_logits.std()} | Router logits min: {binary_logits.min()} | Router logits max: {binary_logits.max()}")
-        
         if self.learnable_temp:
             tau = torch.exp(self.log_temp).clamp(0.3, 1.0)
         else:
@@ -741,8 +757,6 @@ class AttentionRouter(nn.Module):
 
         # --- Gumbel or Softmax routing ---
         if self.training:
-            # 生成 Gumbel 噪声: g = -log(-log(u))
-            # u ~ Uniform(0, 1)
             u = torch.rand_like(binary_logits)
             eps = 1e-8
             g = -torch.log(-torch.log(u + eps) + eps)
@@ -757,8 +771,10 @@ class AttentionRouter(nn.Module):
                 z_hard = torch.zeros_like(z_soft).scatter_(-1, z_soft.argmax(-1, keepdim=True), 1.0)
                 z = z_hard + (z_soft - z_soft.detach())  # [B, H, 2]
                 z = z[..., 1]  # [B, H]
+                z_soft = z_soft[..., 1]
+                z_soft = z_soft.unsqueeze(-1)
+                z = z.unsqueeze(-1)
                 entropy = -(z_soft * torch.log(z_soft + eps)).sum(dim=-1).mean() 
-                # 如果采用softmax，不要打开entropy
         else:
             # 推理阶段：直接根据 Logit 确定 (相当于 tau -> 0)
             # 或者也可以用 sigmoid(logit/tau) > 0.5，但在 deterministic 模式下 logit > 0 即可
@@ -785,13 +801,13 @@ class AttentionRouter(nn.Module):
         B, S, H, D = pooled_input.shape
         pooled_features_list = []
         
-        idx_map = {'first_token': (0, 1),'ctx': (2, 3), 'q': (4, 5), 'a': (6, 7)} 
+        POOL_MAP = {'first_token': (0, 1),'ctx': (2, 3), 'q': (4, 5), 'a': (6, 7), 'ctx_q': (2, 5)} 
         for i in range(B):
             sample_features = []
 
             for seg in segments:
-                start_idx, end_idx = idx_map[seg]
-                start, end = range_ids[i, start_idx:end_idx + 1].tolist()
+                start_idx, end_idx = POOL_MAP[seg]
+                start, end = range_ids[i, start_idx:end_idx + 1].tolist()[0], range_ids[i, start_idx:end_idx + 1].tolist()[-1]
                 if end >= start:
                     seg_slice = pooled_input[i, start : end + 1, :, :]
                     seg_pooled = seg_slice.mean(dim=0)  # [H, D]
@@ -828,7 +844,7 @@ class AttentionRouter(nn.Module):
         Returns:
             torch.Tensor: _description_
         """
-        POOL_MAP = {'first_token': (0, 1),'ctx': (2, 3), 'q': (4, 5), 'a': (6, 7)} 
+        POOL_MAP = {'first_token': (0, 1),'ctx': (2, 3), 'q': (4, 5), 'a': (6, 7), 'ctx_q': (2, 5)} 
         
         B = cu_seq_len.shape[0] - 1
         H, D = x.shape[1:]
@@ -839,7 +855,7 @@ class AttentionRouter(nn.Module):
             x_s, x_e = cu_seq_len[i], cu_seq_len[i + 1]
             for seg in segments:
                 start_idx, end_idx = POOL_MAP[seg]
-                start, end = range_ids[i, start_idx:end_idx + 1].tolist()
+                start, end = range_ids[i, start_idx:end_idx + 1].tolist()[0], range_ids[i, start_idx:end_idx + 1].tolist()[-1]
 
                 if end >= start:
                     seg_slice = x[x_s + start: x_s + end + 1,  : , :]
@@ -943,6 +959,8 @@ class Qwen3Attention(nn.Module):
         self.toggle_type = config.toggle_type
         self.sink_blocks = (config.sink_size + 127) // 128
         self.local_blocks = (config.local_window_size + 127) // 128
+        
+        self.retrieval_mode = getattr(config, "retrieval_mode", "full")
 
         if self.toggle_type == "streaming":
             self.streaming_info_kwargs = {
@@ -963,7 +981,7 @@ class Qwen3Attention(nn.Module):
             self.topk_k = int(getattr(config, "topk_k", 2048))
             self.topk_q_chunk = int(os.environ.get("TOPK_Q_CHUNK", 128))
             self.topk_k_chunk = int(os.environ.get("TOPK_K_CHUNK", 4096))
-        elif self.toggle_type == "xattn":
+        elif self.toggle_type == "xattn" or self.retrieval_mode == "xattn":
             from sparseattn.utils.ops.xattention_fa import xattn_flash_attn_func
             self.streaming_info_kwargs = {
                 "sink_block_num": self.sink_blocks,
@@ -1035,30 +1053,88 @@ class Qwen3Attention(nn.Module):
         )
 
     def interpolated_attention(self, q, kv, k, v, unpadded_lengths, z):
-        if unpadded_lengths is not None:
-            # varlen, ignore padding tokens, efficient for large batch with many paddings
-            cu_seqlens, max_seqlen = unpadded_lengths
-            attn_output = flash_attn_varlen_kvpacked_func(
-                q,
-                kv,
-                cu_seqlens,
-                cu_seqlens,
-                max_seqlen,
-                max_seqlen,
-                dropout_p=0.0,
-                softmax_scale=1.0 / self.norm_factor,
-                causal=True,
-                return_attn_probs=False,
-            )
+        if self.retrieval_mode == "full":
+            if unpadded_lengths is not None:
+                # varlen, ignore padding tokens, efficient for large batch with many paddings
+                cu_seqlens, max_seqlen = unpadded_lengths
+                attn_output = flash_attn_varlen_kvpacked_func(
+                    q,
+                    kv,
+                    cu_seqlens,
+                    cu_seqlens,
+                    max_seqlen,
+                    max_seqlen,
+                    dropout_p=0.0,
+                    softmax_scale=1.0 / self.norm_factor,
+                    causal=True,
+                    return_attn_probs=False,
+                )
+            else:
+                attn_output = flash_attn_kvpacked_func(
+                    q,
+                    kv,
+                    dropout_p=0.0,
+                    softmax_scale=1.0 / self.norm_factor,
+                    causal=True,
+                    return_attn_probs=False,
+                )
+        elif self.retrieval_mode == "xattn":
+            is_vlen_input = (q.dim() == 3) and (unpadded_lengths is not None)
+
+            if is_vlen_input:
+                k = k.repeat_interleave(self.num_key_value_groups, dim=1)
+                v = v.repeat_interleave(self.num_key_value_groups, dim=1)
+                q, k, v = q.transpose(0, 1).contiguous(), k.transpose(0, 1).contiguous(), v.transpose(0, 1).contiguous() 
+            else:
+                k = k.repeat_interleave(self.num_key_value_groups, dim=2)
+                v = v.repeat_interleave(self.num_key_value_groups, dim=2)
+                q, k, v = q.transpose(1, 2).contiguous(), k.transpose(1, 2).contiguous(), v.transpose(1, 2).contiguous() 
+                
+            stride = self.xattn_params["stride"]
+            threshold = self.xattn_params["threshold"]
+            norm = self.xattn_params["norm"]
+
+            if unpadded_lengths is not None:
+                cu_seqlens, max_seqlen = unpadded_lengths
+                attn_output = Xattention_prefill_dim3(
+                    q,
+                    k,
+                    v,
+                    stride,
+                    cu_seqlens,
+                    norm,
+                    threshold,
+                    use_triton=True,
+                )
+
+            else:
+                bsz,_,seqlen,_ = q.size()
+                if not torch.is_tensor(seqlen):
+                    seqlen = torch.tensor(seqlen, dtype=torch.int32, device=q.device)
+                max_seqlen = torch.max(seqlen).item()
+
+                cu_seqlens = torch.arange(
+                    0, (bsz + 1) * seqlen, step=seqlen, dtype=torch.int32, device=q.device
+                )
+                unpadded_lengths_xattn = (cu_seqlens, max_seqlen)
+
+                cu_seqlens, max_seqlen = unpadded_lengths_xattn
+                attn_output = Xattention_prefill_dim4(
+                    q,
+                    k,
+                    v,
+                    stride,
+                    cu_seqlens,
+                    norm,
+                    threshold,
+                    use_triton=True,
+                ).transpose(1, 2)  # B, T, H, D
+            if is_vlen_input:
+                q = q.transpose(0, 1).contiguous()
+            else:
+                q = q.transpose(1, 2).contiguous()
         else:
-            attn_output = flash_attn_kvpacked_func(
-                q,
-                kv,
-                dropout_p=0.0,
-                softmax_scale=1.0 / self.norm_factor,
-                causal=True,
-                return_attn_probs=False,
-            )
+            raise ValueError(f"Unknown retrieval mode: {self.retrieval_mode}")
 
         if self.toggle_type == "streaming" or self.toggle_type == "triangle":
             # breakpoint()

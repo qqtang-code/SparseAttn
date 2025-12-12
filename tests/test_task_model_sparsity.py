@@ -8,7 +8,7 @@ from typing import Dict, Any, List
 # --- 1. 配置路径和目标稀疏度 ---
 # 将此变量设置为您的日志文件路径
 # 注意: 实际运行需要替换成可访问的路径，此处仅为示例
-log_file_path = "/data1/lcm_lab/qqt/SparseAttn/sparseattn/checkpoints/masksonly_Qwen3-4B_bsz16_steps1000_lr1e-5_warmup0.1_sp0.3_cw2048_mlr1.0_rlr1.0sft3_pretrain_64k_xattn_mlp_new*2_nolinear_first_token_20reg_32k_11.28_wfrozen/log.out" # 假设日志内容已作为文件log.out
+log_file_path = "/data1/lcm_lab/qqt/SparseAttn/sparseattn/checkpoints/masksonly_Qwen3-4B_bsz16_steps125_lr1e-5_warmup0.1_sp0.3_cw2048_mlr1.0_rlr1.0sft3_pretrain_64k_xattn_mlp_new*2_nolinear_first_token_5reg_32k_11.30_wfrozen/log.out" # 假设日志内容已作为文件log.out
 print(f"假设日志文件路径为: {log_file_path}")
 
 # 您提供的目标稀疏度配置

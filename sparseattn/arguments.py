@@ -292,3 +292,451 @@ def parse_arguments():
         logger.info("overwriting temperature to 0.0 since do_sample is False")
 
     return args
+/data1/anaconda3/envs/qqt/lib/python3.11/site-packages/tensor_parallel/imports.py:1: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  import pkg_resources
+/data1/anaconda3/envs/qqt/lib/python3.11/site-packages/tensor_parallel/imports.py:1: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  import pkg_resources
+/data1/anaconda3/envs/qqt/lib/python3.11/site-packages/tensor_parallel/imports.py:1: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  import pkg_resources
+/data1/anaconda3/envs/qqt/lib/python3.11/site-packages/tensor_parallel/imports.py:1: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  import pkg_resources
+/data1/anaconda3/envs/qqt/lib/python3.11/site-packages/tensor_parallel/imports.py:1: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  import pkg_resources
+/data1/anaconda3/envs/qqt/lib/python3.11/site-packages/tensor_parallel/imports.py:1: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  import pkg_resources
+/data1/anaconda3/envs/qqt/lib/python3.11/site-packages/tensor_parallel/imports.py:1: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  import pkg_resources
+/data1/anaconda3/envs/qqt/lib/python3.11/site-packages/tensor_parallel/imports.py:1: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  import pkg_resources
+INFO 12-08 13:24:26 [__init__.py:239] Automatically detected platform cuda.
+INFO 12-08 13:24:26 [__init__.py:239] Automatically detected platform cuda.
+INFO 12-08 13:24:27 [__init__.py:239] Automatically detected platform cuda.
+INFO 12-08 13:24:27 [__init__.py:239] Automatically detected platform cuda.
+INFO 12-08 13:24:27 [__init__.py:239] Automatically detected platform cuda.
+INFO 12-08 13:24:27 [__init__.py:239] Automatically detected platform cuda.
+INFO 12-08 13:24:27 [__init__.py:239] Automatically detected platform cuda.
+INFO 12-08 13:24:27 [__init__.py:239] Automatically detected platform cuda.
+Xattention Import Fail
+Traceback (most recent call last):
+  File "<frozen runpy>", line 189, in _run_module_as_main
+  File "<frozen runpy>", line 112, in _get_module_details
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/__init__.py", line 31, in <module>
+    from .modeling_flash_llama import PawLlamaForCausalLM
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/modeling_flash_llama.py", line 66, in <module>
+    from sparseattn.src.Xattention import Xattention_prefill_dim3, Xattention_prefill_dim4
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/__init__.py", line 54, in <module>
+    from .training import DistributedAttention
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/__init__.py", line 32, in <module>
+    from .modeling_flash_qwen import PawQwen3ForCausalLM
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/modeling_flash_qwen.py", line 1914
+    head_contrastive_loss = - （(jsd_total / float(count)) * 0.1）
+                              ^
+SyntaxError: invalid character '（' (U+FF08)
+Xattention Import Fail
+Traceback (most recent call last):
+  File "<frozen runpy>", line 189, in _run_module_as_main
+  File "<frozen runpy>", line 112, in _get_module_details
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/__init__.py", line 31, in <module>
+    from .modeling_flash_llama import PawLlamaForCausalLM
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/modeling_flash_llama.py", line 66, in <module>
+    from sparseattn.src.Xattention import Xattention_prefill_dim3, Xattention_prefill_dim4
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/__init__.py", line 54, in <module>
+    from .training import DistributedAttention
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/__init__.py", line 32, in <module>
+    from .modeling_flash_qwen import PawQwen3ForCausalLM
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/modeling_flash_qwen.py", line 1914
+    head_contrastive_loss = - （(jsd_total / float(count)) * 0.1）
+                              ^
+SyntaxError: invalid character '（' (U+FF08)
+Xattention Import Fail
+Traceback (most recent call last):
+  File "<frozen runpy>", line 189, in _run_module_as_main
+  File "<frozen runpy>", line 112, in _get_module_details
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/__init__.py", line 31, in <module>
+    from .modeling_flash_llama import PawLlamaForCausalLM
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/modeling_flash_llama.py", line 66, in <module>
+    from sparseattn.src.Xattention import Xattention_prefill_dim3, Xattention_prefill_dim4
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/__init__.py", line 54, in <module>
+    from .training import DistributedAttention
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/__init__.py", line 32, in <module>
+    from .modeling_flash_qwen import PawQwen3ForCausalLM
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/modeling_flash_qwen.py", line 1914
+    head_contrastive_loss = - （(jsd_total / float(count)) * 0.1）
+                              ^
+SyntaxError: invalid character '（' (U+FF08)
+Xattention Import Fail
+Traceback (most recent call last):
+  File "<frozen runpy>", line 189, in _run_module_as_main
+  File "<frozen runpy>", line 112, in _get_module_details
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/__init__.py", line 31, in <module>
+    from .modeling_flash_llama import PawLlamaForCausalLM
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/modeling_flash_llama.py", line 66, in <module>
+    from sparseattn.src.Xattention import Xattention_prefill_dim3, Xattention_prefill_dim4
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/__init__.py", line 54, in <module>
+    from .training import DistributedAttention
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/__init__.py", line 32, in <module>
+    from .modeling_flash_qwen import PawQwen3ForCausalLM
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/modeling_flash_qwen.py", line 1914
+    head_contrastive_loss = - （(jsd_total / float(count)) * 0.1）
+                              ^
+SyntaxError: invalid character '（' (U+FF08)
+Xattention Import Fail
+Traceback (most recent call last):
+  File "<frozen runpy>", line 189, in _run_module_as_main
+  File "<frozen runpy>", line 112, in _get_module_details
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/__init__.py", line 31, in <module>
+    from .modeling_flash_llama import PawLlamaForCausalLM
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/modeling_flash_llama.py", line 66, in <module>
+    from sparseattn.src.Xattention import Xattention_prefill_dim3, Xattention_prefill_dim4
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/__init__.py", line 54, in <module>
+    from .training import DistributedAttention
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/__init__.py", line 32, in <module>
+    from .modeling_flash_qwen import PawQwen3ForCausalLM
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/modeling_flash_qwen.py", line 1914
+    head_contrastive_loss = - （(jsd_total / float(count)) * 0.1）
+                              ^
+SyntaxError: invalid character '（' (U+FF08)
+Xattention Import Fail
+Xattention Import Fail
+Traceback (most recent call last):
+  File "<frozen runpy>", line 189, in _run_module_as_main
+  File "<frozen runpy>", line 112, in _get_module_details
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/__init__.py", line 31, in <module>
+    from .modeling_flash_llama import PawLlamaForCausalLM
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/modeling_flash_llama.py", line 66, in <module>
+    from sparseattn.src.Xattention import Xattention_prefill_dim3, Xattention_prefill_dim4
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/__init__.py", line 54, in <module>
+    from .training import DistributedAttention
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/__init__.py", line 32, in <module>
+    from .modeling_flash_qwen import PawQwen3ForCausalLM
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/modeling_flash_qwen.py", line 1914
+    head_contrastive_loss = - （(jsd_total / float(count)) * 0.1）
+                              ^
+SyntaxError: invalid character '（' (U+FF08)
+Xattention Import Fail
+Traceback (most recent call last):
+  File "<frozen runpy>", line 189, in _run_module_as_main
+  File "<frozen runpy>", line 112, in _get_module_details
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/__init__.py", line 31, in <module>
+    from .modeling_flash_llama import PawLlamaForCausalLM
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/modeling_flash_llama.py", line 66, in <module>
+    from sparseattn.src.Xattention import Xattention_prefill_dim3, Xattention_prefill_dim4
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/__init__.py", line 54, in <module>
+    from .training import DistributedAttention
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/__init__.py", line 32, in <module>
+    from .modeling_flash_qwen import PawQwen3ForCausalLM
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/modeling_flash_qwen.py", line 1914
+    head_contrastive_loss = - （(jsd_total / float(count)) * 0.1）
+                              ^
+SyntaxError: invalid character '（' (U+FF08)
+Traceback (most recent call last):
+  File "<frozen runpy>", line 189, in _run_module_as_main
+  File "<frozen runpy>", line 112, in _get_module_details
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/__init__.py", line 31, in <module>
+    from .modeling_flash_llama import PawLlamaForCausalLM
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/modeling_flash_llama.py", line 66, in <module>
+    from sparseattn.src.Xattention import Xattention_prefill_dim3, Xattention_prefill_dim4
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/__init__.py", line 54, in <module>
+    from .training import DistributedAttention
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/__init__.py", line 32, in <module>
+    from .modeling_flash_qwen import PawQwen3ForCausalLM
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/modeling_flash_qwen.py", line 1914
+    head_contrastive_loss = - （(jsd_total / float(count)) * 0.1）
+                              ^
+SyntaxError: invalid character '（' (U+FF08)
+W1208 13:24:30.075000 1293261 site-packages/torch/distributed/elastic/multiprocessing/api.py:897] Sending process 1293296 closing signal SIGTERM
+W1208 13:24:30.078000 1293261 site-packages/torch/distributed/elastic/multiprocessing/api.py:897] Sending process 1293297 closing signal SIGTERM
+W1208 13:24:30.080000 1293261 site-packages/torch/distributed/elastic/multiprocessing/api.py:897] Sending process 1293298 closing signal SIGTERM
+W1208 13:24:30.082000 1293261 site-packages/torch/distributed/elastic/multiprocessing/api.py:897] Sending process 1293299 closing signal SIGTERM
+W1208 13:24:30.084000 1293261 site-packages/torch/distributed/elastic/multiprocessing/api.py:897] Sending process 1293300 closing signal SIGTERM
+W1208 13:24:30.089000 1293261 site-packages/torch/distributed/elastic/multiprocessing/api.py:897] Sending process 1293301 closing signal SIGTERM
+W1208 13:24:30.091000 1293261 site-packages/torch/distributed/elastic/multiprocessing/api.py:897] Sending process 1293303 closing signal SIGTERM
+E1208 13:24:30.680000 1293261 site-packages/torch/distributed/elastic/multiprocessing/api.py:869] failed (exitcode: 1) local_rank: 6 (pid: 1293302) of binary: /data1/anaconda3/envs/qqt/bin/python3
+Traceback (most recent call last):
+  File "/data1/anaconda3/envs/qqt/bin/torchrun", line 10, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/data1/anaconda3/envs/qqt/lib/python3.11/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 355, in wrapper
+    return f(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^
+  File "/data1/anaconda3/envs/qqt/lib/python3.11/site-packages/torch/distributed/run.py", line 918, in main
+    run(args)
+  File "/data1/anaconda3/envs/qqt/lib/python3.11/site-packages/torch/distributed/run.py", line 909, in run
+    elastic_launch(
+  File "/data1/anaconda3/envs/qqt/lib/python3.11/site-packages/torch/distributed/launcher/api.py", line 138, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data1/anaconda3/envs/qqt/lib/python3.11/site-packages/torch/distributed/launcher/api.py", line 269, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+============================================================
+training.lh_train_language_model FAILED
+------------------------------------------------------------
+Failures:
+  <NO_OTHER_FAILURES>
+------------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2025-12-08_13:24:30
+  host      : admin
+  rank      : 6 (local_rank: 6)
+  exitcode  : 1 (pid: 1293302)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+============================================================
+Traceback (most recent call last):
+  File "<frozen runpy>", line 189, in _run_module_as_main
+  File "<frozen runpy>", line 112, in _get_module_details
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/__init__.py", line 31, in <module>
+    from .modeling_flash_llama import PawLlamaForCausalLM
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/modeling_flash_llama.py", line 66, in <module>
+    from sparseattn.src.Xattention import Xattention_prefill_dim3, Xattention_prefill_dim4
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/__init__.py", line 102
+    INFO 12-08 13:24:26 [__init__.py:239] Automatically detected platform cuda.
+            ^
+SyntaxError: leading zeros in decimal integer literals are not permitted; use an 0o prefix for octal integers
+Traceback (most recent call last):
+  File "<frozen runpy>", line 189, in _run_module_as_main
+  File "<frozen runpy>", line 112, in _get_module_details
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/__init__.py", line 31, in <module>
+    from .modeling_flash_llama import PawLlamaForCausalLM
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/modeling_flash_llama.py", line 66, in <module>
+    from sparseattn.src.Xattention import Xattention_prefill_dim3, Xattention_prefill_dim4
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/__init__.py", line 102
+    INFO 12-08 13:24:26 [__init__.py:239] Automatically detected platform cuda.
+            ^
+SyntaxError: leading zeros in decimal integer literals are not permitted; use an 0o prefix for octal integers
+Traceback (most recent call last):
+Traceback (most recent call last):
+  File "<frozen runpy>", line 189, in _run_module_as_main
+  File "<frozen runpy>", line 189, in _run_module_as_main
+  File "<frozen runpy>", line 112, in _get_module_details
+  File "<frozen runpy>", line 112, in _get_module_details
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/__init__.py", line 31, in <module>
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/__init__.py", line 31, in <module>
+        from .modeling_flash_llama import PawLlamaForCausalLMfrom .modeling_flash_llama import PawLlamaForCausalLM
+
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/modeling_flash_llama.py", line 66, in <module>
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/modeling_flash_llama.py", line 66, in <module>
+        from sparseattn.src.Xattention import Xattention_prefill_dim3, Xattention_prefill_dim4from sparseattn.src.Xattention import Xattention_prefill_dim3, Xattention_prefill_dim4
+
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/__init__.py", line 102
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/__init__.py", line 102
+        INFO 12-08 13:24:26 [__init__.py:239] Automatically detected platform cuda.INFO 12-08 13:24:26 [__init__.py:239] Automatically detected platform cuda.
+
+                        ^^
+
+SyntaxErrorSyntaxError: : leading zeros in decimal integer literals are not permitted; use an 0o prefix for octal integersleading zeros in decimal integer literals are not permitted; use an 0o prefix for octal integers
+
+Traceback (most recent call last):
+  File "<frozen runpy>", line 189, in _run_module_as_main
+  File "<frozen runpy>", line 112, in _get_module_details
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/__init__.py", line 31, in <module>
+    from .modeling_flash_llama import PawLlamaForCausalLM
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/modeling_flash_llama.py", line 66, in <module>
+    from sparseattn.src.Xattention import Xattention_prefill_dim3, Xattention_prefill_dim4
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/__init__.py", line 102
+    INFO 12-08 13:24:26 [__init__.py:239] Automatically detected platform cuda.
+            ^
+SyntaxError: leading zeros in decimal integer literals are not permitted; use an 0o prefix for octal integers
+Traceback (most recent call last):
+  File "<frozen runpy>", line 189, in _run_module_as_main
+  File "<frozen runpy>", line 112, in _get_module_details
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/__init__.py", line 31, in <module>
+    from .modeling_flash_llama import PawLlamaForCausalLM
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/modeling_flash_llama.py", line 66, in <module>
+    from sparseattn.src.Xattention import Xattention_prefill_dim3, Xattention_prefill_dim4
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/__init__.py", line 102
+    INFO 12-08 13:24:26 [__init__.py:239] Automatically detected platform cuda.
+            ^
+SyntaxError: leading zeros in decimal integer literals are not permitted; use an 0o prefix for octal integers
+Traceback (most recent call last):
+  File "<frozen runpy>", line 189, in _run_module_as_main
+  File "<frozen runpy>", line 112, in _get_module_details
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/__init__.py", line 31, in <module>
+    from .modeling_flash_llama import PawLlamaForCausalLM
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/modeling_flash_llama.py", line 66, in <module>
+    from sparseattn.src.Xattention import Xattention_prefill_dim3, Xattention_prefill_dim4
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/__init__.py", line 102
+    INFO 12-08 13:24:26 [__init__.py:239] Automatically detected platform cuda.
+            ^
+SyntaxError: leading zeros in decimal integer literals are not permitted; use an 0o prefix for octal integers
+Traceback (most recent call last):
+  File "<frozen runpy>", line 189, in _run_module_as_main
+  File "<frozen runpy>", line 112, in _get_module_details
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/__init__.py", line 31, in <module>
+    from .modeling_flash_llama import PawLlamaForCausalLM
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/modeling_flash_llama.py", line 66, in <module>
+    from sparseattn.src.Xattention import Xattention_prefill_dim3, Xattention_prefill_dim4
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/__init__.py", line 102
+    INFO 12-08 13:24:26 [__init__.py:239] Automatically detected platform cuda.
+            ^
+SyntaxError: leading zeros in decimal integer literals are not permitted; use an 0o prefix for octal integers
+W1208 13:24:40.039000 1294469 site-packages/torch/distributed/elastic/multiprocessing/api.py:897] Sending process 1294509 closing signal SIGTERM
+W1208 13:24:40.040000 1294469 site-packages/torch/distributed/elastic/multiprocessing/api.py:897] Sending process 1294510 closing signal SIGTERM
+W1208 13:24:40.041000 1294469 site-packages/torch/distributed/elastic/multiprocessing/api.py:897] Sending process 1294511 closing signal SIGTERM
+W1208 13:24:40.042000 1294469 site-packages/torch/distributed/elastic/multiprocessing/api.py:897] Sending process 1294512 closing signal SIGTERM
+W1208 13:24:40.042000 1294469 site-packages/torch/distributed/elastic/multiprocessing/api.py:897] Sending process 1294513 closing signal SIGTERM
+W1208 13:24:40.043000 1294469 site-packages/torch/distributed/elastic/multiprocessing/api.py:897] Sending process 1294514 closing signal SIGTERM
+W1208 13:24:40.043000 1294469 site-packages/torch/distributed/elastic/multiprocessing/api.py:897] Sending process 1294517 closing signal SIGTERM
+E1208 13:24:40.271000 1294469 site-packages/torch/distributed/elastic/multiprocessing/api.py:869] failed (exitcode: 1) local_rank: 6 (pid: 1294516) of binary: /data1/anaconda3/envs/qqt/bin/python3
+Traceback (most recent call last):
+  File "/data1/anaconda3/envs/qqt/bin/torchrun", line 10, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/data1/anaconda3/envs/qqt/lib/python3.11/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 355, in wrapper
+    return f(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^
+  File "/data1/anaconda3/envs/qqt/lib/python3.11/site-packages/torch/distributed/run.py", line 918, in main
+    run(args)
+  File "/data1/anaconda3/envs/qqt/lib/python3.11/site-packages/torch/distributed/run.py", line 909, in run
+    elastic_launch(
+  File "/data1/anaconda3/envs/qqt/lib/python3.11/site-packages/torch/distributed/launcher/api.py", line 138, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data1/anaconda3/envs/qqt/lib/python3.11/site-packages/torch/distributed/launcher/api.py", line 269, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+============================================================
+training.lh_train_language_model FAILED
+------------------------------------------------------------
+Failures:
+  <NO_OTHER_FAILURES>
+------------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2025-12-08_13:24:40
+  host      : admin
+  rank      : 6 (local_rank: 6)
+  exitcode  : 1 (pid: 1294516)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+============================================================
+Traceback (most recent call last):
+  File "<frozen runpy>", line 189, in _run_module_as_main
+  File "<frozen runpy>", line 112, in _get_module_details
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/__init__.py", line 31, in <module>
+    from .modeling_flash_llama import PawLlamaForCausalLM
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/modeling_flash_llama.py", line 66, in <module>
+    from sparseattn.src.Xattention import Xattention_prefill_dim3, Xattention_prefill_dim4
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/__init__.py", line 102
+    INFO 12-08 13:24:26 [__init__.py:239] Automatically detected platform cuda.
+            ^
+SyntaxError: leading zeros in decimal integer literals are not permitted; use an 0o prefix for octal integers
+Traceback (most recent call last):
+  File "<frozen runpy>", line 189, in _run_module_as_main
+  File "<frozen runpy>", line 112, in _get_module_details
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/__init__.py", line 31, in <module>
+    from .modeling_flash_llama import PawLlamaForCausalLM
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/modeling_flash_llama.py", line 66, in <module>
+    from sparseattn.src.Xattention import Xattention_prefill_dim3, Xattention_prefill_dim4
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/__init__.py", line 102
+    INFO 12-08 13:24:26 [__init__.py:239] Automatically detected platform cuda.
+            ^
+SyntaxError: leading zeros in decimal integer literals are not permitted; use an 0o prefix for octal integers
+Traceback (most recent call last):
+  File "<frozen runpy>", line 189, in _run_module_as_main
+  File "<frozen runpy>", line 112, in _get_module_details
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/__init__.py", line 31, in <module>
+    from .modeling_flash_llama import PawLlamaForCausalLM
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/modeling_flash_llama.py", line 66, in <module>
+    from sparseattn.src.Xattention import Xattention_prefill_dim3, Xattention_prefill_dim4
+Traceback (most recent call last):
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/__init__.py", line 102
+    INFO 12-08 13:24:26 [__init__.py:239] Automatically detected platform cuda.
+       File "<frozen runpy>", line 189, in _run_module_as_main
+        File "<frozen runpy>", line 112, in _get_module_details
+ ^
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/__init__.py", line 31, in <module>
+SyntaxError: leading zeros in decimal integer literals are not permitted; use an 0o prefix for octal integers
+    from .modeling_flash_llama import PawLlamaForCausalLM
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/modeling_flash_llama.py", line 66, in <module>
+    from sparseattn.src.Xattention import Xattention_prefill_dim3, Xattention_prefill_dim4
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/__init__.py", line 102
+    INFO 12-08 13:24:26 [__init__.py:239] Automatically detected platform cuda.
+            ^
+SyntaxError: leading zeros in decimal integer literals are not permitted; use an 0o prefix for octal integers
+Traceback (most recent call last):
+  File "<frozen runpy>", line 189, in _run_module_as_main
+  File "<frozen runpy>", line 112, in _get_module_details
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/__init__.py", line 31, in <module>
+    from .modeling_flash_llama import PawLlamaForCausalLM
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/modeling_flash_llama.py", line 66, in <module>
+    from sparseattn.src.Xattention import Xattention_prefill_dim3, Xattention_prefill_dim4
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/__init__.py", line 102
+    INFO 12-08 13:24:26 [__init__.py:239] Automatically detected platform cuda.
+            ^
+SyntaxError: leading zeros in decimal integer literals are not permitted; use an 0o prefix for octal integers
+Traceback (most recent call last):
+  File "<frozen runpy>", line 189, in _run_module_as_main
+  File "<frozen runpy>", line 112, in _get_module_details
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/__init__.py", line 31, in <module>
+    from .modeling_flash_llama import PawLlamaForCausalLM
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/modeling_flash_llama.py", line 66, in <module>
+    from sparseattn.src.Xattention import Xattention_prefill_dim3, Xattention_prefill_dim4
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/__init__.py", line 102
+    INFO 12-08 13:24:26 [__init__.py:239] Automatically detected platform cuda.
+            ^
+SyntaxError: leading zeros in decimal integer literals are not permitted; use an 0o prefix for octal integers
+Traceback (most recent call last):
+  File "<frozen runpy>", line 189, in _run_module_as_main
+  File "<frozen runpy>", line 112, in _get_module_details
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/__init__.py", line 31, in <module>
+    from .modeling_flash_llama import PawLlamaForCausalLM
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/modeling_flash_llama.py", line 66, in <module>
+    from sparseattn.src.Xattention import Xattention_prefill_dim3, Xattention_prefill_dim4
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/__init__.py", line 102
+    INFO 12-08 13:24:26 [__init__.py:239] Automatically detected platform cuda.
+            ^
+SyntaxError: leading zeros in decimal integer literals are not permitted; use an 0o prefix for octal integers
+Traceback (most recent call last):
+  File "<frozen runpy>", line 189, in _run_module_as_main
+  File "<frozen runpy>", line 112, in _get_module_details
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/__init__.py", line 31, in <module>
+    from .modeling_flash_llama import PawLlamaForCausalLM
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/training/modeling_flash_llama.py", line 66, in <module>
+    from sparseattn.src.Xattention import Xattention_prefill_dim3, Xattention_prefill_dim4
+  File "/data1/lcm_lab/qqt/SparseAttn/sparseattn/__init__.py", line 102
+    INFO 12-08 13:24:26 [__init__.py:239] Automatically detected platform cuda.
+            ^
+SyntaxError: leading zeros in decimal integer literals are not permitted; use an 0o prefix for octal integers
+W1208 13:24:49.689000 1295069 site-packages/torch/distributed/elastic/multiprocessing/api.py:897] Sending process 1295115 closing signal SIGTERM
+W1208 13:24:49.689000 1295069 site-packages/torch/distributed/elastic/multiprocessing/api.py:897] Sending process 1295117 closing signal SIGTERM
+W1208 13:24:49.690000 1295069 site-packages/torch/distributed/elastic/multiprocessing/api.py:897] Sending process 1295118 closing signal SIGTERM
+W1208 13:24:49.690000 1295069 site-packages/torch/distributed/elastic/multiprocessing/api.py:897] Sending process 1295119 closing signal SIGTERM
+W1208 13:24:49.691000 1295069 site-packages/torch/distributed/elastic/multiprocessing/api.py:897] Sending process 1295120 closing signal SIGTERM
+W1208 13:24:49.691000 1295069 site-packages/torch/distributed/elastic/multiprocessing/api.py:897] Sending process 1295121 closing signal SIGTERM
+W1208 13:24:49.692000 1295069 site-packages/torch/distributed/elastic/multiprocessing/api.py:897] Sending process 1295122 closing signal SIGTERM
+E1208 13:24:49.919000 1295069 site-packages/torch/distributed/elastic/multiprocessing/api.py:869] failed (exitcode: 1) local_rank: 1 (pid: 1295116) of binary: /data1/anaconda3/envs/qqt/bin/python3
+Traceback (most recent call last):
+  File "/data1/anaconda3/envs/qqt/bin/torchrun", line 10, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/data1/anaconda3/envs/qqt/lib/python3.11/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 355, in wrapper
+    return f(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^
+  File "/data1/anaconda3/envs/qqt/lib/python3.11/site-packages/torch/distributed/run.py", line 918, in main
+    run(args)
+  File "/data1/anaconda3/envs/qqt/lib/python3.11/site-packages/torch/distributed/run.py", line 909, in run
+    elastic_launch(
+  File "/data1/anaconda3/envs/qqt/lib/python3.11/site-packages/torch/distributed/launcher/api.py", line 138, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data1/anaconda3/envs/qqt/lib/python3.11/site-packages/torch/distributed/launcher/api.py", line 269, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+============================================================
+training.lh_train_language_model FAILED
+------------------------------------------------------------
+Failures:
+  <NO_OTHER_FAILURES>
+------------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2025-12-08_13:24:49
+  host      : admin
+  rank      : 1 (local_rank: 1)
+  exitcode  : 1 (pid: 1295116)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+============================================================

@@ -44,9 +44,20 @@ def load_sparse_model(model_path):
     )
     return model
 
+def get_task(metadata_str):
+    try:
+        if isinstance(metadata_str, str):
+            meta_dict = ast.literal_eval(metadata_str)
+        elif isinstance(metadata_str, dict):
+            meta_dict = metadata_str
+        else:
+            return None
+        return meta_dict.get('task')
+    except Exception:
+        return None
 
 def main():
-    model_path = "/data1/lcm_lab/qqt/SparseAttn/sparseattn/checkpoints/steps125_qwen_mix_sft_32K_xattn_mlp_linear_first_token_10reg_nolambda_abs*100_head_contrast_wfrozen"
+    model_path = "/data1/lcm_lab/qqt/SparseAttn/sparseattn/checkpoints/12.12sp1steps125_full_xattn_task_head_contrast_64k/checkpoint-111"
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
@@ -54,6 +65,27 @@ def main():
     
     from datasets import Dataset as HFDataset
     from sparseattn.training.dataset_batch import ParquetDataset
+
+    import pandas as pd
+    import ast
+    import numpy as np
+
+    file_path = "/data2/public_data/qwen_mix_sft_32K/all.parquet"
+    # file_path = "/data2/public_data/mix_sft_64k/all.parquet"
+
+    df = pd.read_parquet(file_path)
+
+    target_task = "Summarization"# Single QA, Summarization
+
+    df["task"] = df["metadata"].apply(get_task)
+
+    df_target = df[df["task"] == target_task]
+
+    row = df_target.iloc[0]
+    prompt = row['question']
+    context = row['context']
+    answer = row['answer']
+    metadata = row['metadata']
 
     dummy_data = {
         "context": [""],
@@ -77,13 +109,11 @@ def main():
 
     model.eval()
 
-    prompt = "Hello, how are you?"
-
     fake_item = {
-        "context": "",                     # no context
-        "question": prompt,                # your prompt
-        "answer": "",                      # empty for inference
-        "metadata": {"task": "Summarization", "flag": "0"}, # Single QA, Summarization
+        "context": context,                  
+        "question": prompt,               
+        "answer": "",           
+        "metadata": metadata,# Single QA, Summarization
     }
 
     input_ids, labels, attention_mask, segment_ids, range_ids, class_id = dataset._build_sft_input_and_labels(
@@ -93,26 +123,30 @@ def main():
     actual_len = attention_mask.sum().item()  # number of non-pad tokens
     input_ids = input_ids[:actual_len].unsqueeze(0).to(model.device)          # [1, L]
     attention_mask = attention_mask[:actual_len].unsqueeze(0).to(model.device)  # [1, L]
-    segment_ids = segment_ids[:actual_len].unsqueeze(0).to(model.device)       # [1, L]
-    range_ids = range_ids.unsqueeze(0).to(model.device)                        # [1, 8] — no seq dim, keep as-is
-    task_ids = class_id.unsqueeze(0).to(model.device)                          # [1]
+    
+    # longbench_prediction = "/data1/lcm_lab/sora/LOOM-Eval/benchmarks/General/LongBench/prediction/12.11steps125_qwen_mix_sft_32K_xattn_mlp_ctx_q_new_softmax_wfrozen_LongBench_64k/lcc.jsonl"
+    
+    # # 读取jsonl文件
+    # with open(longbench_prediction, 'r') as f:
+    #     data = [json.loads(line) for line in f]
+    # input_ids = tokenizer.encode(data[0]["input_text"], return_tensors="pt").to(model.device)
+    # attention_mask = torch.ones_like(input_ids).to(model.device)
+    # actual_len = input_ids.shape[-1]
 
     model_inputs = {
         "input_ids": input_ids,
         "attention_mask": attention_mask,
-        "segment_ids": segment_ids,
-        "range_ids": range_ids,
-        "task_ids": task_ids,
     }
 
     with torch.no_grad():
         outputs = model.generate(
             **model_inputs,
-            max_new_tokens=50,
+            max_new_tokens=10,
             use_cache=True,
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id,
         )
+    print(f"sparsity:{model.prefill_sparsity}")
 
     generated_ids = outputs[0][actual_len:]
     response = tokenizer.decode(generated_ids, skip_special_tokens=True)

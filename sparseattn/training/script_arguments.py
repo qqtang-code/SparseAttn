@@ -205,6 +205,13 @@ class TrainingArguments(HfTrainingArguments):
         },
     )
     
+    retrieval_mode: str = field(
+        default="full",
+        metadata={
+            "help": "The retrieval mode to use. Options: 'full', 'xattn'"
+        },
+    )
+    
     ## Streaming
     toggle_type: str = field(
         default="streaming",
