@@ -807,7 +807,7 @@ class AttentionRouter(nn.Module):
 
             for seg in segments:
                 start_idx, end_idx = POOL_MAP[seg]
-                start, end = range_ids[i, start_idx:end_idx + 1].tolist()
+                start, end = range_ids[i, start_idx:end_idx + 1].tolist()[0], range_ids[i, start_idx:end_idx + 1].tolist()[-1]
                 if end >= start:
                     seg_slice = pooled_input[i, start : end + 1, :, :]
                     seg_pooled = seg_slice.mean(dim=0)  # [H, D]
@@ -855,7 +855,7 @@ class AttentionRouter(nn.Module):
             x_s, x_e = cu_seq_len[i], cu_seq_len[i + 1]
             for seg in segments:
                 start_idx, end_idx = POOL_MAP[seg]
-                start, end = range_ids[i, start_idx:end_idx + 1].tolist()
+                start, end = range_ids[i, start_idx:end_idx + 1].tolist()[0], range_ids[i, start_idx:end_idx + 1].tolist()[-1]
 
                 if end >= start:
                     seg_slice = x[x_s + start: x_s + end + 1,  : , :]
