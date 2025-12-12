@@ -1443,8 +1443,25 @@ class Qwen3Attention(nn.Module):
                 unpadded_lengths = (cu_seqlens, max_seqlen)
 
                 cu_seqlens, max_seqlen = unpadded_lengths
-                
-                head_mask_type = (1 - z_kv_batch[0, :, 0]).int()# block sparse attention must
+                if self.retrieval_mode == "full" and self.toggle_type == "xattn":
+                    head_mask_type = (1 - z_kv_batch[0, :, 0]).int()
+                elif self.retrieval_mode == "full" and self.toggle_type == "streaming":
+                    head_mask_type = torch.where(
+                        z_kv_batch[0, :, 0] == 1,
+                        torch.tensor(0, dtype=torch.int, device=z_kv_batch.device),
+                        torch.tensor(-1, dtype=torch.int, device=z_kv_batch.device)
+                    )
+                elif self.retrieval_mode == "xattn" and self.toggle_type == "streaming":
+                    head_mask_type = torch.where(
+                        z_kv_batch[0, :, 0] == 1,
+                        torch.tensor(1, dtype=torch.int, device=z_kv_batch.device),
+                        torch.tensor(-1, dtype=torch.int, device=z_kv_batch.device)
+                    )
+                else:
+                    raise SamplerConditionError(
+                        f"retrieval_mode: {self.retrieval_mode} and toggle_type: {self.toggle_type} is not supported"
+                    )
+                    
                 
                 attn_output = Xattention_prefill_dim4(
                     q,
