@@ -806,7 +806,7 @@ class AttentionRouter(nn.Module):
             sample_features = []
 
             for seg in segments:
-                start_idx, end_idx = idx_map[seg]
+                start_idx, end_idx = POOL_MAP[seg]
                 start, end = range_ids[i, start_idx:end_idx + 1].tolist()
                 if end >= start:
                     seg_slice = pooled_input[i, start : end + 1, :, :]
