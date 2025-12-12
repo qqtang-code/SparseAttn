@@ -729,18 +729,11 @@ class AttentionRouter(nn.Module):
                     x, range_ids, ['q'])
         elif self.pooling_mode == 'ctx_q':
             if cu_seq_len is not None:
-                B = cu_seq_len.shape[0] - 1
-                H, D = x.shape[1:]
-                sample_features = []
-                for i in range(B):
-                    x_s, x_e = cu_seq_len[i], cu_seq_len[i + 1]
-                    seg_slice = x[x_s:x_e]              # [Ti, H, D]
-                    seg_pooled = seg_slice.mean(dim=0)  # [H, D]
-                    sample_features.append(seg_pooled)
-
-                pooled_latent = torch.stack(sample_features, dim=0)
+                pooled_latent = self._segment_pooling(
+                    x, range_ids, ['ctx_q'], cu_seq_len)  # [B, H, D]
             else:
-                pooled_latent = x.mean(dim=1)  # [H, D]
+                pooled_latent = self._segment_pooling_single_batch(
+                    x, range_ids, ['ctx_q'])
 
         else:
             raise ValueError(f"Unknown pooling_mode: {self.pooling_mode}")
@@ -808,7 +801,7 @@ class AttentionRouter(nn.Module):
         B, S, H, D = pooled_input.shape
         pooled_features_list = []
         
-        idx_map = {'first_token': (0, 1),'ctx': (2, 3), 'q': (4, 5), 'a': (6, 7)} 
+        POOL_MAP = {'first_token': (0, 1),'ctx': (2, 3), 'q': (4, 5), 'a': (6, 7), 'ctx_q': (2, 5)} 
         for i in range(B):
             sample_features = []
 
@@ -851,7 +844,7 @@ class AttentionRouter(nn.Module):
         Returns:
             torch.Tensor: _description_
         """
-        POOL_MAP = {'first_token': (0, 1),'ctx': (2, 3), 'q': (4, 5), 'a': (6, 7)} 
+        POOL_MAP = {'first_token': (0, 1),'ctx': (2, 3), 'q': (4, 5), 'a': (6, 7), 'ctx_q': (2, 5)} 
         
         B = cu_seq_len.shape[0] - 1
         H, D = x.shape[1:]
