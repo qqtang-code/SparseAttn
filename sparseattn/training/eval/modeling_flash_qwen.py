@@ -1445,6 +1445,7 @@ class Qwen3Attention(nn.Module):
                 cu_seqlens, max_seqlen = unpadded_lengths
                 
                 head_mask_type = (1 - z_kv_batch[0, :, 0]).int()# block sparse attention must
+                
                 attn_output = Xattention_prefill_dim4(
                     q,
                     k,

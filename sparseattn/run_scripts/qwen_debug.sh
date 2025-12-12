@@ -1,9 +1,9 @@
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export CUDA_VISIBLE_DEVICES=7
 
 # Model and training configuration
 model=${MODEL:-"/data2/hf_models/Qwen3-4B"}
 bsz=${BSZ:-48}
-seq=${SEQ:-6}
+seq=${SEQ:-1}
 lr=${LR:-1e-3}
 steps=${STEPS:-200}
 save_steps=${SAVE:-5000}
@@ -60,7 +60,7 @@ out_dir="checkpoints/$run_name"
 mkdir -p $out_dir
 
 # Calculate GPU and node configuration
-num_gpus=8
+num_gpus=1
 
 num_nodes=$(scontrol show hostnames "$SLURM_JOB_NODELIST" 2>/dev/null | wc -l)
 if [ $num_nodes == 0 ]; then
@@ -77,8 +77,8 @@ header="torchrun \
 
 # header="python -m debugpy --listen 0.0.0.0:5678 --wait-for-client -m training.lh_train_language_model"
 
-accu=$(($bsz / $seq / $num_gpus / $num_nodes))
-# accu=1
+# accu=$(($bsz / $seq / $num_gpus / $num_nodes))
+accu=1
 
 # Environment variables
 export OMP_NUM_THREADS=$num_gpus

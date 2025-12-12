@@ -1,5 +1,5 @@
 # Model and training configuration
-model=${MODEL:-"/data1/hf_model/Meta-Llama-3.1-8B-Instruct"}
+model=${MODEL:-"/data1/lcm_lab/yy/checkpoint/Llama-3.2-1B-Instruct"}
 bsz=${BSZ:-16}
 seq=${SEQ:-1}
 lr=${LR:-1e-5}
@@ -10,7 +10,7 @@ warmup=${WARMUP:-0.1}
 suffix=${SUFFIX:-""}
 overrides=${OVERRIDES:-""}
 min_lr_ratio=${MIN_LR_RATIO:-0.01}
-seq_parallel_size=${SEQ_PARALLEL_SIZE:-1}
+seq_parallel_size=${SEQ_PARALLEL_SIZE:-2}
 
 # FSDP configuration
 # 0=Disable, 1=FULL_SHARD, 2=SHARD_GRAD_OP, 3=NO_SHARD, 4=HYBRID_SHARD, 5=HYBRID_SHARD_ZERO2
@@ -18,7 +18,7 @@ fsdp=${FSDP:-"1"}
 gc=${GC:-"1"}
 
 # PruLong-specific arguments
-max_toks=${MAX_TOKS:-32768}
+max_toks=${MAX_TOKS:-256}
 # max_toks=${MAX_TOKS:-256}
 start_head_sparsity=${START_HEAD_SPARSITY:-0.0}
 end_head_sparsity=${END_HEAD_SPARSITY:-0.7}
@@ -26,6 +26,7 @@ mask_learning_rate=${MASK_LEARNING_RATE:-1.0}
 reg_learning_rate=${REG_LEARNING_RATE:-1.0}
 sparsity_warmup_ratio=${SPARSITY_WARMUP_RATIO:-0.8}
 disable_linear_reg_term=${DISABLE_LINEAR_REG_TERM:-false}
+
 # topk
 context_window_if_toggled=${CONTEXT_WINDOW_IF_TOGGLED:-2048}
 freeze_weights=${FREEZE_WEIGHTS:-true}
@@ -74,7 +75,7 @@ if [ -z "$CUDA_VISIBLE_DEVICES" ]; then
 else
     num_gpus=$(echo $CUDA_VISIBLE_DEVICES | tr ',' '\n' | wc -l)
 fi
-num_gpus=8
+num_gpus=2
 
 num_nodes=$(scontrol show hostnames "$SLURM_JOB_NODELIST" 2>/dev/null | wc -l)
 if [ $num_nodes == 0 ]; then
