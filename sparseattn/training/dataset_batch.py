@@ -119,9 +119,11 @@ class ParquetDataset(Dataset):
         flag = str(meta.get("flag", "0"))
 
         task_type = "Other"
+        is_prefix = True
         try:
             meta_dict = ast.literal_eval(meta) if isinstance(meta, str) else meta
             task_type = meta_dict.get('task', 'Other')
+            is_prefix = meta_dict.get('is_prefix', True)
         except Exception:
             pass
 
@@ -173,20 +175,35 @@ class ParquetDataset(Dataset):
         segment_ids = []
         special_start = special_end = 0
 
-        
-        # Context (Segment 1)
-        ctx_start = current_len
-        full_input_ids.extend(ctx_ids)
-        segment_ids.extend([1] * len(ctx_ids))
-        current_len += len(ctx_ids)
-        ctx_end = current_len - 1 if ctx_ids else ctx_start
-        
-        # Question (Segment 2)
-        q_start = current_len
-        full_input_ids.extend(q_ids)
-        segment_ids.extend([2] * len(q_ids))
-        current_len += len(q_ids)
-        q_end = current_len - 1 if q_ids else q_start
+        if is_prefix:
+            # Question (Segment 2)
+            q_start = current_len
+            full_input_ids.extend(q_ids)
+            segment_ids.extend([2] * len(q_ids))
+            current_len += len(q_ids)
+            q_end = current_len - 1 if q_ids else q_start
+            
+            # Context (Segment 1)
+            ctx_start = current_len
+            full_input_ids.extend(ctx_ids)
+            segment_ids.extend([1] * len(ctx_ids))
+            current_len += len(ctx_ids)
+            ctx_end = current_len - 1 if ctx_ids else ctx_start
+            
+        else:
+            # Context (Segment 1)
+            ctx_start = current_len
+            full_input_ids.extend(ctx_ids)
+            segment_ids.extend([1] * len(ctx_ids))
+            current_len += len(ctx_ids)
+            ctx_end = current_len - 1 if ctx_ids else ctx_start
+            
+            # Question (Segment 2)
+            q_start = current_len
+            full_input_ids.extend(q_ids)
+            segment_ids.extend([2] * len(q_ids))
+            current_len += len(q_ids)
+            q_end = current_len - 1 if q_ids else q_start
         
         # Answer (Segment 3) + Separator
         a_start = current_len
