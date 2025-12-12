@@ -2016,26 +2016,6 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
         current_step = getattr(self.config, "global_step", 0) 
 
-        if self.training and (dist.get_rank() == 0) and (current_step % save_interval == 0):
-            try:
-                save_dir = os.path.join("/data1/lcm_lab/qqt/SparseAttn/sparseattn/", "nolambda_abs*100")
-                os.makedirs(save_dir, exist_ok=True)
-
-                import time
-                timestamp = int(time.time() * 1000)
-                save_path = os.path.join(save_dir, f"batch_step{current_step}_{timestamp}.pt")
-
-                torch.save({
-                    "global_hidden": global_hidden.detach().cpu().half(),
-                    "global_task": global_task.detach().cpu(),
-                    "unique_tasks": unique_tasks.cpu(),
-                    "loss_val": contrastive_loss.item() if isinstance(contrastive_loss, torch.Tensor) else contrastive_loss,
-                    "prototypes": prototypes.detach().cpu() if unique_tasks.numel() > 1 else None
-                }, save_path)
-
-                print(f"[Diagnostic] Saved batch analysis to {save_path}", flush=True)
-            except Exception as e:
-                print(f"[Diagnostic] Save failed: {e}", flush=True)
         hidden_states = self.norm(hidden_states)
 
         # add hidden states from the last decoder layer
