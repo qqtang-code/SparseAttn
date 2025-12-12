@@ -404,7 +404,7 @@ def main():
             sp_size = training_args.seq_parallel_size
             
             if world_size % sp_size != 0:
-                raise ValueError(f"World size ({xworld_size}) must be divisible by SP size ({sp_size})")
+                raise ValueError(f"World size ({world_size}) must be divisible by SP size ({sp_size})")
 
             # 计算逻辑上的 DP 组数量和当前 rank 所属的 DP 组 ID
             # 举例: 4卡, SP=2. Rank0,1 -> dp_rank 0; Rank2,3 -> dp_rank 1
