@@ -960,7 +960,31 @@ class Qwen3Attention(nn.Module):
         self.sink_blocks = (config.sink_size + 127) // 128
         self.local_blocks = (config.local_window_size + 127) // 128
         
-        self.retrieval_mode = getattr(config, "retrieval_mode", "full")
+        self.retrieval_mode = config.retrieval_mode
+
+        if self.retrieval_mode == "xattn":
+            from sparseattn.utils.ops.xattention_fa import xattn_flash_attn_func
+            self.streaming_info_kwargs = {
+                "sink_block_num": self.sink_blocks,
+                "local_block_num": self.local_blocks,
+            }
+            # self.head_indices = self.num_heads // self.num_key_value_heads
+            self.head_indices = self.num_heads
+            self.xattn_flash_attn_func = xattn_flash_attn_func
+            self.granularity = int(getattr(config, "block_size", 64))
+            self.xattn_params = {
+                "stride": 16,
+                "norm": 1,
+                "softmax": True,
+                "threshold": 0.9,
+                "chunk_size": 16384,
+                "select_mode": "inverse",
+                "use_triton": True,
+                "causal": True,
+                "kdb": 1,
+                "keep_sink": True,
+                "keep_recent": True,
+            }
 
         if self.toggle_type == "streaming":
             self.streaming_info_kwargs = {
