@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 class DataArguments:
     single_seq: bool = False
     subsplit_length: Optional[int] = None
-    per_device_max_tokens: int = 32768
+    per_device_max_tokens: int = 128 * 1024
     apply_instruct_masks: bool = False
     prepack: bool = False
     streaming: bool = False
