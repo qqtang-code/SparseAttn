@@ -331,6 +331,46 @@ def main():
     
     # load_datasets
     if training_args.do_train:
+        data_collator = PackedDataCollator(tokenizer, data_args, max_seq_len=data_args.per_device_max_tokens)
+        
+        train_dataset = build_packed_dataset(
+            script_args.tokenized_mds_train,
+            tokenizer=tokenizer,
+            data_args=data_args,
+        )
+        
+        world_size = dist.get_world_size()
+        global_rank = dist.get_rank()
+        sp_size = training_args.seq_parallel_size
+
+        # 计算逻辑上的 DP 组数量和当前 rank 所属的 DP 组 ID
+        # 举例: 4卡, SP=2. Rank0,1 -> dp_rank 0; Rank2,3 -> dp_rank 1
+        dp_size = world_size // sp_size
+        dp_rank = global_rank // sp_size
+        
+        from torch.utils.data.distributed import DistributedSampler
+        sampler = DistributedSampler(
+            dataset=train_dataset,
+            num_replicas=dp_size,   # 这里告诉 Sampler 总共有 dp_size 个分片
+            rank=dp_rank,           # 这里告诉 Sampler 我是第 dp_rank 个分片
+            shuffle=True,
+            seed=training_args.seed,
+            drop_last=True,
+        )
+        
+        train_dataloader = torch.utils.data.DataLoader(
+            dataset=train_dataset,
+            batch_size=1,
+            sampler=sampler,
+            collate_fn=data_collator,
+            num_workers=training_args.dataloader_num_workers,
+            pin_memory=training_args.dataloader_pin_memory,
+            drop_last=True, 
+        )
+        
+            
+        
+        """
         if training_args.seq_parallel_size <= 1:
             data_collator = PackingDataCollator(tokenizer, data_args, max_seq_len=data_args.per_device_max_tokens)
             multiprocessing.set_start_method("spawn", force=True) 
@@ -340,7 +380,7 @@ def main():
                 data_args=data_args,
                 is_training=True,
             )
-            # breakpoint()
+           
             class_indices = train_dataset.get_class_indices()
             logger.info(f"Using stratified sampling. Class distribution: {[len(v) for v in class_indices.values()]}")
             
@@ -349,26 +389,26 @@ def main():
             else:
                 world_size = training_args.n_gpu
 
-            try:
-                if not dist.is_initialized():
-                    raise SamplerConditionError("Distributed environment not initialized.")
+            # try:
+            #     if not dist.is_initialized():
+            #         raise SamplerConditionError("Distributed environment not initialized.")
 
-                custom_sampler = CustomDistributedStratifiedSampler(
-                    dataset=train_dataset,
-                    class_indices=class_indices,
-                    num_gpus=world_size,
-                    required_per_class=2,
-                    seed=42,
-                )
-                sampler = custom_sampler
+            #     custom_sampler = CustomDistributedStratifiedSampler(
+            #         dataset=train_dataset,
+            #         class_indices=class_indices,
+            #         num_gpus=world_size,
+            #         required_per_class=2,
+            #         seed=42,
+            #     )
+            #     sampler = custom_sampler
                 
-            except SamplerConditionError as e:
-                print(f"⚠️ Sampler fallback triggered: {e}. Using default DistributedSampler instead.")
-                from torch.utils.data.distributed import DistributedSampler
-                sampler = DistributedSampler(
-                    dataset=train_dataset,
-                    shuffle=True,
-                )
+            # except SamplerConditionError as e:
+            #     print(f"⚠️ Sampler fallback triggered: {e}. Using default DistributedSampler instead.")
+            #     from torch.utils.data.distributed import DistributedSampler
+            #     sampler = DistributedSampler(
+            #         dataset=train_dataset,
+            #         shuffle=True,
+            #     )
                 
             train_dataloader = torch.utils.data.DataLoader(
                 dataset=train_dataset,
@@ -430,7 +470,7 @@ def main():
                 drop_last=True, 
             )
             # breakpoint()
-    
+    """
 
     # Initialize our Trainer
     if training_args.attention_type is not None and "nsa" in training_args.attention_type :

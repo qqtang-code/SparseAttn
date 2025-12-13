@@ -380,7 +380,7 @@ if __name__ == "__main__":
     multiprocessing.set_start_method("spawn", force=True) # 推荐在 CUDA 环境或复杂库中使用 spawn
 
     path = "/data2/public_data/qwen_mix_sft_128K" 
-    data_args = DataArguments(preprocessing_num_workers=32) # 设置为你机器的 CPU 核心数
+    data_args = DataArguments(preprocessing_num_workers=4) # 设置为你机器的 CPU 核心数
     tokenizer = AutoTokenizer.from_pretrained("/data2/hf_models/Qwen3-4B", trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
