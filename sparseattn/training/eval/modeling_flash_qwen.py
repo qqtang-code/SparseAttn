@@ -1472,7 +1472,9 @@ class Qwen3Attention(nn.Module):
                     norm,
                     threshold,
                     use_triton=True,
-                    head_mask_type=head_mask_type
+                    head_mask_type=head_mask_type,
+                    sink_num=self.sink_blocks,
+                    local_num=self.local_blocks,
                 ).transpose(1, 2)  # B, T, H, D
         else:
             if self.num_key_value_groups > 1:

@@ -315,21 +315,7 @@ class Trainer(HFTrainer):
             start_sp = cfg["start"]
             end_sp = cfg["end"]
             
-            if global_step < self.num_sparsity_warmup_steps:
-                if self.warmup_type == "linear":
-                    sp = start_sp + (end_sp - start_sp) * global_step / self.num_sparsity_warmup_steps
-                elif self.warmup_type == "logarithmic":
-                    log_one_minus_start = math.log(1 - start_sp)
-                    log_one_minus_end = math.log(1 - end_sp)
-                    log_one_minus_sp = (
-                        log_one_minus_start
-                        + (log_one_minus_end - log_one_minus_start) * global_step / self.num_sparsity_warmup_steps
-                    )
-                    sp = 1 - math.exp(log_one_minus_sp)
-                else:
-                    raise ValueError(f"Unknown warmup_type: {self.warmup_type}")
-            else:
-                sp = end_sp
+            sp = end_sp
             sparsities.append(sp)
 
         return torch.tensor(sparsities, dtype=torch.float32)  # shape: [B]
@@ -427,7 +413,7 @@ class Trainer(HFTrainer):
 
         Subclass and override for custom behavior.
         """
-        tasks = inputs.get("task_types", ["default"] * inputs["input_ids"].size(0)) #[B]
+        tasks = inputs.get("task_type", ["default"] * inputs["input_ids"].size(0)) #[B]
         # tasks = ["default"] * inputs["input_ids"].size(0)
         target_sparsity = self.get_current_target_sparsity(self.state.global_step, tasks)
         target_sparsity = target_sparsity.to(model.device)  # [B]
