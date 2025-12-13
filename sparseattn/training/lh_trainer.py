@@ -484,9 +484,9 @@ class Trainer(HFTrainer):
         
         task_ids = outputs['task_ids']
         log_z_loss = outputs['log_z_loss']
-        task_sparsity_statistic = dict([(task_name, torch.tensor(0,)) for task_name in self.reverse_class_map.values()])
-        task_sparsity_loss_statistic = dict([(task_name, torch.tensor(0,)) for task_name in self.reverse_class_map.values()])
-        task_target_sparsity_statistic = dict([(task_name, torch.tensor(0,)) for task_name in self.reverse_class_map.values()])
+        task_sparsity_statistic = dict([(task_name, []) for task_name in self.reverse_class_map.values()])
+        task_sparsity_loss_statistic = dict([(task_name, []) for task_name in self.reverse_class_map.values()])
+        task_target_sparsity_statistic = dict([(task_name, []) for task_name in self.reverse_class_map.values()])
         
         # all gather task ids and model_sparsity
         distributed_log_z_loss = self.accelerator.gather(log_z_loss)
@@ -528,25 +528,54 @@ class Trainer(HFTrainer):
             for task_id, item in zip(distributed_task_ids, merged_list):
                 log_z_loss, task_sparsity, target_sparsity = item[0], item[1], item[2]
                 task_name = self.reverse_class_map[task_id.item()]
-                task_sparsity_statistic[task_name] = (task_sparsity_statistic[task_name] + task_sparsity) / 2
-                task_sparsity_loss_statistic[task_name] = (task_sparsity_loss_statistic[task_name] + log_z_loss) / 2
-                task_target_sparsity_statistic[task_name] = (task_target_sparsity_statistic[task_name] + target_sparsity) / 2
+
+                task_sparsity_statistic[task_name].append(task_sparsity)
+                task_sparsity_loss_statistic[task_name].append(log_z_loss)
+                task_target_sparsity_statistic[task_name].append(target_sparsity)
+
+            valid_tasks = []
+
+            for task_name in task_sparsity_statistic.keys():
+                if len(task_sparsity_statistic[task_name]) == 0:
+                    continue
+
+                task_sparsity_statistic[task_name] = (
+                    torch.stack(task_sparsity_statistic[task_name]).mean().item()
+                )
+                task_sparsity_loss_statistic[task_name] = (
+                    torch.stack(task_sparsity_loss_statistic[task_name]).mean().item()
+                )
+                task_target_sparsity_statistic[task_name] = (
+                    torch.stack(task_target_sparsity_statistic[task_name]).mean().item()
+                )
+
+                valid_tasks.append(task_name)
+
+
             
-            new_task_sparsity_loss_statistic = {
-                f"Spa-{task_name} log_z_loss": log_z_loss.item()
-                for task_name, log_z_loss in task_sparsity_loss_statistic.items()
-            }
             new_task_sparsity_statistic = {
-                f"Spa-{task_name} sparsity": task_sparsity.detach().item()
-                for task_name, task_sparsity in task_sparsity_statistic.items()
+                f"Spa-{task} sparsity": task_sparsity_statistic[task]
+                for task in valid_tasks
             }
+
+            new_task_sparsity_loss_statistic = {
+                f"Spa-{task} log_z_loss": task_sparsity_loss_statistic[task]
+                for task in valid_tasks
+            }
+
             new_task_target_sparsity_statistic = {
-                f"Spa-{task_name} target_sparsity": task_target_sparsity.detach().item()
-                for task_name, task_target_sparsity in task_target_sparsity_statistic.items()
+                f"Spa-{task} target_sparsity": task_target_sparsity_statistic[task]
+                for task in valid_tasks
             }
+
             
-            for task_name, task_sparsity in task_sparsity_statistic.items():
-                logger.info(f"Statistic -> {task_name} | Sparsity: {task_sparsity} | Target_Sparsity: {task_target_sparsity_statistic[task_name]} | z_loss: {task_sparsity_loss_statistic[task_name]}")
+            for task_name in valid_tasks:
+                logger.info(
+                    f"Statistic -> {task_name} | "
+                    f"Sparsity: {task_sparsity_statistic[task_name]} | "
+                    f"Target_Sparsity: {task_target_sparsity_statistic[task_name]} | "
+                    f"z_loss: {task_sparsity_loss_statistic[task_name]}"
+                )
 
 
             del task_sparsity_statistic
