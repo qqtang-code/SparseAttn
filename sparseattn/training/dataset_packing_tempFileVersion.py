@@ -415,7 +415,7 @@ if __name__ == "__main__":
     
     # 5. 【验证环节 1】检查单条数据
     # 注意：根据 PackedDataset.__getitem__ 的实现，这里打印出来的应该是 Tensor
-    item0 = dataset[1000]
+    item0 = dataset[0]
     print("\n--- Sample 0 Check ---")
     print(f"Keys: {item0.keys()}")
     print(f"Input IDs Shape: {item0['input_ids'].shape}")
@@ -427,12 +427,16 @@ if __name__ == "__main__":
     print("\n--- Collator Check ---")
     collator = PackedDataCollator(tokenizer=tokenizer)
     
-    # 模拟一个 Batch
-    batch_input = [dataset[1000]]
+    # 模拟一个 Batch (取前两条)
+    batch_input = [dataset[0]]
     batch_output = collator(batch_input)
     
     print(f"Batch Input IDs Shape: {batch_output['input_ids'].shape}") # 应该是 [2, max_seq_len]
     print(f"Batch Labels Shape:    {batch_output['labels'].shape}")
     
+    if batch_output['input_ids'].shape[0] == 2:
+        print("✅ Collator test passed!")
+    else:
+        print("❌ Collator test failed!")
 
     # breakpoint() # 如果需要手动调试解开此行

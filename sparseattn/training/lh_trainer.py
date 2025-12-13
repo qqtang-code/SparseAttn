@@ -382,7 +382,7 @@ class Trainer(HFTrainer):
                 "seq_parallel_group": self.seq_parallel_group,
             }
 
-            max_seq_length = seq_lengths.max()
+            max_seq_length = seq_lengths[0].max() #List[Tensor]
             max_tokens_per_device = seq_lengths.sum() // seq_parallel_world_size
 
             start_index = sum(
@@ -427,17 +427,23 @@ class Trainer(HFTrainer):
 
         Subclass and override for custom behavior.
         """
-        tasks = inputs.get("task_types", ["default"] * inputs["input_ids"].size(0)) #[B]
+        tasks = inputs.get("task_type", None) #List[Tensor] Tensor shape:[Bi, ]
+        
+        if isinstance(tasks, list):
+            tasks = tasks[0] # Tensor, [Bi, ]
+        else:
+            tasks = tasks
+        
         # tasks = ["default"] * inputs["input_ids"].size(0)
         target_sparsity = self.get_current_target_sparsity(self.state.global_step, tasks)
-        target_sparsity = target_sparsity.to(model.device)  # [B]
+        target_sparsity = target_sparsity.to(model.device)  # [Bi, ]
         
         inputs = self.get_sequence_parallel_inputs(inputs)
         
         logger.info(f"[Step {self.state.global_step}] Sample tasks: {tasks} → Target Sparsity: {[f'{s:.3f}' for s in target_sparsity.tolist()]}")
         
-        attention_mask = inputs.get("attention_mask")
-        valid_tokens = attention_mask.sum(dim=1)
+        # attention_mask = inputs.get("attention_mask")
+        # valid_tokens = attention_mask.sum(dim=1)
 
         outputs = model(**inputs, use_cache=False, target_sparsity=target_sparsity)
 
