@@ -420,7 +420,7 @@ class Trainer(HFTrainer):
         
         inputs = self.get_sequence_parallel_inputs(inputs)
         
-        logger.info(f"[Step {self.state.global_step}] Sample tasks: {tasks} → Target Sparsity: {[f'{s:.3f}' for s in target_sparsity.tolist()]}")
+        print(f"[Step {self.state.global_step}] Sample tasks: {tasks} → Target Sparsity: {[f'{s:.3f}' for s in target_sparsity.tolist()]}")
         
         attention_mask = inputs.get("attention_mask")
         valid_tokens = attention_mask.sum(dim=1)
