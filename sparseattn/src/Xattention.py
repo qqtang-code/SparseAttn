@@ -825,6 +825,8 @@ def Xattention_prefill_dim4(
     keep_sink=False,
     keep_recent=False,
     head_mask_type=None,
+    sink_num=1,
+    local_num=16,
 ):
     batch_size, num_heads, max_q_len, head_dim = query_states.shape
     _, _, max_k_len, _ = key_states.shape
@@ -981,6 +983,7 @@ def Xattention_prefill_dim4(
     # head_mask_type
     mask = (head_mask_type == 1)
     blockmask = approx_simple_mask[:, mask, :max_q_block_num, :max_k_block_num].contiguous()
+    streaming_info = torch.tensor([sink_num, local_num] * num_heads, device=query_states.device, dtype=torch.int32)
     
     attn_output = block_sparse_attn_func(
         query_states,
@@ -989,7 +992,7 @@ def Xattention_prefill_dim4(
         cu_seq_lens,
         cu_seq_lens,
         head_mask_type,
-        None,
+        streaming_info,
         blockmask,
         max_q_len,
         max_k_len, 
