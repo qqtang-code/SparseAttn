@@ -733,7 +733,8 @@ class AttentionRouter(nn.Module):
 
                 pooled_latent = torch.stack(sample_features, dim=0)
             else:
-                pooled_latent = x.mean(dim=1)  # [H, D]
+                target = torch.concat([x[:,:100,:] , x[:,-100:,:]],dim=1).mean(dim=1)
+                pooled_latent = target  # [H, D]
         else:
             raise ValueError(f"Unknown pooling_mode: {self.pooling_mode}")
         
@@ -753,42 +754,24 @@ class AttentionRouter(nn.Module):
             tau = torch.exp(self.log_temp).clamp(0.3, 1.0)
         else:
             tau = self.tau
-        
-        # 生成 Gumbel 噪声: g = -log(-log(u))
-        # u ~ Uniform(0, 1)
+
         u = torch.rand_like(binary_logits)
         eps = 1e-8
         g = -torch.log(-torch.log(u + eps) + eps)
-
-        # --- Gumbel or Softmax routing ---
-        if self.training:
-            
-            
-            if not self.use_softmax:
-                z_soft = torch.sigmoid((binary_logits + g) / tau)
-                z_hard = (z_soft > 0.5).float()
-                z = z_hard + (z_soft - z_soft.detach())  # [B, H, 1]
-                entropy = -(z_soft * torch.log(z_soft + eps) + (1 - z_soft) * torch.log(1 - z_soft + eps))
-            else:
-                z_soft = F.softmax((binary_logits + g) / tau, dim=-1)
-                z_hard = torch.zeros_like(z_soft).scatter_(-1, z_soft.argmax(-1, keepdim=True), 1.0)
-                z = z_hard + (z_soft - z_soft.detach())  # [B, H, 2]
-                z = z[..., 1]  # [B, H]
-                z = z.unsqueeze(-1)
-                entropy = -(z_soft * torch.log(z_soft + eps)).sum(dim=-1).mean() 
+        
+        if not self.use_softmax:
+            z_soft = torch.sigmoid((binary_logits + g) / tau)
+            z_hard = (z_soft > 0.5).float()
+            z = z_hard + (z_soft - z_soft.detach())  # [B, H, 1]
+            entropy = -(z_soft * torch.log(z_soft + eps) + (1 - z_soft) * torch.log(1 - z_soft + eps))
         else:
-            # 推理阶段：直接根据 Logit 确定 (相当于 tau -> 0)
-            # 或者也可以用 sigmoid(logit/tau) > 0.5，但在 deterministic 模式下 logit > 0 即可
-            # z_soft = torch.sigmoid(binary_logits / tau) 
-            if not self.use_softmax:
-                z_soft = torch.sigmoid(binary_logits)
-                z_hard = (z_soft > 0.5).float()
-                z = z_hard
-            else:
-                z_soft = F.softmax(binary_logits, dim=-1)
-                z_hard = z_soft.argmax(-1)
-                z = z_hard
-                z = z.unsqueeze(-1)
+            z_soft = F.softmax((binary_logits + g) / tau, dim=-1)
+            z_hard = torch.zeros_like(z_soft).scatter_(-1, z_soft.argmax(-1, keepdim=True), 1.0)
+            z = z_hard + (z_soft - z_soft.detach())  # [B, H, 2]
+            z = z[..., 1]  # [B, H]
+            z_soft = z_soft[..., 1]
+            z_soft = z_soft.unsqueeze(-1)
+            z = z.unsqueeze(-1)
             entropy = -(z_soft * torch.log(z_soft + eps)).sum(dim=-1).mean() 
         
         return {
@@ -804,16 +787,19 @@ class AttentionRouter(nn.Module):
         B, S, H, D = pooled_input.shape
         pooled_features_list = []
         
-        idx_map = {'first_token': (0, 1),'ctx': (2, 3), 'q': (4, 5), 'a': (6, 7)} 
+        POOL_MAP = {'first_token': (0, 1),'ctx': (2, 3), 'q': (4, 5), 'a': (6, 7), 'ctx_q': (2, 5)} 
         for i in range(B):
             sample_features = []
 
             for seg in segments:
-                start_idx, end_idx = idx_map[seg]
-                start, end = range_ids[i, start_idx:end_idx + 1].tolist()
+                start_idx, end_idx = POOL_MAP[seg]
+                start, end = range_ids[i, start_idx:end_idx + 1].tolist()[0], range_ids[i, start_idx:end_idx + 1].tolist()[-1]
                 if end >= start:
-                    seg_slice = pooled_input[i, start : end + 1, :, :]
-                    seg_pooled = seg_slice.mean(dim=0)  # [H, D]
+                    # seg_slice = pooled_input[i, start : end + 1, :, :]
+                    start_slice = pooled_input[i, start : start + 100, :, :]
+                    end_slice = pooled_input[i, end - 100 : end + 1, :, :]
+                    combined_slice = torch.cat((start_slice, end_slice), dim=0)
+                    seg_pooled = combined_slice.mean(dim=0)  # [H, D]
                 else:
                     seg_pooled = torch.zeros(H, D, device=pooled_input.device)
                 
@@ -847,7 +833,7 @@ class AttentionRouter(nn.Module):
         Returns:
             torch.Tensor: _description_
         """
-        POOL_MAP = {'first_token': (0, 1),'ctx': (2, 3), 'q': (4, 5), 'a': (6, 7)} 
+        POOL_MAP = {'first_token': (0, 1),'ctx': (2, 3), 'q': (4, 5), 'a': (6, 7), 'ctx_q': (2, 5)} 
         
         B = cu_seq_len.shape[0] - 1
         H, D = x.shape[1:]
@@ -858,11 +844,13 @@ class AttentionRouter(nn.Module):
             x_s, x_e = cu_seq_len[i], cu_seq_len[i + 1]
             for seg in segments:
                 start_idx, end_idx = POOL_MAP[seg]
-                start, end = range_ids[i, start_idx:end_idx + 1].tolist()
+                start, end = range_ids[i, start_idx:end_idx + 1].tolist()[0], range_ids[i, start_idx:end_idx + 1].tolist()[-1]
 
                 if end >= start:
-                    seg_slice = x[x_s + start: x_s + end + 1,  : , :]
-                    seg_pooled = seg_slice.mean(dim=0)  # [H, D]
+                    start_slice = pooled_input[i, start : start + 100, :, :]
+                    end_slice = pooled_input[i, end - 100 : end + 1, :, :]
+                    combined_slice = torch.cat((start_slice, end_slice), dim=0)
+                    seg_pooled = combined_slice.mean(dim=0)  # [H, D]
                 else:
                     seg_pooled = torch.zeros(H, D, device=x.device)
                 
@@ -1007,7 +995,7 @@ class Qwen3Attention(nn.Module):
             self.topk_k = int(getattr(config, "topk_k", 2048))
             self.topk_q_chunk = int(os.environ.get("TOPK_Q_CHUNK", 128))
             self.topk_k_chunk = int(os.environ.get("TOPK_K_CHUNK", 4096))
-        elif self.toggle_type == "xattn":
+        elif self.toggle_type == "xattn" or self.retrieval_mode == "xattn":
             from sparseattn.utils.ops.xattention_fa import xattn_flash_attn_func
             self.streaming_info_kwargs = {
                 "sink_block_num": self.sink_blocks,

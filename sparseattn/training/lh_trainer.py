@@ -280,14 +280,19 @@ class Trainer(HFTrainer):
         self.num_sparsity_warmup_steps = math.ceil(self.sparsity_warmup_ratio * self.args.max_steps)
         self.task_sparsity_config = {
             "default": {"start": self.start_head_sparsity, "end": self.end_head_sparsity},
-            "Code": {"start": 0, "end": 0.4},
+            "Code": {"start": 0, "end": 0.5},
             "Math": {"start": 0, "end": 0.6},
-            "MultiHop QA": {"start": 0, "end": 0.2},
-            "Single QA": {"start": 0, "end": 0.2},
-            "Summarization": {"start": 0, "end": 0.5},
+            "MultiHop QA": {"start": 0, "end": 0.3},
+            "Single QA": {"start": 0, "end": 0.3},
+            "Summarization": {"start": 0, "end": 0.7},
         }
         self.reverse_class_map = {0: 'Single QA', 1: 'MultiHop QA', 2: 'Summarization', 3: 'Code'}
         self.use_softmax = args.use_softmax
+        
+        self.tau_max = 1.5  # 初始 tau
+        self.tau_min = 0.2  # 最终/保持 tau
+
+        self.tau_decay_steps = math.ceil(self.args.max_steps * 0.6)
 
         if not dist.is_initialized() or args.seq_parallel_size == dist.get_world_size():
             logger.info(f"Using world as sequence parallel group")
@@ -319,7 +324,24 @@ class Trainer(HFTrainer):
             sparsities.append(sp)
 
         return torch.tensor(sparsities, dtype=torch.float32)  # shape: [B]
+    
+    def get_current_tau(self, global_step: int) -> torch.Tensor:
+        
+        tau_max = self.tau_max
+        tau_min = self.tau_min
+        T_max = self.tau_decay_steps
+        
+        t = torch.tensor(global_step, dtype=torch.float32)
+        T_max_tensor = torch.tensor(T_max, dtype=torch.float32)
+        
+        if global_step < T_max:
+            cosine_factor = torch.cos(torch.pi * t / T_max_tensor) 
 
+            current_tau = tau_min + 0.5 * (tau_max - tau_min) * (1 + cosine_factor)
+            return current_tau.to(torch.float32)
+        else:
+            # 保持 0.2
+            return torch.tensor(tau_min, dtype=torch.float32)
     def get_sequence_parallel_inputs(self, inputs):
         """
         Args:
@@ -411,11 +433,15 @@ class Trainer(HFTrainer):
         target_sparsity = self.get_current_target_sparsity(self.state.global_step, tasks)
         target_sparsity = target_sparsity.to(model.device)  # [B]
         
+        current_tau = self.get_current_tau(self.state.global_step)
+        
+        inputs = self.get_sequence_parallel_inputs(inputs)
+        
         print(f"[Step {self.state.global_step}] Sample tasks: {tasks} → Target Sparsity: {[f'{s:.3f}' for s in target_sparsity.tolist()]}")
         
         valid_tokens = (inputs['labels'] != -100).sum().item()
 
-        outputs = model(**inputs, use_cache=False, target_sparsity=target_sparsity)
+        outputs = model(**inputs, use_cache=False, target_sparsity=target_sparsity, current_tau=current_tau)
 
         lm_loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
         head_entropy = outputs["head_entropy"]
@@ -508,7 +534,7 @@ class Trainer(HFTrainer):
                 )
 
             logger.info(
-                f"@ {self.state.global_step} | Loss: {distributed_loss} | LM Loss: {distributed_lm_loss} | "
+                f"@ {self.state.global_step} | Loss: {distributed_loss} | LM Loss: {distributed_lm_loss} | Tau:{current_tau} | "
                 f"Reg Loss: {distributed_reg_loss} | contrastive_loss: {distributed_contrastive_loss} | head_contrastive_loss: {distributed_head_contrastive_loss} | Head Entropy: {head_entropy}"
                 + (" | " + " | ".join(extra) if len(extra) else "")
             )
@@ -602,6 +628,7 @@ class Trainer(HFTrainer):
                         else distributed_head_contrastive_loss
                     ),
                     "head_entropy": head_entropy.detach().item(),
+                    "current_tau": current_tau.detach().item(),
                     "target_sparsity(avg)": distributed_target_sparsity.detach().float().mean().item(),
                     "model_sparsity(avg)": distributed_model_sparsity.detach().float().mean().item(),
                     "step": self.state.global_step,

@@ -630,7 +630,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 class AttentionRouter(nn.Module):
     def __init__(self, input_dim, num_key_value_heads, d_feature=128,
-                 use_task_emb=False, temp=3/2, hard=False, 
+                 use_task_emb=False, temp=0.2, hard=False, 
                  router_type='mlp', use_gumbel=True, learnable_temp=False,
                  dropout=0.1, use_softmax=True, pooling_mode='ctx_q'):
         super().__init__()
@@ -694,7 +694,8 @@ class AttentionRouter(nn.Module):
         x, 
         cu_seq_len=None,
         range_ids: torch.Tensor = None, 
-        task_ids: Optional[torch.Tensor] = None
+        task_ids: Optional[torch.Tensor] = None,
+        current_tau: Optional[torch.Tensor] = None,
     ):
         """
         x: [cu_seq_len, H, D]
@@ -753,7 +754,7 @@ class AttentionRouter(nn.Module):
         if self.learnable_temp:
             tau = torch.exp(self.log_temp).clamp(0.3, 1.0)
         else:
-            tau = self.tau
+            tau = current_tau if current_tau is not None else self.tau
 
         # --- Gumbel or Softmax routing ---
         if self.training:
@@ -809,8 +810,11 @@ class AttentionRouter(nn.Module):
                 start_idx, end_idx = POOL_MAP[seg]
                 start, end = range_ids[i, start_idx:end_idx + 1].tolist()[0], range_ids[i, start_idx:end_idx + 1].tolist()[-1]
                 if end >= start:
-                    seg_slice = pooled_input[i, start : end + 1, :, :]
-                    seg_pooled = seg_slice.mean(dim=0)  # [H, D]
+                    # seg_slice = pooled_input[i, start : end + 1, :, :]
+                    start_slice = pooled_input[i, start : start + 100, :, :]
+                    end_slice = pooled_input[i, end - 100 : end + 1, :, :]
+                    combined_slice = torch.cat((start_slice, end_slice), dim=0)
+                    seg_pooled = combined_slice.mean(dim=0)  # [H, D]
                 else:
                     seg_pooled = torch.zeros(H, D, device=pooled_input.device)
                 
@@ -858,8 +862,10 @@ class AttentionRouter(nn.Module):
                 start, end = range_ids[i, start_idx:end_idx + 1].tolist()[0], range_ids[i, start_idx:end_idx + 1].tolist()[-1]
 
                 if end >= start:
-                    seg_slice = x[x_s + start: x_s + end + 1,  : , :]
-                    seg_pooled = seg_slice.mean(dim=0)  # [H, D]
+                    start_slice = pooled_input[i, start : start + 100, :, :]
+                    end_slice = pooled_input[i, end - 100 : end + 1, :, :]
+                    combined_slice = torch.cat((start_slice, end_slice), dim=0)
+                    seg_pooled = combined_slice.mean(dim=0)  # [H, D]
                 else:
                     seg_pooled = torch.zeros(H, D, device=x.device)
                 
@@ -1348,6 +1354,7 @@ class Qwen3Attention(nn.Module):
         segment_ids: Optional[torch.LongTensor] = None,
         range_ids: Optional[torch.LongTensor] = None,
         task_ids: Optional[torch.LongTensor] = None,
+        current_tau: Optional[torch.Tensor] = None,
         position_embeddings: Optional[
             Tuple[torch.Tensor, torch.Tensor]
         ] = None,  # will become mandatory in v4.46
@@ -1369,9 +1376,9 @@ class Qwen3Attention(nn.Module):
             z = z_kv.unsqueeze(-1).expand(-1, self.num_key_value_groups).reshape(-1)
         else:
             if unpadded_lengths is not None:
-                res = self.mask_allocator(k, unpadded_lengths[0], range_ids, task_ids)
+                res = self.mask_allocator(k, unpadded_lengths[0], range_ids, task_ids, current_tau)
             else:
-                res = self.mask_allocator(k, None, range_ids, task_ids)
+                res = self.mask_allocator(k, None, range_ids, task_ids, current_tau)
             
             z_kv_batch, entropy, pooled_hidden_states = res['sparse_mask'], res['entropy'], res['pooled_hidden_states']
             z_constrast = res['decisions']
@@ -1498,6 +1505,7 @@ class Qwen3DecoderLayer(nn.Module):
         segment_ids: Optional[torch.LongTensor] = None,
         range_ids: Optional[torch.LongTensor] = None,
         task_ids: Optional[torch.LongTensor] = None,
+        current_tau: Optional[torch.Tensor] = None,
     ) -> Tuple[
         torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]
     ]:
@@ -1531,7 +1539,8 @@ class Qwen3DecoderLayer(nn.Module):
             seq_parallel_group=seq_parallel_group,
             segment_ids=segment_ids,
             range_ids=range_ids,
-            task_ids=task_ids
+            task_ids=task_ids,
+            current_tau=current_tau,
         )
         hidden_states = residual + hidden_states
 
@@ -1798,6 +1807,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
         unpadded_lengths: Optional[Tuple[torch.Tensor]] = None,
         seq_parallel_group: Optional[Any] = None,
         target_sparsity: Optional[float] = None,
+        current_tau: Optional[torch.Tensor] = None,
         segment_ids: Optional[torch.LongTensor] = None,
         range_ids: Optional[torch.LongTensor] = None,
         task_ids: Optional[torch.LongTensor] = None,
@@ -1881,6 +1891,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
                     segment_ids=segment_ids,
                     range_ids=range_ids,
                     task_ids=task_ids,
+                    current_tau=current_tau,
                 )
             else:
                 layer_outputs = decoder_layer(
@@ -1895,6 +1906,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
                     segment_ids=segment_ids,
                     range_ids=range_ids,
                     task_ids=task_ids,
+                    current_tau=current_tau,
                 )
 
             z_layer_sum, entropy, pooled_hidden_states, z_constrast, hidden_states = layer_outputs[0], layer_outputs[1], layer_outputs[2], layer_outputs[3], layer_outputs[4]
@@ -2312,6 +2324,7 @@ class PawQwen3ForCausalLM(Qwen3PreTrainedModel):
         shifted_labels: Optional[torch.LongTensor] = None,
         seq_parallel_group: Optional[Any] = None,
         target_sparsity: Optional[float] = None,
+        current_tau: Optional[torch.Tensor] = None,
         segment_ids: Optional[torch.LongTensor] = None,
         range_ids: Optional[torch.LongTensor] = None,
         task_ids: Optional[torch.LongTensor] = None,
@@ -2406,6 +2419,7 @@ class PawQwen3ForCausalLM(Qwen3PreTrainedModel):
             unpadded_lengths=unpadded_lengths,
             seq_parallel_group=seq_parallel_group,
             target_sparsity=target_sparsity,
+            current_tau=current_tau,
             segment_ids=segment_ids,
             range_ids=range_ids,
             task_ids=task_ids,
