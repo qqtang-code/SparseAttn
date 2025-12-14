@@ -331,9 +331,8 @@ def main():
     
     # load_datasets
     if training_args.do_train:
-        
         train_dataset = build_packed_dataset(
-            script_args.tokenized_mds_train,
+            script_args.tokenized_mds_train[0],  # FIXME: 这里只能传入一个文件，不支持多个文件传入
             tokenizer=tokenizer,
             data_args=data_args,
         )

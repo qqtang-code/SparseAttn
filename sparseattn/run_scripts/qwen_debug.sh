@@ -1,4 +1,4 @@
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=0,1
 
 # Model and training configuration
 model=${MODEL:-"/data2/hf_models/Qwen3-4B"}
@@ -51,7 +51,7 @@ layerwise_sparsity_weight=${LAYERWISE_SPARSITY_WEIGHT:-1.0}
 erank_analysis_path="/"
 
 # Dataset configuration
-dataset=${DATASET:-"/data2/public_data/qwen_mix_sft_32K_4task"} #  qwen_mix_sft_32K_4task qwen_mix_sft_64K2
+dataset=${DATASET:-"/data2/public_data/qwen_mix_sft_64K2"} #  qwen_mix_sft_32K_4task qwen_mix_sft_64K2
 task_type="sft" # pretrain or sft
 
 run_name="overfit_quick_sparsity_v2"
@@ -60,7 +60,7 @@ out_dir="checkpoints/$run_name"
 mkdir -p $out_dir
 
 # Calculate GPU and node configuration
-num_gpus=1
+num_gpus=2
 
 num_nodes=$(scontrol show hostnames "$SLURM_JOB_NODELIST" 2>/dev/null | wc -l)
 if [ $num_nodes == 0 ]; then
@@ -77,8 +77,8 @@ header="torchrun \
 
 # header="python -m debugpy --listen 0.0.0.0:5678 --wait-for-client -m training.lh_train_language_model"
 
-# accu=$(($bsz / $seq / $num_gpus / $num_nodes))
-accu=1
+accu=$(($bsz / $seq / $num_gpus / $num_nodes))
+# accu=1
 
 # Environment variables
 export OMP_NUM_THREADS=$num_gpus
