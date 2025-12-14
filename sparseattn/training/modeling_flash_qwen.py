@@ -854,7 +854,6 @@ class AttentionRouter(nn.Module):
             sample_features = []
             x_s, x_e = cu_seq_len[i], cu_seq_len[i + 1]
             for seg in segments:
-                breakpoint()
                 start_idx, end_idx = POOL_MAP[seg]
                 start, end = range_ids[i, start_idx:end_idx + 1].tolist()[0], range_ids[i, start_idx:end_idx + 1].tolist()[-1]
 

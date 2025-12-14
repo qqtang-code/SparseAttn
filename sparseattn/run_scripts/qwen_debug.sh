@@ -1,4 +1,4 @@
-export CUDA_VISIBLE_DEVICES=7
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
 # Model and training configuration
 model=${MODEL:-"/data2/hf_models/Qwen3-4B"}
@@ -20,7 +20,7 @@ fsdp=${FSDP:-"5"}
 gc=${GC:-"1"}
 
 # PruLong-specific arguments
-max_toks=${MAX_TOKS:-32768}
+max_toks=${MAX_TOKS:-65536}
 # max_toks=${MAX_TOKS:-256}
 start_head_sparsity=${START_HEAD_SPARSITY:-0.5}
 end_head_sparsity=${END_HEAD_SPARSITY:-0.3}
@@ -51,7 +51,7 @@ layerwise_sparsity_weight=${LAYERWISE_SPARSITY_WEIGHT:-1.0}
 erank_analysis_path="/"
 
 # Dataset configuration
-dataset=${DATASET:-"/data2/public_data/qwen_mix_sft_32K_4task"}
+dataset=${DATASET:-"/data2/public_data/qwen_mix_sft_32K_4task"} # qwen_mix_sft_32K_4task
 task_type="sft" # pretrain or sft
 
 run_name="overfit_quick_sparsity_v2"
@@ -116,6 +116,7 @@ base_arguments=(
     --save_steps $save_steps
     --save_total_limit $save_total_limit
     --dataloader_num_workers 0
+    --preprocessing_num_workers 48
     --disable_tqdm true
     --use_fast_tokenizer false
     --remove_unused_columns false

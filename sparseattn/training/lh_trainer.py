@@ -329,10 +329,14 @@ class Trainer(HFTrainer):
                 - seq_lengths: List[Tensor] (len=1, tensor=[Bi+1]) -> 取出变成 [Bi+1], 保持全局
         """
         input_ids = inputs["input_ids"]
+
         if len(input_ids.shape) == 2:
             input_ids = inputs["input_ids"].squeeze(0) 
             labels = inputs["labels"].squeeze(0)
             global_seq_lengths = inputs["seq_lengths"][0] 
+            task_ids = inputs["task_ids"][0]
+            range_ids = inputs["range_ids"][0]
+            task_type = inputs['task_type'][0]
         else:
             global_seq_lengths = inputs["seq_lengths"]
 
@@ -379,7 +383,10 @@ class Trainer(HFTrainer):
             model_inputs = {
                 "input_ids": input_ids,             # Global [S]
                 "labels": labels,                   # Global [S]
+                "task_ids": task_ids,
+                "range_ids": range_ids,
                 "seq_lengths": global_seq_lengths,  # Global [Bi+1]
+                "task_type": task_type,
                 "seq_parallel_group": None
             }
 
@@ -398,17 +405,15 @@ class Trainer(HFTrainer):
 
         Subclass and override for custom behavior.
         """
-        tasks = inputs.get("task_type", ["default"] * inputs["input_ids"].size(0)) #[B]
+        inputs = self.get_sequence_parallel_inputs(inputs)
+        tasks = inputs.get("task_type", ["default"] * inputs["range_ids"].size(0)) #[B]
         # tasks = ["default"] * inputs["input_ids"].size(0)
         target_sparsity = self.get_current_target_sparsity(self.state.global_step, tasks)
         target_sparsity = target_sparsity.to(model.device)  # [B]
         
-        inputs = self.get_sequence_parallel_inputs(inputs)
-        
         print(f"[Step {self.state.global_step}] Sample tasks: {tasks} → Target Sparsity: {[f'{s:.3f}' for s in target_sparsity.tolist()]}")
         
-        attention_mask = inputs.get("attention_mask")
-        valid_tokens = attention_mask.sum(dim=1)
+        valid_tokens = (inputs['labels'] != -100).sum().item()
 
         outputs = model(**inputs, use_cache=False, target_sparsity=target_sparsity)
 
