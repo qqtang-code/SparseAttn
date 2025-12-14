@@ -381,7 +381,7 @@ def build_packed_dataset(paths: str, data_args, tokenizer=None):
         raw, 
         tokenizer, 
         max_seq_len=max_len, # 根据需要调整
-        cache_dir="data_cache",
+        cache_dir=data_args.data_cache_dir,
         num_proc=data_args.preprocessing_num_workers, # 使用参数控制核数
         raw_path = paths,
     )
