@@ -1,4 +1,4 @@
-export CUDA_VISIBLE_DEVICES=0,1
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
 # Model and training configuration
 model=${MODEL:-"/data2/hf_models/Qwen3-4B"}
@@ -60,7 +60,7 @@ out_dir="checkpoints/$run_name"
 mkdir -p $out_dir
 
 # Calculate GPU and node configuration
-num_gpus=2
+num_gpus=8
 
 num_nodes=$(scontrol show hostnames "$SLURM_JOB_NODELIST" 2>/dev/null | wc -l)
 if [ $num_nodes == 0 ]; then
