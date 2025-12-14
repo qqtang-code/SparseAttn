@@ -237,11 +237,11 @@ class PackedDataset(Dataset):
             # 这里的后缀改为 .parquet
             cache_filename = f"{os.path.basename(data_name)}_packed_maxseq{max_seq_len}.parquet"
             self.cache_path = os.path.join(cache_dir, cache_filename)
-        
+       
         if self.cache_path and os.path.exists(self.cache_path):
             print(f"🚀 发现缓存文件: {self.cache_path}")
             try:
-                self.packed_data = load_dataset("parquet", data_files=self.cache_path, split="train")
+                self.packed_data = load_dataset("parquet", data_files=[self.cache_path], split="train", cache_dir=cache_dir)
                 print(f"✅ 成功加载 Parquet 缓存! 包含 {len(self.packed_data)} 条序列。")
                 return 
             except Exception as e:
@@ -363,7 +363,7 @@ def build_packed_dataset(paths, data_args, tokenizer=None):
         raw, 
         tokenizer, 
         max_seq_len=max_len, # 根据需要调整
-        cache_dir="data_cache",
+        cache_dir=data_args.data_cache_dir,
         num_proc=data_args.preprocessing_num_workers, # 使用参数控制核数
         data_name=paths[0],
     )

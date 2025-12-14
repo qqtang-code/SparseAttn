@@ -320,7 +320,7 @@ def build_dataset(paths, data_args, tokenizer=None, is_training=True, model_name
 
     max_len = data_args.per_device_max_tokens or 32768
     max_len = min(max_len, 4096*250)  # hard clamp for safety
-
+    breakpoint()
     raw = load_dataset("parquet", data_files=parquet_files, split="train", cache_dir=os.path.join(data_args.data_cache_dir, "raw") if data_args.data_cache_dir else None)
     
     # repeated_datasets = [raw] * 10000

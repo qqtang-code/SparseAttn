@@ -849,33 +849,30 @@ class AttentionRouter(nn.Module):
             torch.Tensor: _description_
         """
         POOL_MAP = {'first_token': (0, 1),'ctx': (2, 3), 'q': (4, 5), 'a': (6, 7), 'ctx_q': (2, 5)} 
-        
+
         B = cu_seq_len.shape[0] - 1
         H, D = x.shape[1:]
         pooled_features_list = []
-        
+
         for i in range(B):
             sample_features = []
             x_s, x_e = cu_seq_len[i], cu_seq_len[i + 1]
             for seg in segments:
                 start_idx, end_idx = POOL_MAP[seg]
                 start, end = range_ids[i, start_idx:end_idx + 1].tolist()[0], range_ids[i, start_idx:end_idx + 1].tolist()[-1]
-
                 if end >= start:
-                    start_slice = pooled_input[i, start : start + 100, :, :]
-                    end_slice = pooled_input[i, end - 100 : end + 1, :, :]
-                    combined_slice = torch.cat((start_slice, end_slice), dim=0)
-                    seg_pooled = combined_slice.mean(dim=0)  # [H, D]
+                    seg_slice = x[x_s + start: x_s + end + 1,  : , :]
+                    seg_pooled = seg_slice.mean(dim=0)  # [H, D]
                 else:
                     seg_pooled = torch.zeros(H, D, device=x.device)
-                
+
                 sample_features.append(seg_pooled)
 
             if sample_features:
                 combined_feature = torch.stack(sample_features, dim=0).mean(dim=0) # [H, D]
             else:
                 combined_feature = torch.zeros(H, D, device=x.device)
-                
+
             pooled_features_list.append(combined_feature)
 
         return torch.stack(pooled_features_list, dim=0) # [B, H, D]
