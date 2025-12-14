@@ -398,23 +398,17 @@ class Trainer(HFTrainer):
 
         Subclass and override for custom behavior.
         """
-        tasks = inputs.get("task_type", None) #List[Tensor] Tensor shape:[Bi, ]
-        
-        if isinstance(tasks, list):
-            tasks = tasks[0] # Tensor, [Bi, ]
-        else:
-            tasks = tasks
-        
+        tasks = inputs.get("task_type", ["default"] * inputs["input_ids"].size(0)) #[B]
         # tasks = ["default"] * inputs["input_ids"].size(0)
         target_sparsity = self.get_current_target_sparsity(self.state.global_step, tasks)
-        target_sparsity = target_sparsity.to(model.device)  # [Bi, ]
+        target_sparsity = target_sparsity.to(model.device)  # [B]
         
         inputs = self.get_sequence_parallel_inputs(inputs)
         
         print(f"[Step {self.state.global_step}] Sample tasks: {tasks} → Target Sparsity: {[f'{s:.3f}' for s in target_sparsity.tolist()]}")
         
-        # attention_mask = inputs.get("attention_mask")
-        # valid_tokens = attention_mask.sum(dim=1)
+        attention_mask = inputs.get("attention_mask")
+        valid_tokens = attention_mask.sum(dim=1)
 
         outputs = model(**inputs, use_cache=False, target_sparsity=target_sparsity)
 
