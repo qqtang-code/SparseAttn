@@ -2002,7 +2002,6 @@ class Qwen3Model(Qwen3PreTrainedModel):
         else:
             layerwise_model_sparsity = None
             layerwise_target = None
-            layerwise_loss = None
         
         if z_loss is not None:
             z_loss = z_loss.sum()
