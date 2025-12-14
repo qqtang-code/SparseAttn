@@ -159,7 +159,7 @@ class ParquetDataset(Dataset):
         else:
             user_text = ctx_text + "\n" + q_text
         
-        if np.random.rand() < 0.5:
+        if task_type == 'Single QA' or task_type == 'MultiHop QA':
             messages = [
                 {"role": "user", "content": user_text}
             ]
@@ -174,10 +174,7 @@ class ParquetDataset(Dataset):
 
         # Separator + Answer (Segment ID 3)
         if a:
-            if np.random.rand() < 0.5:
-                a_text = separator + a
-                a_ids = tokenizer(a_text, add_special_tokens=False)["input_ids"]
-            else:
+            if task_type == 'Single QA' or task_type == 'MultiHop QA':
                 messages = [
                     {"role": "assistant", "content": a}
                 ]
@@ -188,7 +185,9 @@ class ParquetDataset(Dataset):
                 )
                 a_text = separator + a_text
                 a_ids = tokenizer(a_text, add_special_tokens=False)["input_ids"]
-            
+            else:
+                a_text = separator + a
+                a_ids = tokenizer(a_text, add_special_tokens=False)["input_ids"]
         else:
             a_ids = []
 
