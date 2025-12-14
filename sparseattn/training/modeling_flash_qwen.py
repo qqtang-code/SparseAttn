@@ -861,8 +861,10 @@ class AttentionRouter(nn.Module):
                 start_idx, end_idx = POOL_MAP[seg]
                 start, end = range_ids[i, start_idx:end_idx + 1].tolist()[0], range_ids[i, start_idx:end_idx + 1].tolist()[-1]
                 if end >= start:
-                    seg_slice = x[x_s + start: x_s + end + 1,  : , :]
-                    seg_pooled = seg_slice.mean(dim=0)  # [H, D]
+                    prefix_seg_slice = x[x_s + start: x_s + start + 100,  : , :]
+                    suffix_seg_slice = x[x_s + end - 99: x_s + end + 1,  : , :]
+                    combined_slice = torch.cat((prefix_seg_slice, suffix_seg_slice), dim=0)
+                    seg_pooled = combined_slice.mean(dim=0)  # [H, D]
                 else:
                     seg_pooled = torch.zeros(H, D, device=x.device)
 
