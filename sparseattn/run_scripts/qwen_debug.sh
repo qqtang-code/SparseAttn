@@ -51,7 +51,7 @@ layerwise_sparsity_weight=${LAYERWISE_SPARSITY_WEIGHT:-1.0}
 erank_analysis_path="/"
 
 # Dataset configuration
-dataset=${DATASET:-"/data2/public_data/qwen_mix_sft_32K_4task"} # qwen_mix_sft_32K_4task
+dataset=${DATASET:-"/data2/public_data/qwen_mix_sft_64K2"} #  qwen_mix_sft_32K_4task
 task_type="sft" # pretrain or sft
 
 run_name="overfit_quick_sparsity_v2"
@@ -60,7 +60,7 @@ out_dir="checkpoints/$run_name"
 mkdir -p $out_dir
 
 # Calculate GPU and node configuration
-num_gpus=1
+num_gpus=8
 
 num_nodes=$(scontrol show hostnames "$SLURM_JOB_NODELIST" 2>/dev/null | wc -l)
 if [ $num_nodes == 0 ]; then
@@ -116,7 +116,7 @@ base_arguments=(
     --save_steps $save_steps
     --save_total_limit $save_total_limit
     --dataloader_num_workers 0
-    --preprocessing_num_workers 48
+    --preprocessing_num_workers 32
     --disable_tqdm true
     --use_fast_tokenizer false
     --remove_unused_columns false

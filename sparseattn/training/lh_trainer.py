@@ -351,14 +351,13 @@ class Trainer(HFTrainer):
                 - seq_lengths: List[Tensor] (len=1, tensor=[Bi+1]) -> 取出变成 [Bi+1], 保持全局
         """
         input_ids = inputs["input_ids"]
-
         if len(input_ids.shape) == 2:
             input_ids = inputs["input_ids"].squeeze(0) 
             labels = inputs["labels"].squeeze(0)
             global_seq_lengths = inputs["seq_lengths"][0] 
             task_ids = inputs["task_ids"][0]
             range_ids = inputs["range_ids"][0]
-            task_type = inputs['task_type'][0]
+            task_type = [i[0] for i in inputs['task_type']]
         else:
             global_seq_lengths = inputs["seq_lengths"]
 
@@ -401,7 +400,6 @@ class Trainer(HFTrainer):
             )
 
         else:
-            # 非并行模式 (单卡或纯 DP)
             model_inputs = {
                 "input_ids": input_ids,             # Global [S]
                 "labels": labels,                   # Global [S]
@@ -432,14 +430,9 @@ class Trainer(HFTrainer):
         # tasks = ["default"] * inputs["input_ids"].size(0)
         target_sparsity = self.get_current_target_sparsity(self.state.global_step, tasks)
         target_sparsity = target_sparsity.to(model.device)  # [B]
-        
         current_tau = self.get_current_tau(self.state.global_step)
         
-        inputs = self.get_sequence_parallel_inputs(inputs)
-        
         print(f"[Step {self.state.global_step}] Sample tasks: {tasks} → Target Sparsity: {[f'{s:.3f}' for s in target_sparsity.tolist()]}")
-        
-        valid_tokens = (inputs['labels'] != -100).sum().item()
 
         outputs = model(**inputs, use_cache=False, target_sparsity=target_sparsity, current_tau=current_tau)
 

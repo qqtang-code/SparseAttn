@@ -225,7 +225,7 @@ def worker_pack_chunk(chunk_dataset, tokenizer, max_seq_len, worker_id):
 # =========================================================
 
 class PackedDataset(Dataset):
-    def __init__(self, raw_dataset, tokenizer, max_seq_len=128*1024, cache_dir=None, num_proc=8):
+    def __init__(self, raw_dataset, tokenizer, max_seq_len=128*1024, cache_dir=None, num_proc=8, data_name=None):
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
         self.packed_data = None
@@ -235,32 +235,32 @@ class PackedDataset(Dataset):
         if cache_dir:
             os.makedirs(cache_dir, exist_ok=True)
             # 这里的后缀改为 .parquet
-            cache_filename = f"packed_sft_len{len(raw_dataset)}_seq{max_seq_len}.parquet"
+            cache_filename = f"{os.path.basename(data_name)}_packed_maxseq{max_seq_len}.parquet"
             self.cache_path = os.path.join(cache_dir, cache_filename)
-
+        
         if self.cache_path and os.path.exists(self.cache_path):
-            logger.info(f"🚀 发现缓存文件: {self.cache_path}")
+            print(f"🚀 发现缓存文件: {self.cache_path}")
             try:
                 self.packed_data = load_dataset("parquet", data_files=self.cache_path, split="train")
-                logger.info(f"✅ 成功加载 Parquet 缓存! 包含 {len(self.packed_data)} 条序列。")
+                print(f"✅ 成功加载 Parquet 缓存! 包含 {len(self.packed_data)} 条序列。")
                 return 
             except Exception as e:
                 logger.warning(f"⚠️ 加载缓存失败 ({e})，准备重新打包...")
 
-        logger.info(f"开始多进程 Packing... 目标长度: {max_seq_len}, 进程数: {num_proc}")
+        print(f"开始多进程 Packing... 目标长度: {max_seq_len}, 进程数: {num_proc}")
 
         # 多进程处理，得到一个巨大的 List[Dict]
         packed_data_list = self._parallel_pack_dataset(raw_dataset, num_proc)
 
-        logger.info("正在转换为 HuggingFace Dataset 对象...")
+        print("正在转换为 HuggingFace Dataset 对象...")
         self.packed_data = datasets.Dataset.from_list(packed_data_list)
 
         # 保存最终缓存
         if self.cache_path:
-            logger.info(f"💾 正在保存 Parquet 到: {self.cache_path} ...")
+            print(f"💾 正在保存 Parquet 到: {self.cache_path} ...")
             try:
                 self.packed_data.to_parquet(self.cache_path) 
-                logger.info("✅ Parquet 保存成功!")
+                print("✅ Parquet 保存成功!")
             except Exception as e:
                 logger.error(f"❌ 缓存保存失败: {e}")
 
@@ -269,7 +269,7 @@ class PackedDataset(Dataset):
         num_proc = min(num_proc, total_size)
         if num_proc < 1: num_proc = 1
 
-        logger.info(f"Splitting dataset into {num_proc} chunks...")
+        print(f"Splitting dataset into {num_proc} chunks...")
 
         chunks = []
         for i in range(num_proc):
@@ -282,7 +282,7 @@ class PackedDataset(Dataset):
                 futures.append(
                     executor.submit(worker_pack_chunk, chunk, self.tokenizer, self.max_seq_len, i)
                 )
-        logger.info(f"所有子进程处理完毕，开始汇总数据...")
+        print(f"所有子进程处理完毕，开始汇总数据...")
 
         results = []
         for f in tqdm(as_completed(futures), total=len(futures), desc="Waiting for workers"):
@@ -293,7 +293,7 @@ class PackedDataset(Dataset):
                 logger.error(f"Worker failed with error: {e}")
                 raise e
 
-        logger.info(f"多进程 Packing 完成。原始: {total_size} -> Packed: {len(results)}")
+        print(f"多进程 Packing 完成。原始: {total_size} -> Packed: {len(results)}")
         return results
 
     def __len__(self):
@@ -341,7 +341,7 @@ def build_packed_dataset(paths, data_args, tokenizer=None):
 
     # 2. 检查并计算 length 字段 (如果原数据没有)
     if "length" not in raw.column_names:
-        logger.info("Extracting 'length' from metadata for sorting...")
+        print("Extracting 'length' from metadata for sorting...")
 
         # 这里的 int() 很重要：
         # 1. 你的 JSON 示例里 length 是字符串 ("length": "")
@@ -353,7 +353,7 @@ def build_packed_dataset(paths, data_args, tokenizer=None):
         )
 
     # 3. 按照 length 从小到大排序
-    logger.info("📉 正在按 length 从小到大排序数据...")
+    print("📉 正在按 length 从小到大排序数据...")
     raw = raw.sort("length", reverse=False)
 
     max_len = data_args.per_device_max_tokens
@@ -364,7 +364,8 @@ def build_packed_dataset(paths, data_args, tokenizer=None):
         tokenizer, 
         max_seq_len=max_len, # 根据需要调整
         cache_dir="data_cache",
-        num_proc=data_args.preprocessing_num_workers # 使用参数控制核数
+        num_proc=data_args.preprocessing_num_workers, # 使用参数控制核数
+        data_name=paths[0],
     )
 
 if __name__ == "__main__":
