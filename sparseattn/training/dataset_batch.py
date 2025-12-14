@@ -20,6 +20,7 @@ import torch
 from torch.utils.data import Dataset, IterableDataset
 from transformers import AutoTokenizer
 from datasets import load_dataset
+import numpy as np
 
 import ast
 
@@ -145,23 +146,49 @@ class ParquetDataset(Dataset):
         task_ids = []
         
         # Context (Segment ID 1)
-        if flag == "1" or not ctx:
-            ctx_text = ""
-        else:
-            ctx_text = "\n" + ctx.rstrip()
-        ctx_ids = tokenizer(ctx_text, add_special_tokens=False)["input_ids"]
+        ctx_text = "\n" + ctx.rstrip()
+        # ctx_ids = tokenizer(ctx_text, add_special_tokens=False)["input_ids"]
         
         # Question (Segment ID 2)
-        if flag == "1":
-            q_text = "\n" + q.lstrip()
+        q_text = "\n" + q.lstrip()
+        # q_ids = tokenizer(q_text, add_special_tokens=False)["input_ids"]
+        
+        if is_prefix:
+            user_text = q_text + "\n" + ctx_text
+            
         else:
-            q_text = "\n" + q.lstrip() if ctx and q else (q.lstrip() if q and not ctx else "")
-        q_ids = tokenizer(q_text, add_special_tokens=False)["input_ids"]
+            user_text = ctx_text + "\n" + q_text
+        
+        if np.random.rand() < 0.5:
+            messages = [
+                {"role": "user", "content": user_text}
+            ]
+            user_text = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                enable_thinking=False,
+            )
+            user_text_ids = tokenizer(user_text, add_special_tokens=False)["input_ids"]
+        else:
+            user_text_ids = tokenizer(user_text, add_special_tokens=False)["input_ids"]        
 
         # Separator + Answer (Segment ID 3)
         if a:
-            a_text = separator + a
-            a_ids = tokenizer(a_text, add_special_tokens=False)["input_ids"]
+            if np.random.rand() < 0.5:
+                a_text = separator + a
+                a_ids = tokenizer(a_text, add_special_tokens=False)["input_ids"]
+            else:
+                messages = [
+                    {"role": "assistant", "content": a}
+                ]
+                a_text = tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    enable_thinking=False,
+                )
+                a_text = separator + a_text
+                a_ids = tokenizer(a_text, add_special_tokens=False)["input_ids"]
+            
         else:
             a_ids = []
 
@@ -176,35 +203,11 @@ class ParquetDataset(Dataset):
         segment_ids = []
         special_start = special_end = 0
 
-        if is_prefix:
-            # Question (Segment 2)
-            q_start = current_len
-            full_input_ids.extend(q_ids)
-            segment_ids.extend([2] * len(q_ids))
-            current_len += len(q_ids)
-            q_end = current_len - 1 if q_ids else q_start
-            
-            # Context (Segment 1)
-            ctx_start = current_len
-            full_input_ids.extend(ctx_ids)
-            segment_ids.extend([1] * len(ctx_ids))
-            current_len += len(ctx_ids)
-            ctx_end = current_len - 1 if ctx_ids else ctx_start
-            
-        else:
-            # Context (Segment 1)
-            ctx_start = current_len
-            full_input_ids.extend(ctx_ids)
-            segment_ids.extend([1] * len(ctx_ids))
-            current_len += len(ctx_ids)
-            ctx_end = current_len - 1 if ctx_ids else ctx_start
-            
-            # Question (Segment 2)
-            q_start = current_len
-            full_input_ids.extend(q_ids)
-            segment_ids.extend([2] * len(q_ids))
-            current_len += len(q_ids)
-            q_end = current_len - 1 if q_ids else q_start
+        user_text_start = current_len
+        full_input_ids.extend(user_text_ids)
+        segment_ids.extend([1] * len(user_text_ids))
+        current_len += len(user_text_ids)
+        user_text_end = current_len - 1
         
         # Answer (Segment 3) + Separator
         a_start = current_len
@@ -222,38 +225,13 @@ class ParquetDataset(Dataset):
             
         # --- 4. Apply Truncation ---
         original_len = len(full_input_ids)
-        
-        if original_len > max_seq_len:
-            
-            full_input_ids = full_input_ids[:max_seq_len]
-            segment_ids = segment_ids[:max_seq_len]
-
-            max_valid_index = max_seq_len - 1 
-
-            special_end = min(special_end, max_valid_index)
-            ctx_end = min(ctx_end, max_valid_index)
-            q_end = min(q_end, max_valid_index)
-            a_end = min(a_end, max_valid_index)
-
-            if q_start > max_valid_index:
-                q_start = q_end + 1 
-
-            if special_start > max_valid_index:
-                special_start = special_end + 1
-
-            if ctx_start > max_valid_index:
-                ctx_start = ctx_end + 1
-                
-            if a_start > max_valid_index:
-                a_start = a_end + 1
             
         # labels = [-100] * len(full_input_ids)
         # if a_ids:
         #     labels[a_start:len(full_input_ids)] = full_input_ids[a_start:len(full_input_ids)]
         labels = full_input_ids.copy()
-        
-        # Range_ids: [ctx_start, ctx_end, q_start, q_end, a_start, a_end]
-        range_ids = [special_start, special_end, ctx_start, ctx_end, q_start, q_end, a_start, a_end]
+
+        range_ids = [special_start, special_end, user_text_start, user_text_end, user_text_start, user_text_end, a_start, a_end]
         
         padding_len = max_seq_len - len(full_input_ids)
         if padding_len > 0:
@@ -356,8 +334,9 @@ def build_dataset(paths, data_args, tokenizer=None, is_training=True, model_name
             if text is None:
                 return False
             l = len(tokenizer(text, add_special_tokens=True, truncation=False)["input_ids"])
-            return l > data_args.min_seq_len
+            return l > data_args.min_seq_len and l < max_len
         raw = raw.filter(filter_fn, num_proc=os.cpu_count())
+        logger.info(f"max len: {max_len}")
         logger.info(f"Filtered dataset size: {len(raw)}")
 
     return ParquetDataset(raw, tokenizer, data_args, max_len, is_training)

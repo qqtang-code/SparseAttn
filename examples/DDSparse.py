@@ -57,7 +57,7 @@ def get_task(metadata_str):
         return None
 
 def main():
-    model_path = "/data1/lcm_lab/qqt/SparseAttn/sparseattn/checkpoints/12.12sp1steps125_full_xattn_task_head_contrast_64k/checkpoint-111"
+    model_path = "/data1/lcm_lab/qqt/SparseAttn/sparseattn/checkpoints/12.14sp1steps125_full_xattn_32k_qwen3-8b_wfrozen"
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
@@ -70,17 +70,17 @@ def main():
     import ast
     import numpy as np
 
-    file_path = "/data2/public_data/qwen_mix_sft_32K/all.parquet"
-    # file_path = "/data2/public_data/mix_sft_64k/all.parquet"
+    # file_path = "/data2/lcm_lab/public_data/Longbench/all.parquet"
+    file_path = "/data2/public_data/qwen_mix_sft_64K2/all.parquet"
 
     df = pd.read_parquet(file_path)
 
-    target_task = "Summarization"# Single QA, Summarization
+    target_task = "Code"# Single QA, Summarization
 
     df["task"] = df["metadata"].apply(get_task)
 
     df_target = df[df["task"] == target_task]
-
+    
     row = df_target.iloc[0]
     prompt = row['question']
     context = row['context']

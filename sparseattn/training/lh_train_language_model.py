@@ -380,7 +380,7 @@ def main():
                 data_args=data_args,
                 is_training=True,
             )
-           
+            # breakpoint()
             class_indices = train_dataset.get_class_indices()
             logger.info(f"Using stratified sampling. Class distribution: {[len(v) for v in class_indices.values()]}")
             
@@ -389,26 +389,26 @@ def main():
             else:
                 world_size = training_args.n_gpu
 
-            # try:
-            #     if not dist.is_initialized():
-            #         raise SamplerConditionError("Distributed environment not initialized.")
+            try:
+                if not dist.is_initialized():
+                    raise SamplerConditionError("Distributed environment not initialized.")
 
-            #     custom_sampler = CustomDistributedStratifiedSampler(
-            #         dataset=train_dataset,
-            #         class_indices=class_indices,
-            #         num_gpus=world_size,
-            #         required_per_class=2,
-            #         seed=42,
-            #     )
-            #     sampler = custom_sampler
+                custom_sampler = CustomDistributedStratifiedSampler(
+                    dataset=train_dataset,
+                    class_indices=class_indices,
+                    num_gpus=world_size,
+                    required_per_class=2,
+                    seed=42,
+                )
+                sampler = custom_sampler
                 
-            # except SamplerConditionError as e:
-            #     print(f"⚠️ Sampler fallback triggered: {e}. Using default DistributedSampler instead.")
-            #     from torch.utils.data.distributed import DistributedSampler
-            #     sampler = DistributedSampler(
-            #         dataset=train_dataset,
-            #         shuffle=True,
-            #     )
+            except SamplerConditionError as e:
+                print(f"⚠️ Sampler fallback triggered: {e}. Using default DistributedSampler instead.")
+                from torch.utils.data.distributed import DistributedSampler
+                sampler = DistributedSampler(
+                    dataset=train_dataset,
+                    shuffle=True,
+                )
                 
             train_dataloader = torch.utils.data.DataLoader(
                 dataset=train_dataset,
@@ -470,7 +470,7 @@ def main():
                 drop_last=True, 
             )
             # breakpoint()
-    """
+    
 
     # Initialize our Trainer
     if training_args.attention_type is not None and "nsa" in training_args.attention_type :
