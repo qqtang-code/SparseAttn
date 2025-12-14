@@ -362,7 +362,7 @@ def main():
             dataset=train_dataset,
             batch_size=1,
             sampler=sampler,
-            collate_fn=data_collator,
+            collate_fn=None,
             num_workers=training_args.dataloader_num_workers,
             pin_memory=training_args.dataloader_pin_memory,
             drop_last=True, 

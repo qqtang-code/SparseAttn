@@ -155,7 +155,7 @@ base_arguments=(
     --layerwise_sparsity_weight $layerwise_sparsity_weight
     --erank_analysis_path $erank_analysis_path
     --data_cache_dir "/data2/public_data/data_cache"
-    --pooling_mode 'first_token'
+    --pooling_mode 'ctx_q'
 )
 
 # FSDP configuration

@@ -321,84 +321,69 @@ class Trainer(HFTrainer):
         return torch.tensor(sparsities, dtype=torch.float32)  # shape: [B]
 
     def get_sequence_parallel_inputs(self, inputs):
-        seq_parallel_world_size = (
-            dist.get_world_size(self.seq_parallel_group) if dist.is_initialized() else 1
-        )
+        """
+        Args:
+            inputs: Dict from DataCollator.
+                - input_ids: [1, S] -> 需要变成 [S] 然后切分
+                - labels: [1, S] -> 需要变成 [S] 然后切分
+                - seq_lengths: List[Tensor] (len=1, tensor=[Bi+1]) -> 取出变成 [Bi+1], 保持全局
+        """
+        input_ids = inputs["input_ids"]
+        if len(input_ids.shape) == 2:
+            input_ids = inputs["input_ids"].squeeze(0) 
+            labels = inputs["labels"].squeeze(0)
+            global_seq_lengths = inputs["seq_lengths"][0] 
+        else:
+            global_seq_lengths = inputs["seq_lengths"]
+
+        if dist.is_initialized():
+            seq_parallel_world_size = dist.get_world_size(self.seq_parallel_group)
+            seq_parallel_rank = dist.get_rank(self.seq_parallel_group)
+        else:
+            seq_parallel_world_size = 1
+            seq_parallel_rank = 0
 
         if seq_parallel_world_size > 1:
-            seq_parallel_rank = dist.get_rank(self.seq_parallel_group)
+            total_seq_len = input_ids.size(0)
 
-            input_ids = inputs["input_ids"]
-            labels = inputs["labels"]
-
-            shifted_labels = labels.roll(-1, dims=-1)
-            shifted_labels[..., -1] = -100
-
-            seq_lengths = inputs["seq_lengths"]
-
-            # add right padding here to make equal sized chunks
-            if input_ids.size(-1) % seq_parallel_world_size != 0:
-                padding = seq_parallel_world_size - (
-                    input_ids.size(-1) % seq_parallel_world_size
-                )
+            # 计算 Padding (保证能被 world_size 整除)
+            if total_seq_len % seq_parallel_world_size != 0:
+                padding = seq_parallel_world_size - (total_seq_len % seq_parallel_world_size)
                 padding_zeros = torch.full(
-                    input_ids.size()[:-1] + (padding,),
-                    0,
-                    dtype=input_ids.dtype,
-                    device=input_ids.device,
+                    (padding,), 0, dtype=input_ids.dtype, device=input_ids.device
                 )
-                input_ids = torch.cat([input_ids, padding_zeros], dim=-1)
-                shifted_labels = torch.cat(
-                    [shifted_labels, padding_zeros - 100], dim=-1
-                )
-                seq_lengths[-1] += padding
+                input_ids = torch.cat([input_ids, padding_zeros], dim=0)
+                # labels padding: 补 -100
+                labels = torch.cat([labels, padding_zeros - 100], dim=0)
 
-            # select chunk of input_ids and labels
-            input_ids_chunks = torch.tensor_split(
-                input_ids, seq_parallel_world_size, dim=-1
-            )
-            shifted_labels_chunks = torch.tensor_split(
-                shifted_labels, seq_parallel_world_size, dim=-1
-            )
+            # input_ids_chunks: tuple of [S / world_size]
+            input_ids_chunks = torch.tensor_split(input_ids, seq_parallel_world_size, dim=0)
+            labels_chunks = torch.tensor_split(labels, seq_parallel_world_size, dim=0)
 
-            inputs = {
-                "input_ids": input_ids_chunks[seq_parallel_rank],
-                "shifted_labels": shifted_labels_chunks[seq_parallel_rank],
-                "seq_lengths": seq_lengths,
+            model_inputs = {
+                "input_ids": input_ids_chunks[seq_parallel_rank],    # Local [S_local]
+                "labels": labels_chunks[seq_parallel_rank],          # Local [S_local]
+                "seq_lengths": global_seq_lengths,                   # Global [Bi+1]
                 "seq_parallel_group": self.seq_parallel_group,
             }
 
-            max_seq_length = seq_lengths[0].max() #List[Tensor]
-            max_tokens_per_device = seq_lengths.sum() // seq_parallel_world_size
-
-            start_index = sum(
-                chunk.size(-1) for chunk in input_ids_chunks[:seq_parallel_rank]
+            # 可选：计算 position_ids 起始位置，如果模型需要
+            start_index = sum(chunk.size(0) for chunk in input_ids_chunks[:seq_parallel_rank])
+            model_inputs["position_ids"] = torch.arange(
+                start_index, start_index + model_inputs["input_ids"].size(0), 
+                device=input_ids.device
             )
-            end_index = start_index + input_ids_chunks[seq_parallel_rank].size(-1)
 
-            inputs["position_ids"] = torch.tensor([start_index]).to(input_ids.device)
+        else:
+            # 非并行模式 (单卡或纯 DP)
+            model_inputs = {
+                "input_ids": input_ids,             # Global [S]
+                "labels": labels,                   # Global [S]
+                "seq_lengths": global_seq_lengths,  # Global [Bi+1]
+                "seq_parallel_group": None
+            }
 
-            # max sequence length is smaller per device => no need for sequence parallelism
-            if max_seq_length <= max_tokens_per_device:
-                # take the seq length field and only retain seq lengths with indices that are valid for this rank
-                seq_indices = seq_lengths.cumsum(-1)
-                seq_indices = seq_indices[
-                    (seq_indices < end_index) & (seq_indices >= start_index)
-                ]
-
-                start_index_tensor = torch.tensor(
-                    [start_index], device=seq_indices.device
-                )
-                end_index_tensor = torch.tensor([end_index], device=seq_indices.device)
-
-                seq_lengths = seq_indices.diff(
-                    prepend=start_index_tensor, append=end_index_tensor
-                )
-                seq_lengths = seq_lengths[seq_lengths > 0]
-                inputs["seq_lengths"] = seq_lengths
-                inputs["seq_parallel_group"] = None
-
-        return inputs
+        return model_inputs
 
     def compute_loss(
         self,

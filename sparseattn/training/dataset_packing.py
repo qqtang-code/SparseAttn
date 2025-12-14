@@ -111,14 +111,14 @@ def _process_single_item(item, tokenizer, class_map):
 
 def _finalize_pack(tokenizer, input_ids, labels, task_ids, lengths, task_types):
     """打包收尾：Padding并转换为Tensor结构"""
-    curr_len = len(input_ids)
-    remainder = curr_len % 8
-    if remainder != 0:
-        pad_len = 8 - remainder
-        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+    # curr_len = len(input_ids)
+    # remainder = curr_len % 8
+    # if remainder != 0:
+    #     pad_len = 8 - remainder
+    #     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
         
-        input_ids.extend([pad_id] * pad_len)
-        labels.extend([-100] * pad_len)
+    #     input_ids.extend([pad_id] * pad_len)
+    #     labels.extend([-100] * pad_len)
     
     seq_lengths = [0] + list(np.cumsum(lengths))
     
@@ -429,10 +429,10 @@ if __name__ == "__main__":
     
     # 模拟一个 Batch
     batch_input = [dataset[1000]]
-    batch_output = collator(batch_input)
-    
-    print(f"Batch Input IDs Shape: {batch_output['input_ids'].shape}") # 应该是 [2, max_seq_len]
-    print(f"Batch Labels Shape:    {batch_output['labels'].shape}")
+    # batch_output = collator(batch_input)
+    breakpoint()
+    print(f"Batch Input IDs Shape: {batch_input['input_ids'].shape}") # 应该是 [2, max_seq_len]
+    print(f"Batch Labels Shape:    {batch_input['labels'].shape}")
     
 
     # breakpoint() # 如果需要手动调试解开此行

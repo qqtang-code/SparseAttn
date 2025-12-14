@@ -854,6 +854,7 @@ class AttentionRouter(nn.Module):
             sample_features = []
             x_s, x_e = cu_seq_len[i], cu_seq_len[i + 1]
             for seg in segments:
+                breakpoint()
                 start_idx, end_idx = POOL_MAP[seg]
                 start, end = range_ids[i, start_idx:end_idx + 1].tolist()[0], range_ids[i, start_idx:end_idx + 1].tolist()[-1]
 
@@ -2356,6 +2357,7 @@ class PawQwen3ForCausalLM(Qwen3PreTrainedModel):
         return_dict = (
             return_dict if return_dict is not None else self.config.use_return_dict
         )
+    
         if seq_lengths is not None:
             if inputs_embeds is not None:
                 assert len(inputs_embeds.shape) == 2, (
@@ -2372,13 +2374,9 @@ class PawQwen3ForCausalLM(Qwen3PreTrainedModel):
                 "attention_mask should be None or all ones for `seq_lengths`"
             )
             assert not use_cache, "use_cache is not supported with `seq_lengths`"
-
-            cu_seqlens = F.pad(
-                torch.cumsum(seq_lengths, dim=0, dtype=torch.torch.int32), (1, 0)
-            )
-            max_seqlen = seq_lengths.max().item()
-
-            unpadded_lengths = (cu_seqlens, max_seqlen)
+            max_seqlen = (seq_lengths[1:]-seq_lengths[:-1]).max().item()
+            unpadded_lengths = (seq_lengths, max_seqlen)
+        
         elif attention_mask is not None and not use_cache and attention_mask.size(0) != 1:
             if inputs_embeds is not None:
                 bsz = inputs_embeds.size(0)
