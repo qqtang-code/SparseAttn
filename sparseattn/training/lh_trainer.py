@@ -290,7 +290,7 @@ class Trainer(HFTrainer):
         self.use_softmax = args.use_softmax
         
         self.tau_max = 1.5  # 初始 tau
-        self.tau_min = 0.2  # 最终/保持 tau
+        self.tau_min = 1  # 最终/保持 tau
 
         self.tau_decay_steps = math.ceil(self.args.max_steps * 0.6)
 
