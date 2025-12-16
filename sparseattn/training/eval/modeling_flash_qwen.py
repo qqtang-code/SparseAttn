@@ -624,7 +624,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 class AttentionRouter(nn.Module):
     def __init__(self, input_dim, num_key_value_heads, d_feature=128,
-                 use_task_emb=False, temp=3/2, hard=False, 
+                 use_task_emb=False, temp=0.2, hard=False, 
                  router_type='mlp', use_gumbel=True, learnable_temp=False,
                  dropout=0.1, use_softmax=True, pooling_mode='ctx_q'):
         super().__init__()
@@ -669,8 +669,7 @@ class AttentionRouter(nn.Module):
         if learnable_temp:
             self.log_temp = nn.Parameter(torch.log(torch.tensor(temp)))
         else:
-            self.register_buffer("log_temp", torch.log(torch.tensor(temp)))
-            self.tau = torch.exp(self.log_temp).clamp(0.3, 1.0)
+            self.tau = temp
     
     def reset_parameters(self):
         nn.init.kaiming_uniform_(self.cls_router_head_agnostic[0].weight, a=math.sqrt(5))
@@ -688,7 +687,8 @@ class AttentionRouter(nn.Module):
         x, 
         cu_seq_len=None,
         range_ids: torch.Tensor = None, 
-        task_ids: Optional[torch.Tensor] = None
+        task_ids: Optional[torch.Tensor] = None,
+        current_tau: Optional[torch.Tensor] = None,
     ):
         """
         x: [cu_seq_len, H, D]
@@ -753,7 +753,7 @@ class AttentionRouter(nn.Module):
         if self.learnable_temp:
             tau = torch.exp(self.log_temp).clamp(0.3, 1.0)
         else:
-            tau = self.tau
+            tau = current_tau if current_tau is not None else self.tau
 
         u = torch.rand_like(binary_logits)
         eps = 1e-8
@@ -765,7 +765,7 @@ class AttentionRouter(nn.Module):
             z = z_hard + (z_soft - z_soft.detach())  # [B, H, 1]
             entropy = -(z_soft * torch.log(z_soft + eps) + (1 - z_soft) * torch.log(1 - z_soft + eps))
         else:
-            z_soft = F.softmax((binary_logits + g) / tau, dim=-1)
+            z_soft = F.softmax((binary_logits + g) / tau , dim=-1)
             z_hard = torch.zeros_like(z_soft).scatter_(-1, z_soft.argmax(-1, keepdim=True), 1.0)
             z = z_hard + (z_soft - z_soft.detach())  # [B, H, 2]
             z = z[..., 1]  # [B, H]
@@ -848,7 +848,7 @@ class AttentionRouter(nn.Module):
 
                 if end >= start:
                     start_slice = pooled_input[i, start : start + 100, :, :]
-                    end_slice = pooled_input[i, end - 100 : end + 1, :, :]
+                    end_slice = pooled_input[i, end - 99 : end + 1, :, :]
                     combined_slice = torch.cat((start_slice, end_slice), dim=0)
                     seg_pooled = combined_slice.mean(dim=0)  # [H, D]
                 else:
@@ -938,7 +938,7 @@ class Qwen3Attention(nn.Module):
             # head_dim = self.head_dim,
             d_feature=self.head_dim,
             use_task_emb=getattr(config, "use_task_emb_for_mask", False),
-            temp=getattr(config, "mask_temp", 3/2),
+            temp=getattr(config, "mask_temp", 0.2),
             hard=getattr(config, "mask_hard_sample", False),
             pooling_mode=getattr(config, "pooling_mode", "first_token"),
             use_softmax=getattr(config, "use_softmax", False)

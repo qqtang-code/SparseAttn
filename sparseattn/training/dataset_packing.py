@@ -79,36 +79,37 @@ def _process_single_item(item, tokenizer, class_map):
 
     else:
         user_text = ctx_text + "\n" + q_text
+        
+    if task_type == "Summarization":
+        user_text = "You are given several news passages. Write a one-page summary of all news." + user_text
+    if task_type == "Code":
+        user_text = "Please complete the code given below." + user_text
 
-    if task_type == 'Single QA' or task_type == 'MultiHop QA':
+    messages = [
+        {"role": "user", "content": user_text}
+    ]
+    user_text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        enable_thinking=False,
+    )
+    user_text_ids = tokenizer(user_text, add_special_tokens=False)["input_ids"]
+    
+
+    # Separator + Answer (Segment ID 3)
+    if a:
+        
         messages = [
-            {"role": "user", "content": user_text}
+            {"role": "assistant", "content": a}
         ]
-        user_text = tokenizer.apply_chat_template(
+        a_text = tokenizer.apply_chat_template(
             messages,
             tokenize=False,
             enable_thinking=False,
         )
-        user_text_ids = tokenizer(user_text, add_special_tokens=False)["input_ids"]
-    else:
-        user_text_ids = tokenizer(user_text, add_special_tokens=False)["input_ids"]        
+        a_text = separator + a_text
+        a_ids = tokenizer(a_text, add_special_tokens=False)["input_ids"]
 
-    # Separator + Answer (Segment ID 3)
-    if a:
-        if task_type == 'Single QA' or task_type == 'MultiHop QA':
-            messages = [
-                {"role": "assistant", "content": a}
-            ]
-            a_text = tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                enable_thinking=False,
-            )
-            a_text = separator + a_text
-            a_ids = tokenizer(a_text, add_special_tokens=False)["input_ids"]
-        else:
-            a_text = separator + a
-            a_ids = tokenizer(a_text, add_special_tokens=False)["input_ids"]
     else:
         a_ids = []
 
