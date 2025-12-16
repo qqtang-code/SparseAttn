@@ -81,7 +81,7 @@ def _process_single_item(item, tokenizer, class_map):
         user_text = ctx_text + "\n" + q_text
         
     if task_type == "Summarization":
-        user_text = "You are given several news passages. Write a one-page summary of all news." + user_text
+        user_text = "You are given several news passages. Write a one-page summary of all news." + user_text + "\n\nSummary:"
     if task_type == "Code":
         user_text = "Please complete the code given below." + user_text
 
