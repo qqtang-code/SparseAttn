@@ -624,7 +624,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 class AttentionRouter(nn.Module):
     def __init__(self, input_dim, num_key_value_heads, d_feature=128,
-                 use_task_emb=False, temp=0.2, hard=False, 
+                 use_task_emb=False, temp=1.0, hard=False, 
                  router_type='mlp', use_gumbel=True, learnable_temp=False,
                  dropout=0.1, use_softmax=True, pooling_mode='ctx_q'):
         super().__init__()
@@ -765,7 +765,7 @@ class AttentionRouter(nn.Module):
             z = z_hard + (z_soft - z_soft.detach())  # [B, H, 1]
             entropy = -(z_soft * torch.log(z_soft + eps) + (1 - z_soft) * torch.log(1 - z_soft + eps))
         else:
-            z_soft = F.softmax((binary_logits + g) / tau , dim=-1)
+            z_soft = F.softmax(binary_logits, dim=-1)
             z_hard = torch.zeros_like(z_soft).scatter_(-1, z_soft.argmax(-1, keepdim=True), 1.0)
             z = z_hard + (z_soft - z_soft.detach())  # [B, H, 2]
             z = z[..., 1]  # [B, H]
@@ -1994,7 +1994,6 @@ class Qwen3Model(Qwen3PreTrainedModel):
             all_hidden_states += (hidden_states,)
 
         next_cache = next_decoder_cache if use_cache else None
-        
         model_sparsity = 1 - (z_sum / self.total_num_heads)
         
         if not return_dict:
@@ -2244,7 +2243,6 @@ class PawQwen3ForCausalLM(Qwen3PreTrainedModel):
             unpadded_lengths = (cu_seqlens, max_seqlen)
         else:
             unpadded_lengths = None
-
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
             input_ids=input_ids,
@@ -2265,7 +2263,7 @@ class PawQwen3ForCausalLM(Qwen3PreTrainedModel):
             enable_contrastive_loss=self.enable_contrastive_loss,
         )
 
-        if self.prefill_sparsity is None:
+        if input_ids.shape[1] > 1 and use_cache:
             self.prefill_sparsity = outputs.model_sparsity.detach()
         
         hidden_states = outputs[0]
