@@ -938,7 +938,7 @@ class Qwen3Attention(nn.Module):
             # head_dim = self.head_dim,
             d_feature=self.head_dim,
             use_task_emb=getattr(config, "use_task_emb_for_mask", False),
-            temp=getattr(config, "mask_temp", 0.2),
+            temp=getattr(config, "mask_temp", 1.0),
             hard=getattr(config, "mask_hard_sample", False),
             pooling_mode=getattr(config, "pooling_mode", "first_token"),
             use_softmax=getattr(config, "use_softmax", False)
