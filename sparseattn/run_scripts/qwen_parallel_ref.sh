@@ -1,20 +1,28 @@
+#!/bin/bash
+# qwen_parallel_ref.sh - Single GPU Reference Run
+
+export CUDA_VISIBLE_DEVICES=7  # 只见一张卡
+seq_parallel_size=1            # 关闭序列并行
+num_gpus=1                     # 显式设为1
+num_nodes=1
+
 # Model and training configuration
 model=${MODEL:-"/data2/hf_models/Qwen3-4B"}
 bsz=${BSZ:-8}
 seq=${SEQ:-1}
 lr=${LR:-1e-5}
-steps=${STEPS:-150}
+steps=${STEPS:-100}
 save_steps=${SAVE:-50}
 save_total_limit=3
 warmup=${WARMUP:-0.3}
 
 overrides=${OVERRIDES:-""}
 min_lr_ratio=${MIN_LR_RATIO:-1e-7}
-seq_parallel_size=${SEQ_PARALLEL_SIZE:-8}
+seq_parallel_size=${SEQ_PARALLEL_SIZE:-1}
 
 # FSDP configuration
 # 0=Disable, 1=FULL_SHARD, 2=SHARD_GRAD_OP, 3=NO_SHARD, 4=HYBRID_SHARD, 5=HYBRID_SHARD_ZERO2
-fsdp=${FSDP:-"1"}
+fsdp=${FSDP:-"0"}
 gc=${GC:-"1"}
 
 # PruLong-specific arguments
@@ -23,7 +31,7 @@ max_toks=${MAX_TOKS:-4096} # dataset_packing 中用于计算一个 batch 内最�
 # max_toks=${MAX_TOKS:-256}
 start_head_sparsity=${START_HEAD_SPARSITY:-0.0}
 end_head_sparsity=${END_HEAD_SPARSITY:-0.3}
-mask_learning_rate=${MASK_LEARNING_RATE:-1e-5}
+mask_learning_rate=${MASK_LEARNING_RATE:-1e-3}
 reg_learning_rate=${REG_LEARNING_RATE:-1e-3}
 sparsity_warmup_ratio=${SPARSITY_WARMUP_RATIO:-0.0}
 disable_linear_reg_term=${DISABLE_LINEAR_REG_TERM:-false}
@@ -63,7 +71,7 @@ enable_lambda_task=false
 use_softmax=true
 
 # Create run name
-suffix=${SUFFIX:-"qwen_parallel"}
+suffix=${SUFFIX:-"qwen_parallel_ref"}
 extra_name="seqlen4k"
 # extra_name="debug_12.5"
 if [[ $freeze_weights == "true" ]]; then
@@ -79,7 +87,6 @@ out_dir="checkpoints/$run_name"
 mkdir -p $out_dir
 nvidia-smi
 
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 # Calculate GPU and node configuration
 if [ -z "$CUDA_VISIBLE_DEVICES" ]; then
     num_gpus=$(nvidia-smi -L | wc -l)
@@ -179,7 +186,7 @@ base_arguments=(
     --disable_tqdm true
     --use_fast_tokenizer false
     --remove_unused_columns false
-    --ddp_find_unused_parameters true  # 注意：一定要开，不然报错
+    --ddp_find_unused_parameters true
 
     --cuda_empty_cache
 
