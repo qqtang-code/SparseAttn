@@ -282,9 +282,9 @@ class Trainer(HFTrainer):
             "default": {"start": self.start_head_sparsity, "end": self.end_head_sparsity},
             "Code": {"start": 0, "end": 0.5},
             "Math": {"start": 0, "end": 0.6},
-            "MultiHop QA": {"start": 0, "end": 0.7},
-            "Single QA": {"start": 0, "end": 0.7},
-            "Summarization": {"start": 0, "end": 0.5},
+            "MultiHop QA": {"start": 0, "end": 0.8},
+            "Single QA": {"start": 0, "end": 0.8},
+            "Summarization": {"start": 0, "end": 0.2},
         }
         self.reverse_class_map = {0: 'Single QA', 1: 'MultiHop QA', 2: 'Summarization', 3: 'Code'}
         self.use_softmax = args.use_softmax
