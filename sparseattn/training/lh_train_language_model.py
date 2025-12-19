@@ -365,6 +365,38 @@ def main():
             pin_memory=training_args.dataloader_pin_memory,
             drop_last=True, 
         )
+        
+    if training_args.do_eval:
+        eval_dataset = build_dataset(
+            script_args.tokenized_mds_validation[0],
+            tokenizer=tokenizer,
+            data_args=data_args,
+        )
+        world_size = dist.get_world_size()
+        global_rank = dist.get_rank()
+        sp_size = training_args.seq_parallel_size
+
+        dp_size = world_size // sp_size
+        dp_rank = global_rank // sp_size
+        
+        from torch.utils.data.distributed import DistributedSampler
+        sampler = DistributedSampler(
+            dataset=eval_dataset,
+            num_replicas=dp_size,   
+            rank=dp_rank,          
+            shuffle=False,
+            seed=training_args.seed,
+        )
+        
+        eval_dataloader = torch.utils.data.DataLoader(
+            dataset=eval_dataset,
+            batch_size=1,
+            sampler=sampler,
+            collate_fn=None,
+            num_workers=training_args.dataloader_num_workers,
+            pin_memory=training_args.dataloader_pin_memory,
+        )
+        
 
     # Initialize our Trainer
     if training_args.attention_type is not None and "nsa" in training_args.attention_type :
@@ -383,12 +415,17 @@ def main():
             model=model,
             args=training_args,
             train_dataset=train_dataset if training_args.do_train else None,
+            eval_dataset=eval_dataset if training_args.do_eval else None,
             tokenizer=tokenizer,
             # data_collator=data_collator,
             log_loss=script_args.should_log_loss,
         )
     if training_args.do_train:
         trainer.train_dataloader = train_dataloader
+        logger.info("Successfully injected CustomDistributedStratifiedSampler into Trainer.")
+    
+    if training_args.do_eval:
+        trainer.eval_dataloader = eval_dataloader
         logger.info("Successfully injected CustomDistributedStratifiedSampler into Trainer.")
 
     if trainer.is_fsdp_enabled:

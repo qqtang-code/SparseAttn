@@ -357,6 +357,13 @@ def build_packed_dataset(paths: str, data_args, tokenizer=None):
         split="train", 
         cache_dir=os.path.join(data_args.data_cache_dir, "raw") if data_args.data_cache_dir else None
     )
+    
+    # def filter_fn(x):
+    #     task_type = x.get("metadata", {}).get('task', 'Other')
+    #     if task_type == "Summarization" or task_type == "Code":
+    #         return False
+    #     return task_type == "Single QA" or task_type == "MultiHop QA"
+    # raw = raw.filter(filter_fn, num_proc=os.cpu_count())
 
     # 2. 检查并计算 length 字段 (如果原数据没有)
     if "length" not in raw.column_names:
