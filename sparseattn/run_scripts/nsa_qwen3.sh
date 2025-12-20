@@ -1,5 +1,5 @@
 # Model and training configuration
-model=${MODEL:-"/data1/hf_model/Qwen3-4B"}
+model=${MODEL:-"/data2/hf_models/Qwen3-4B"}
 
 bsz=${BSZ:-8}
 seq=${SEQ:-1}
@@ -26,10 +26,10 @@ attn_type=${ATTN_TYPE:-"nsa"}
 
 # Dataset configuration
 # dataset=${DATASET:-"/data/lcm_lab/qqt/project/SparseAttn/sparseattn/data"}
-dataset=${DATASET:-"/data1/public_data/Pre_filter"}
+dataset=${DATASET:-"/data2/public_data/qwen_mix_sft_64K2"}
 
 # Create run name
-extra_name="update_compress_key_compress_value_gate_only_blocksize_128_topk_64"
+extra_name="nsa_qwen3-8B"
 
 run_name="nsa_qwen3_$(basename $model)_bsz${bsz}_steps${steps}_lr${lr}_warmup${warmup}_${extra_name}${suffix}"
 
@@ -63,7 +63,7 @@ if [ $num_nodes -gt 1 ]; then
     --rdzv-endpoint=$master_addr:56321 \
     --nnodes=$num_nodes \
     --nproc-per-node=$num_gpus \
-    -m training.nsa_train"
+    -m training.train_nsa"
 else
     master_port=$(comm -23 <(seq 49152 65535 | sort) <(ss -Htan | awk '{print $4}' | cut -d':' -f2 | sort -u) | shuf | head -n 1)
 
@@ -72,7 +72,7 @@ else
     --rdzv-endpoint=localhost:$master_port \
     --nnodes=1 \
     --nproc-per-node=$num_gpus \
-    -m training.nsa_train"
+    -m training.train_nsa"
 fi
 
 # accu=$(($bsz / $seq / $num_gpus / $num_nodes))

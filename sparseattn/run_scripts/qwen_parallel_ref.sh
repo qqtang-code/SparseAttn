@@ -1,14 +1,14 @@
 #!/bin/bash
 # qwen_parallel_ref.sh - Single GPU Reference Run
 
-export CUDA_VISIBLE_DEVICES=7  # 只见一张卡
+export CUDA_VISIBLE_DEVICES=5  # 只见一张卡
 seq_parallel_size=1            # 关闭序列并行
 num_gpus=1                     # 显式设为1
 num_nodes=1
 
 # Model and training configuration
 model=${MODEL:-"/data2/hf_models/Qwen3-4B"}
-bsz=${BSZ:-8}
+bsz=${BSZ:-1}
 seq=${SEQ:-1}
 lr=${LR:-1e-5}
 steps=${STEPS:-100}
@@ -37,7 +37,7 @@ sparsity_warmup_ratio=${SPARSITY_WARMUP_RATIO:-0.0}
 disable_linear_reg_term=${DISABLE_LINEAR_REG_TERM:-false}
 # topk
 context_window_if_toggled=${CONTEXT_WINDOW_IF_TOGGLED:-2048}
-freeze_weights=${FREEZE_WEIGHTS:-false}
+freeze_weights=${FREEZE_WEIGHTS:-true}
 freeze_masks=${FREEZE_MASKS:-false}
 warmup_type=${WARMUP_TYPE:-"linear"}
 

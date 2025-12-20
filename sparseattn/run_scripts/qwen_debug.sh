@@ -50,6 +50,7 @@ layerwise_sparsity_power=${LAYERWISE_SPARSITY_POWER:-1.0}
 layerwise_sparsity_weight=${LAYERWISE_SPARSITY_WEIGHT:-1.0}
 erank_analysis_path="/"
 
+use_softmax=true
 # Dataset configuration
 dataset=${DATASET:-"/data2/public_data/qwen_mix_sft_64K2"} #  qwen_mix_sft_32K_4task qwen_mix_sft_64K2
 task_type="sft" # pretrain or sft
@@ -140,6 +141,7 @@ base_arguments=(
     --should_log_loss true
     --save_total_limit 3
     --tokenized_mds_train $dataset
+    --use_softmax $use_softmax
 
     # Streaming configuration
     --toggle_type $toggle_type

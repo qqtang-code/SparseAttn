@@ -25,7 +25,6 @@ from functools import partial
 import math
 import gc
 
-from .dataset_batch import StreamingParquetIterable
 
 from datasets import Dataset
 import transformers
@@ -1030,44 +1029,6 @@ class Trainer(HFTrainer):
             )
 
         return metrics
-
-    def get_train_dataloader(self):
-        """
-        Because streaming handles the distributed data parallel by itself, we don't need special data loader.
-        The plainest data loader is enough.
-        """
-        if not isinstance(self.train_dataset, StreamingParquetIterable):
-            return super().get_train_dataloader()
-
-        if not self.args.streaming_dataset:
-            return super().get_train_dataloader()
-
-        logger.warning("Use streaming dataloader for train")
-
-        if self.train_dataset is None:
-            raise ValueError("Trainer: training requires a train_dataset.")
-
-        train_dataset = self.train_dataset
-        data_collator = self.data_collator
-        data_collator = self._get_collator_with_removed_columns(
-            data_collator, description="training"
-        )
-
-        dataloader_params = {
-            "batch_size": self._train_batch_size,
-            "collate_fn": data_collator,
-            "num_workers": self.args.dataloader_num_workers,
-            "pin_memory": self.args.dataloader_pin_memory,
-            "persistent_workers": self.args.dataloader_persistent_workers,
-        }
-
-        # Streaming is iterable so no need to set sampler etc.
-
-        # Instead of use accelerate to prepare the dataloader, we just return a plain dataloader
-        self.train_dataloader = DataLoader(train_dataset, **dataloader_params)
-        # This actually uses the dataset first dimension......
-
-        return self.train_dataloader
 
     def get_eval_dataloader(self, eval_dataset):
         """

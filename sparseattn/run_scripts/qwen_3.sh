@@ -1,9 +1,9 @@
 # Model and training configuration
-model=${MODEL:-"/data2/hf_models/Qwen3-4B"}
-bsz=${BSZ:-64}
-seq=${SEQ:-2}
-lr=${LR:-1e-3}
-steps=${STEPS:-125}
+model=${MODEL:-"/data2/hf_models/Qwen3-8B"}
+bsz=${BSZ:-32}
+seq=${SEQ:-1}
+lr=${LR:-1e-5}
+steps=${STEPS:-200}
 save_steps=${SAVE:-20}
 save_total_limit=3
 warmup=${WARMUP:-0.3}
@@ -18,9 +18,8 @@ fsdp=${FSDP:-"5"}
 gc=${GC:-"1"}
 
 # PruLong-specific arguments
-max_toks=${MAX_TOKS:-65536}
-# max_toks=${MAX_TOKS:-32768}
-# max_toks=${MAX_TOKS:-16384}
+# max_toks=${MAX_TOKS:-65536}
+max_toks=${MAX_TOKS:-32768}
 # max_toks=${MAX_TOKS:-256}
 start_head_sparsity=${START_HEAD_SPARSITY:-0.0}
 end_head_sparsity=${END_HEAD_SPARSITY:-0.3}
@@ -30,12 +29,12 @@ sparsity_warmup_ratio=${SPARSITY_WARMUP_RATIO:-0.0}
 disable_linear_reg_term=${DISABLE_LINEAR_REG_TERM:-false}
 # topk
 context_window_if_toggled=${CONTEXT_WINDOW_IF_TOGGLED:-2048}
-freeze_weights=${FREEZE_WEIGHTS:-true}
+freeze_weights=${FREEZE_WEIGHTS:-false}
 freeze_masks=${FREEZE_MASKS:-false}
 warmup_type=${WARMUP_TYPE:-"linear"}
 
 # Streaming configuration
-toggle_type=${TOGGLE_TYPE:-"xattn"}
+toggle_type=${TOGGLE_TYPE:-"streaming"}
 retrieval_mode=${RETRIEVAL_MODE:-"full"} # "full","xattn"
 sink_size=${SINK_SIZE:-128}
 topk_k=${TOPK_K:-2048}
@@ -52,8 +51,8 @@ layerwise_sparsity_weight=${LAYERWISE_SPARSITY_WEIGHT:-1.0}
 erank_analysis_path="/"
 
 # Dataset configuration
-dataset=${DATASET:-"/data2/public_data/qwen_mix_sft_32K"}
-dataset_cache_dir="data_cache/sft"
+dataset=${DATASET:-"/data2/public_data/qwen_mix_sft_64K2"}
+dataset_cache_dir="/data2/public_data/data_cache"
 # dataset=${DATASET:-"/data1/public_data/Pre_filter"}
 task_type="sft" # pretrain or sft
 
@@ -64,8 +63,8 @@ enable_lambda_task=false
 use_softmax=true
 
 # Create run name
-suffix=${SUFFIX:-"12.11"}
-extra_name="qwen_mix_sft_32K_xattn_mlp_ctx_q_new_softmax"
+suffix=${SUFFIX:-"12.16sp3_template"}
+extra_name="full_streaming_32k_qwen3-8b"
 # extra_name="debug_12.5"
 if [[ $freeze_weights == "true" ]]; then
     extra_name="${extra_name}_wfrozen"

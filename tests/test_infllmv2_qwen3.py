@@ -4,6 +4,7 @@ from transformers import AutoTokenizer
 import torch
 
 model_path = "/data2/hf_models/Qwen3-4B/"
+model_path = "/data2/hf_models/infllm/"
 tokenizer = AutoTokenizer.from_pretrained(model_path)
 
 config_path = "/data1/lcm_lab/yy/infllmv2_qwen3/config.json"
@@ -27,25 +28,26 @@ inputs = tokenizer(text, return_tensors="pt")
 
 # Move inputs to the model's device if necessary
 device = next(model.parameters()).device
-inputs = {k: v.to(device) for k, v in inputs.items()}
+for i in range(10):
+    inputs = {k: v.to(device) for k, v in inputs.items()}
 
 
-past_key_values = inflllmv2Cache(config, config.num_hidden_layers)
+    past_key_values = inflllmv2Cache(config, config.num_hidden_layers)
 
-outputs = model.generate(
-    **inputs, 
-    max_new_tokens=100, 
-    use_cache=True,
-    past_key_values=past_key_values
-)
+    outputs = model.generate(
+        **inputs, 
+        max_new_tokens=100, 
+        use_cache=True,
+        past_key_values=past_key_values
+    )
 
 
-# 获取输入 token 的长度
-input_length = inputs["input_ids"].shape[1]
+    # 获取输入 token 的长度
+    input_length = inputs["input_ids"].shape[1]
 
-# 提取仅由模型生成的部分（跳过输入）
-generated_tokens = outputs[0][input_length:]
+    # 提取仅由模型生成的部分（跳过输入）
+    generated_tokens = outputs[0][input_length:]
 
-# 解码生成的部分
-result = tokenizer.decode(generated_tokens, skip_special_tokens=True)
-print(result)
+    # 解码生成的部分
+    result = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+    print(result)

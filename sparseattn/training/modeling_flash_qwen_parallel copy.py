@@ -1358,20 +1358,6 @@ class Qwen3Attention(nn.Module):
         )
 
     def interpolated_attention(self, q, kv, k, v, unpadded_lengths, z):
-        cu_seqlens, max_seqlen = unpadded_lengths
-        total_valid_tokens = cu_seqlens[-1].item()
-            
-        if q.shape[0] > total_valid_tokens:
-            q = q[:total_valid_tokens]
-            # 注意：KV Packed 需要小心处理
-            if kv is not None:
-                # kv: [Total_Seq, 2, Heads, Dim]
-                kv = kv[:total_valid_tokens]
-            if k is not None:
-                k = k[:total_valid_tokens]
-            if v is not None:
-                v = v[:total_valid_tokens]
-                
         if self.retrieval_mode == "full":
             if unpadded_lengths is not None:
                 # varlen, ignore padding tokens, efficient for large batch with many paddings
@@ -1665,13 +1651,13 @@ class Qwen3Attention(nn.Module):
         else:
             seqlen_offset = 0 # 有 position_ids 则 offset 无意义
             
-        q, k = self.rotary_emb(
-            q, 
-            k, 
-            seqlen_offset=seqlen_offset, 
-            unpadded_lengths=unpadded_lengths,
-            position_ids=position_ids 
-        )
+        # q, k = self.rotary_emb(
+        #     q, 
+        #     k, 
+        #     seqlen_offset=seqlen_offset, 
+        #     unpadded_lengths=unpadded_lengths,
+        #     position_ids=position_ids 
+        # )
         
         kv = torch.stack([k, v], -3)
         if self.num_key_value_groups > 1:
@@ -1779,6 +1765,7 @@ class Qwen3Attention(nn.Module):
         # Mask: z_kv_batch [B, H_local, 1] -> interpolated_attention 内部会广播
         
         kv_packed = torch.stack([k, v], dim=1)
+        # breakpoint()
         attn_output = self.interpolated_attention(q, kv_packed, k, v, unpadded_lengths, z_kv_batch)
         # attn_output: [S_global, H_local, D]
 
@@ -2314,7 +2301,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
         else:
             model_sparsity = None
             z_loss = None
-            
+        
         if compute_sparsity:
             layerwise_model_sparsity = None
             layerwise_target = None
@@ -2639,7 +2626,6 @@ class PawQwen3ForCausalLM(Qwen3PreTrainedModel):
         hidden_states = outputs[0]
         if seq_lengths is None and unpadded_lengths is not None:
             hidden_states = pad_input(hidden_states, unpad_indices, bsz, max_seqlen_for_pad_seq)
-            
         if labels is not None or shifted_labels is not None:
             if shifted_labels is not None:
                 labels = shifted_labels.reshape(-1)

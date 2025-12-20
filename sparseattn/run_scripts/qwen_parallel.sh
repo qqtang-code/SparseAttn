@@ -1,16 +1,16 @@
 # Model and training configuration
 model=${MODEL:-"/data2/hf_models/Qwen3-4B"}
-bsz=${BSZ:-8}
+bsz=${BSZ:-48}
 seq=${SEQ:-1}
 lr=${LR:-1e-5}
-steps=${STEPS:-150}
-save_steps=${SAVE:-50}
+steps=${STEPS:-266}
+save_steps=${SAVE:-133}
 save_total_limit=3
 warmup=${WARMUP:-0.3}
 
 overrides=${OVERRIDES:-""}
 min_lr_ratio=${MIN_LR_RATIO:-1e-7}
-seq_parallel_size=${SEQ_PARALLEL_SIZE:-8}
+seq_parallel_size=${SEQ_PARALLEL_SIZE:-2}
 
 # FSDP configuration
 # 0=Disable, 1=FULL_SHARD, 2=SHARD_GRAD_OP, 3=NO_SHARD, 4=HYBRID_SHARD, 5=HYBRID_SHARD_ZERO2
@@ -18,7 +18,8 @@ fsdp=${FSDP:-"1"}
 gc=${GC:-"1"}
 
 # PruLong-specific arguments
-max_toks=${MAX_TOKS:-4096} # dataset_packing 中用于计算一个 batch 内最多有多少 tokens
+# max_toks=${MAX_TOKS:-4096} # dataset_packing 中用于计算一个 batch 内最多有多少 tokens
+max_toks=${MAX_TOKS:-131072}
 # max_toks=${MAX_TOKS:-32768}
 # max_toks=${MAX_TOKS:-256}
 start_head_sparsity=${START_HEAD_SPARSITY:-0.0}
@@ -29,7 +30,7 @@ sparsity_warmup_ratio=${SPARSITY_WARMUP_RATIO:-0.0}
 disable_linear_reg_term=${DISABLE_LINEAR_REG_TERM:-false}
 # topk
 context_window_if_toggled=${CONTEXT_WINDOW_IF_TOGGLED:-2048}
-freeze_weights=${FREEZE_WEIGHTS:-false}
+freeze_weights=${FREEZE_WEIGHTS:-true}
 freeze_masks=${FREEZE_MASKS:-false}
 warmup_type=${WARMUP_TYPE:-"linear"}
 
@@ -64,7 +65,7 @@ use_softmax=true
 
 # Create run name
 suffix=${SUFFIX:-"qwen_parallel"}
-extra_name="seqlen4k"
+extra_name="seqlen128k"
 # extra_name="debug_12.5"
 if [[ $freeze_weights == "true" ]]; then
     extra_name="${extra_name}_wfrozen"

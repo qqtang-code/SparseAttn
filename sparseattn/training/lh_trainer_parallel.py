@@ -356,6 +356,10 @@ class Trainer(HFTrainer):
         if len(input_ids.shape) == 2:
             input_ids = inputs["input_ids"].squeeze(0) 
             labels = inputs["labels"].squeeze(0)
+            
+            shifted_labels = labels.roll(-1, dims=-1)
+            shifted_labels[..., -1] = -100
+            
             global_seq_lengths = inputs["seq_lengths"][0] # [Bi+1] (cu_seqlens)
             task_ids = inputs["task_ids"][0]
             range_ids = inputs["range_ids"][0]
@@ -416,17 +420,17 @@ class Trainer(HFTrainer):
                 padding_zeros = torch.full((padding,), 0, dtype=input_ids.dtype, device=input_ids.device)
                 
                 input_ids = torch.cat([input_ids, padding_zeros], dim=0)
-                labels = torch.cat([labels, padding_zeros - 100], dim=0)
+                shifted_labels = torch.cat([shifted_labels, padding_zeros - 100], dim=0)
                 # Position IDs 也要 Pad (补0即可)
                 global_position_ids = torch.cat([global_position_ids, torch.zeros(padding, dtype=torch.long, device=input_ids.device)], dim=0)
 
             input_ids_chunks = torch.tensor_split(input_ids, seq_parallel_world_size, dim=0)
-            labels_chunks = torch.tensor_split(labels, seq_parallel_world_size, dim=0)
+            shifted_labels_chunks = torch.tensor_split(shifted_labels, seq_parallel_world_size, dim=0)
             pos_ids_chunks = torch.tensor_split(global_position_ids, seq_parallel_world_size, dim=0)
 
             model_inputs = {
                 "input_ids": input_ids_chunks[seq_parallel_rank],    # Local chunk
-                "labels": labels_chunks[seq_parallel_rank],          # Local chunk
+                "shifted_labels": shifted_labels_chunks[seq_parallel_rank],          # Local chunk
                 "position_ids": pos_ids_chunks[seq_parallel_rank],   # [CRITICAL] 切分后的正确位置
                 "seq_lengths": global_seq_lengths,                   # Global
                 "seq_parallel_group": self.seq_parallel_group,
@@ -522,7 +526,7 @@ class Trainer(HFTrainer):
        
         model_sparsity = outputs["model_sparsity"]
         
-        print(f"Rank {torch.distributed.get_rank() if torch.distributed.is_initialized() else 0}: "f"[Step {self.state.global_step}] Task={tasks} | model_sparsity={model_sparsity} | reg_loss={reg_loss}")
+        print(f"Rank {torch.distributed.get_rank() if torch.distributed.is_initialized() else 0}: "f"[Step {self.state.global_step}] Task={tasks} | model_sparsity={model_sparsity} | reg_loss={reg_loss} | lm_loss={lm_loss}")
         
         task_ids = outputs['task_ids']
         log_z_loss = outputs['log_z_loss']
@@ -1586,6 +1590,14 @@ class Trainer(HFTrainer):
     def get_batch_samples(self, epoch_iterator, num_batches, device):
         batch_samples = []
         num_items_in_batch = None
+        
+        # i=0
+        # while i<num_batches:
+        #     temp = next(epoch_iterator)
+        #     if temp['seq_lengths'][0,-1]%2 == 0:
+        #         batch_samples.append(temp)
+        #         i+=1
+                
   
         for _ in range(num_batches):
             try:
