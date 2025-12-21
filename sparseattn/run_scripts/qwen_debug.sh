@@ -1,9 +1,9 @@
 # Model and training configuration
 model=${MODEL:-"/data2/hf_models/Qwen3-4B"}
-bsz=${BSZ:-1}
+bsz=${BSZ:-16}
 seq=${SEQ:-1}
 lr=${LR:-1e-5}
-steps=${STEPS:-266}
+steps=${STEPS:-133}
 save_steps=${SAVE:-133}
 save_total_limit=10
 warmup=${WARMUP:-0.3}
@@ -19,8 +19,9 @@ gc=${GC:-"1"}
 
 # PruLong-specific arguments
 # max_toks=${MAX_TOKS:-65536}
-max_toks=${MAX_TOKS:-32768}
+# max_toks=${MAX_TOKS:-32768}
 # max_toks=${MAX_TOKS:-256}
+max_toks=${MAX_TOKS:-4096}
 start_head_sparsity=${START_HEAD_SPARSITY:-0.0}
 end_head_sparsity=${END_HEAD_SPARSITY:-0.3}
 mask_learning_rate=${MASK_LEARNING_RATE:-1e-3}
@@ -51,7 +52,7 @@ layerwise_sparsity_weight=${LAYERWISE_SPARSITY_WEIGHT:-1.0}
 erank_analysis_path="/"
 
 # Dataset configuration
-dataset=${DATASET:-"/data2/public_data/for_debug_mix_sft_64k"}
+dataset=${DATASET:-"/data2/public_data/qwen_mix_sft_32K"}
 dataset_cache_dir="/data2/public_data/data_cache"
 # dataset=${DATASET:-"/data1/public_data/Pre_filter"}
 task_type="sft" # pretrain or sft
@@ -75,7 +76,7 @@ fi
 
 run_name="${suffix}steps${steps}_${extra_name}"
 
-export CUDA_VISIBLE_DEVICES=5
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 out_dir="checkpoints/$run_name"
 mkdir -p $out_dir
 nvidia-smi
@@ -214,6 +215,7 @@ base_arguments=(
     --layerwise_sparsity_power $layerwise_sparsity_power
     --layerwise_sparsity_weight $layerwise_sparsity_weight
     --erank_analysis_path $erank_analysis_path
+
 )
 
 # FSDP configuration

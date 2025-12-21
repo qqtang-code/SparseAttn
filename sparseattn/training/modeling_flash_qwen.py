@@ -1359,8 +1359,6 @@ class Qwen3Attention(nn.Module):
         ] = None,  # will become mandatory in v4.46
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        breakpoint()
-
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
         q = self.q_norm(self.q_proj(hidden_states).view(hidden_shape))
@@ -2001,7 +1999,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 else:
                     z_loss = (model_sparsity - target_sparsity).abs()
                     log_z_loss = z_loss.detach()
-                    z_loss = z_loss.mean() 
+                    z_loss = z_loss.mean() # 标量
         else:
             layerwise_model_sparsity = None
             layerwise_target = None

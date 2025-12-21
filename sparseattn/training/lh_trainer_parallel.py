@@ -426,19 +426,17 @@ class Trainer(HFTrainer):
 
             input_ids_chunks = torch.tensor_split(input_ids, seq_parallel_world_size, dim=0)
             shifted_labels_chunks = torch.tensor_split(shifted_labels, seq_parallel_world_size, dim=0)
-            pos_ids_chunks = torch.tensor_split(global_position_ids, seq_parallel_world_size, dim=0)
 
             model_inputs = {
                 "input_ids": input_ids_chunks[seq_parallel_rank],    # Local chunk
                 "shifted_labels": shifted_labels_chunks[seq_parallel_rank],          # Local chunk
-                "position_ids": pos_ids_chunks[seq_parallel_rank],   # [CRITICAL] 切分后的正确位置
+                "position_ids": global_position_ids,   # [CRITICAL] 切分后的正确位置
                 "seq_lengths": global_seq_lengths,                   # Global
                 "seq_parallel_group": self.seq_parallel_group,
                 "range_ids": range_ids,
                 "task_type": task_type,
                 "task_ids": task_ids,
             }
-            
         else:
             # 单卡 / DP 模式
             model_inputs = {
@@ -534,11 +532,12 @@ class Trainer(HFTrainer):
         task_sparsity_loss_statistic = dict([(task_name, []) for task_name in self.reverse_class_map.values()])
         task_target_sparsity_statistic = dict([(task_name, []) for task_name in self.reverse_class_map.values()])
         
-        # all gather task ids and model_sparsity
-        # distributed_log_z_loss = self.accelerator.gather(log_z_loss)
-        # distributed_task_ids = self.accelerator.gather(task_ids)
-        # distributed_model_sparsity = self.accelerator.gather(model_sparsity)
-        # distributed_target_sparsity = self.accelerator.gather(target_sparsity)
+        if dist.is_initialized():
+            sp_size = dist.get_world_size(self.seq_parallel_group)
+            world_size = dist.get_world_size()
+        else:
+            sp_size = 1
+            world_size = 1
         
         distributed_log_z_loss = [None for _ in range(dist.get_world_size())]
         distributed_task_ids = [None for _ in range(dist.get_world_size())]
@@ -548,11 +547,30 @@ class Trainer(HFTrainer):
         dist.all_gather_object(distributed_task_ids, task_ids.cpu())
         dist.all_gather_object(distributed_model_sparsity, model_sparsity.cpu())
         dist.all_gather_object(distributed_target_sparsity, target_sparsity.cpu())
-        distributed_log_z_loss = torch.cat(distributed_log_z_loss)
-        distributed_task_ids = torch.cat(distributed_task_ids)
-        distributed_model_sparsity = torch.cat(distributed_model_sparsity)
-        distributed_target_sparsity = torch.cat(distributed_target_sparsity)
+        # 只保留每个 SP 组的 Leader (Rank 0) 的数据
+        # 假设 rank 0-3 是 Group A，rank 4-7 是 Group B，我们只取 0 和 4
+        # 这样就把 8 份物理数据还原成了 2 份逻辑数据 (DP Size)
+        valid_indices = [i for i in range(world_size) if i % sp_size == 0]
         
+        filtered_log_z_loss = []
+        filtered_task_ids = []
+        filtered_model_sparsity = []
+        filtered_target_sparsity = []
+
+        for i in valid_indices:
+            filtered_log_z_loss.append(distributed_log_z_loss[i])
+            filtered_task_ids.append(distributed_task_ids[i])
+            filtered_model_sparsity.append(distributed_model_sparsity[i])
+            filtered_target_sparsity.append(distributed_target_sparsity[i])
+
+        # 4. 现在再进行 cat，这时得到的就是真实的 DP Batch 数据了
+        distributed_log_z_loss = torch.cat(filtered_log_z_loss)
+        distributed_task_ids = torch.cat(filtered_task_ids)
+        distributed_model_sparsity = torch.cat(filtered_model_sparsity)
+        distributed_target_sparsity = torch.cat(filtered_target_sparsity)
+        
+        # Loss 的 mean 是没问题的，因为 mean(A, A, A, A, B, B, B, B) == mean(A, B)
+        # 除非你想统计 sum loss，否则这里不用变
         distributed_loss = self.accelerator.gather(loss).mean()
         distributed_lm_loss = self.accelerator.gather(lm_loss).mean()
         distributed_reg_loss = self.accelerator.gather(reg_loss).mean()

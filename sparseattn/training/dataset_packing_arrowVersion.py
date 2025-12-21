@@ -454,7 +454,7 @@ if __name__ == "__main__":
     data_args = PackedDataArguments(
         preprocessing_num_workers=32,
         data_cache_dir="/data2/public_data/data_cache",
-        per_device_max_tokens=131072
+        per_device_max_tokens=4096
     )
 
     # 3. 加载 Tokenizer

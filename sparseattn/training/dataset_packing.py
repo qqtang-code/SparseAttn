@@ -178,7 +178,7 @@ def _finalize_pack(tokenizer, input_ids, labels, task_ids, lengths, task_types, 
         "range_ids": range_ids,          # List[int] [8]
     }
 
-def worker_pack_chunk(chunk_dataset, tokenizer, max_seq_len, worker_id):
+def worker_pack_chunk(chunk_dataset, tokenizer, max_seq_len, min_seq_len, worker_id):
     """
     子进程执行的函数：处理分配给它的那一部分数据
     """
@@ -207,8 +207,8 @@ def worker_pack_chunk(chunk_dataset, tokenizer, max_seq_len, worker_id):
         p_input_ids = processed["input_ids"]
         p_len = len(p_input_ids)
 
-        if p_len > max_seq_len:
-            # 单条过长直接跳过
+        if p_len > max_seq_len and p_len < min_seq_len:
+            # 单条过长直接跳过 或者 单条太短也跳过（CUDA illegal memory access）
             continue
 
         # 贪心打包检查
@@ -244,9 +244,10 @@ def worker_pack_chunk(chunk_dataset, tokenizer, max_seq_len, worker_id):
 # =========================================================
 
 class PackedDataset(Dataset):
-    def __init__(self, raw_dataset, tokenizer, max_seq_len=128*1024, cache_dir=None, num_proc=8, raw_path = None):
+    def __init__(self, raw_dataset, tokenizer, max_seq_len=128*1024, min_seq_len=1000, cache_dir=None, num_proc=8, raw_path = None):
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
+        self.min_seq_len = min_seq_len
         self.packed_data = None
 
         # 缓存逻辑
@@ -271,9 +272,16 @@ class PackedDataset(Dataset):
 
         # 多进程处理，得到一个巨大的 List[Dict]
         packed_data_list = self._parallel_pack_dataset(raw_dataset, num_proc)
+        
+        keys = ["input_ids", "labels", "seq_lengths", "task_ids", "task_type", "range_ids"]
+        columnar = {k: [] for k in keys}
+        for item in packed_data_list:
+            for k in keys:
+                columnar[k].append(item[k])
 
         print("正在转换为 HuggingFace Dataset 对象...")
-        self.packed_data = datasets.Dataset.from_list(packed_data_list)
+        #self.packed_data = datasets.Dataset.from_list(packed_data_list)
+        self.packed_data = datasets.Dataset.from_dict(columnar)
 
         # 保存最终缓存
         if self.cache_path:
@@ -300,7 +308,7 @@ class PackedDataset(Dataset):
         with ProcessPoolExecutor(max_workers=num_proc) as executor:
             for i, chunk in enumerate(chunks):
                 futures.append(
-                    executor.submit(worker_pack_chunk, chunk, self.tokenizer, self.max_seq_len, i)
+                    executor.submit(worker_pack_chunk, chunk, self.tokenizer, self.max_seq_len, self.min_seq_len, i)
                 )
         print(f"所有子进程处理完毕，开始汇总数据...")
 
@@ -384,65 +392,19 @@ def build_packed_dataset(paths: str, data_args, tokenizer=None):
     raw = raw.sort("length", reverse=False)
 
     max_len = data_args.per_device_max_tokens
+    min_len = data_args.min_seq_len
 
     # 实例化并触发多进程处理
     return PackedDataset(
         raw, 
         tokenizer, 
-        max_seq_len=max_len, # 根据需要调整
+        max_seq_len=max_len, # 根据需要调整,
+        min_seq_len=min_len,
         cache_dir=data_args.data_cache_dir,
         num_proc=data_args.preprocessing_num_workers, # 使用参数控制核数
         raw_path = paths,
     )
 
-# 已弃用
-# class PackedDataCollator:
-#     def __init__(self, tokenizer=None, data_args=None, max_seq_len=None):
-#         # 保留接口兼容性，但在 Packing 模式下通常不需要 pad，因为都已经 pack 满或 pad 好了
-#         self.tokenizer = tokenizer 
-#         self.data_args = data_args
-#         self.max_seq_len = max_seq_len
-
-#     def __call__(self, batch: List[Dict]):
-#         # batch 是一个 list，包含多个 dataset[i] 的结果
-
-#         # 1. 确保 input_ids 和 labels 是 Tensor
-#         input_ids_list = [item['input_ids'] for item in batch]
-#         labels_list = [item['labels'] for item in batch]
-
-#         # 如果 __getitem__ 没有转 Tensor，这里进行转换
-#         if not isinstance(input_ids_list[0], torch.Tensor):
-#             input_ids = torch.tensor(input_ids_list, dtype=torch.long)
-#             labels = torch.tensor(labels_list, dtype=torch.long)
-#         else:
-#             input_ids = torch.stack(input_ids_list, dim=0)
-#             labels = torch.stack(labels_list, dim=0)
-
-#         # 2. 处理变长字段 (seq_lengths, task_ids)
-#         # 它们是 List[Tensor] 或 List[List]，Collator 最终通常不 Stack 变长字段
-#         # 或者 Flatten 它们（取决于你的模型 FlashAttn 实现）
-
-#         seq_lengths = [item['seq_lengths'] for item in batch]
-#         task_ids = [item['task_ids'] for item in batch]
-
-#         # 确保内部也是 Tensor (针对变长部分)
-#         if not isinstance(seq_lengths[0], torch.Tensor):
-#              seq_lengths = [torch.tensor(s, dtype=torch.int32) for s in seq_lengths]
-
-#         if not isinstance(task_ids[0], torch.Tensor):
-#              task_ids = [torch.tensor(t, dtype=torch.long) for t in task_ids]
-
-#         task_types = [item['task_type'] for item in batch]
-
-#         res = {
-#             "input_ids": input_ids,     # [B, S], B == 1 
-#             "labels": labels,           # [B, S]
-#             "seq_lengths": seq_lengths, # List[Tensor] Tensor shape: [Bi + 1], Bi is the number of sub-samples in the seq.
-#             "task_ids": task_ids,       # List[Tensor] Tensor shape: [Bi]
-#             "task_type": task_types     # List[Tensor] Tensor shape: [Bi]
-#         }
-
-#         return res
 
 if __name__ == "__main__":
     # 1. 多进程启动方式设置 (CUDA环境必备)
@@ -452,9 +414,10 @@ if __name__ == "__main__":
     # 建议先用小数据或少量 worker 测试，跑通后再调大
     path = "/data2/public_data/qwen_mix_sft_32K" 
     data_args = PackedDataArguments(
-        preprocessing_num_workers=32,
+        preprocessing_num_workers=16,
         data_cache_dir="/data2/public_data/data_cache",
-        per_device_max_tokens=131072
+        per_device_max_tokens=8192,
+        min_seq_len=1000
     )
 
     # 3. 加载 Tokenizer
@@ -479,7 +442,7 @@ if __name__ == "__main__":
 
     # 5. 【验证环节 1】检查单条数据
     # 注意：根据 PackedDataset.__getitem__ 的实现，这里打印出来的应该是 Tensor
-    item0 = dataset[1000]
+    item0 = dataset[0]
     print("\n--- Sample 0 Check ---")
     print(f"Keys: {item0.keys()}")
     print(f"Input IDs Shape: {item0['input_ids'].shape}")

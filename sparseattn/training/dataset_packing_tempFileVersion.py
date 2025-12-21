@@ -178,7 +178,7 @@ def _finalize_pack(tokenizer, input_ids, labels, task_ids, lengths, task_types, 
         "range_ids": range_ids,          # List[int] [8]
     }
 
-def worker_pack_chunk(chunk_dataset, tokenizer, max_seq_len, worker_id):
+def worker_pack_chunk(chunk_dataset, tokenizer, max_seq_len, min_seq_len, worker_id):
     """
     子进程执行的函数：处理分配给它的那一部分数据
     """
@@ -207,8 +207,8 @@ def worker_pack_chunk(chunk_dataset, tokenizer, max_seq_len, worker_id):
         p_input_ids = processed["input_ids"]
         p_len = len(p_input_ids)
 
-        if p_len > max_seq_len:
-            # 单条过长直接跳过
+        if p_len > max_seq_len and p_len < min_seq_len:
+            # 单条过长直接跳过 或者 单条太短也跳过（CUDA illegal memory access）
             continue
 
         # 贪心打包检查
@@ -244,9 +244,10 @@ def worker_pack_chunk(chunk_dataset, tokenizer, max_seq_len, worker_id):
 # =========================================================
 
 class PackedDataset(Dataset):
-    def __init__(self, raw_dataset, tokenizer, max_seq_len=128*1024, cache_dir=None, num_proc=8, raw_path = None):
+    def __init__(self, raw_dataset, tokenizer, max_seq_len=128*1024, min_seq_len=1000, cache_dir=None, num_proc=8, raw_path = None):
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
+        self.min_seq_len = min_seq_len
         self.packed_data = None
 
         # 缓存逻辑
@@ -307,7 +308,7 @@ class PackedDataset(Dataset):
         with ProcessPoolExecutor(max_workers=num_proc) as executor:
             for i, chunk in enumerate(chunks):
                 futures.append(
-                    executor.submit(worker_pack_chunk, chunk, self.tokenizer, self.max_seq_len, i)
+                    executor.submit(worker_pack_chunk, chunk, self.tokenizer, self.max_seq_len, self.min_seq_len, i)
                 )
         print(f"所有子进程处理完毕，开始汇总数据...")
 
@@ -391,12 +392,14 @@ def build_packed_dataset(paths: str, data_args, tokenizer=None):
     raw = raw.sort("length", reverse=False)
 
     max_len = data_args.per_device_max_tokens
+    min_len = data_args.min_seq_len
 
     # 实例化并触发多进程处理
     return PackedDataset(
         raw, 
         tokenizer, 
-        max_seq_len=max_len, # 根据需要调整
+        max_seq_len=max_len, # 根据需要调整,
+        min_seq_len=min_len,
         cache_dir=data_args.data_cache_dir,
         num_proc=data_args.preprocessing_num_workers, # 使用参数控制核数
         raw_path = paths,
@@ -409,11 +412,11 @@ if __name__ == "__main__":
 
     # 2. 配置参数
     # 建议先用小数据或少量 worker 测试，跑通后再调大
-    path = "/data2/public_data/for_debug_mix_sft_64k" 
+    path = "/data2/public_data/qwen_mix_sft_32K" 
     data_args = PackedDataArguments(
         preprocessing_num_workers=16,
         data_cache_dir="/data2/public_data/data_cache",
-        per_device_max_tokens=32768
+        per_device_max_tokens=4096
     )
 
     # 3. 加载 Tokenizer

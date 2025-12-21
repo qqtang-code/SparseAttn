@@ -470,8 +470,8 @@ def main():
         elif last_checkpoint is not None:
             checkpoint = last_checkpoint
         #FIXME：debug时暂时不加载ckpt
-        # train_result = trainer.train(resume_from_checkpoint=checkpoint)
-        train_result = trainer.train()
+        train_result = trainer.train(resume_from_checkpoint=checkpoint)
+        # train_result = trainer.train()
         trainer.save_model()
 
         metrics = train_result.metrics
