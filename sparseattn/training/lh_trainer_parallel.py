@@ -282,15 +282,15 @@ class Trainer(HFTrainer):
             "default": {"start": self.start_head_sparsity, "end": self.end_head_sparsity},
             "Code": {"start": 0, "end": 0.5},
             "Math": {"start": 0, "end": 0.6},
-            "MultiHop QA": {"start": 0, "end": 0.3},
-            "Single QA": {"start": 0, "end": 0.3},
-            "Summarization": {"start": 0, "end": 0.7},
+            "MultiHop QA": {"start": 0, "end": 0.8},
+            "Single QA": {"start": 0, "end": 0.8},
+            "Summarization": {"start": 0, "end": 0.2},
         }
         self.reverse_class_map = {0: 'Single QA', 1: 'MultiHop QA', 2: 'Summarization', 3: 'Code'}
         self.use_softmax = args.use_softmax
         
         self.tau_max = 1.5  # 初始 tau
-        self.tau_min = 0.2  # 最终/保持 tau
+        self.tau_min = 1  # 最终/保持 tau
 
         self.tau_decay_steps = math.ceil(self.args.max_steps * 0.6)
 

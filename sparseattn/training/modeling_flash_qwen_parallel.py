@@ -1649,6 +1649,7 @@ class Qwen3Attention(nn.Module):
         ] = None,  # will become mandatory in v4.46
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        breakpoint()
 
         input_shape = hidden_states.shape[:-1] # [S_local, ]
         hidden_shape = (*input_shape, -1, self.head_dim) # [S_local, nhead, head_dim]

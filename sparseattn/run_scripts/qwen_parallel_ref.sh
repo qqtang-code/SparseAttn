@@ -1,7 +1,7 @@
 #!/bin/bash
 # qwen_parallel_ref.sh - Single GPU Reference Run
 
-export CUDA_VISIBLE_DEVICES=5  # 只见一张卡
+export CUDA_VISIBLE_DEVICES=4  # 只见一张卡
 seq_parallel_size=1            # 关闭序列并行
 num_gpus=1                     # 显式设为1
 num_nodes=1
@@ -11,8 +11,8 @@ model=${MODEL:-"/data2/hf_models/Qwen3-4B"}
 bsz=${BSZ:-1}
 seq=${SEQ:-1}
 lr=${LR:-1e-5}
-steps=${STEPS:-100}
-save_steps=${SAVE:-50}
+steps=${STEPS:-133}
+save_steps=${SAVE:-133}
 save_total_limit=3
 warmup=${WARMUP:-0.3}
 
@@ -26,7 +26,7 @@ fsdp=${FSDP:-"0"}
 gc=${GC:-"1"}
 
 # PruLong-specific arguments
-max_toks=${MAX_TOKS:-4096} # dataset_packing 中用于计算一个 batch 内最多有多少 tokens
+max_toks=${MAX_TOKS:-32768} # dataset_packing 中用于计算一个 batch 内最多有多少 tokens
 # max_toks=${MAX_TOKS:-32768}
 # max_toks=${MAX_TOKS:-256}
 start_head_sparsity=${START_HEAD_SPARSITY:-0.0}
@@ -59,13 +59,13 @@ layerwise_sparsity_weight=${LAYERWISE_SPARSITY_WEIGHT:-1.0}
 erank_analysis_path="/"
 
 # Dataset configuration
-dataset=${DATASET:-"/data2/public_data/qwen_mix_sft_32K"}
+dataset=${DATASET:-"/data2/public_data/for_debug_mix_sft_64k"}
 dataset_cache_dir="/data2/public_data/data_cache"
 # dataset=${DATASET:-"/data1/public_data/Pre_filter"}
 task_type="sft" # pretrain or sft
 
 pooling_mode="ctx_q" # first_token,mean_all,ctx,q,ctx_q
-enable_contrastive_loss=true
+enable_contrastive_loss=false
 use_task_emb_for_mask=false
 enable_lambda_task=false
 use_softmax=true

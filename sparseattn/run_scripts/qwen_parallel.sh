@@ -1,26 +1,26 @@
 # Model and training configuration
 model=${MODEL:-"/data2/hf_models/Qwen3-4B"}
-bsz=${BSZ:-48}
+bsz=${BSZ:-1}
 seq=${SEQ:-1}
 lr=${LR:-1e-5}
-steps=${STEPS:-266}
+steps=${STEPS:-133}
 save_steps=${SAVE:-133}
 save_total_limit=3
 warmup=${WARMUP:-0.3}
 
 overrides=${OVERRIDES:-""}
 min_lr_ratio=${MIN_LR_RATIO:-1e-7}
-seq_parallel_size=${SEQ_PARALLEL_SIZE:-2}
+seq_parallel_size=${SEQ_PARALLEL_SIZE:-1}
 
 # FSDP configuration
 # 0=Disable, 1=FULL_SHARD, 2=SHARD_GRAD_OP, 3=NO_SHARD, 4=HYBRID_SHARD, 5=HYBRID_SHARD_ZERO2
-fsdp=${FSDP:-"1"}
+fsdp=${FSDP:-"0"}
 gc=${GC:-"1"}
 
 # PruLong-specific arguments
 # max_toks=${MAX_TOKS:-4096} # dataset_packing 中用于计算一个 batch 内最多有多少 tokens
-max_toks=${MAX_TOKS:-131072}
-# max_toks=${MAX_TOKS:-32768}
+# max_toks=${MAX_TOKS:-131072}
+max_toks=${MAX_TOKS:-32768}
 # max_toks=${MAX_TOKS:-256}
 start_head_sparsity=${START_HEAD_SPARSITY:-0.0}
 end_head_sparsity=${END_HEAD_SPARSITY:-0.3}
@@ -52,7 +52,7 @@ layerwise_sparsity_weight=${LAYERWISE_SPARSITY_WEIGHT:-1.0}
 erank_analysis_path="/"
 
 # Dataset configuration
-dataset=${DATASET:-"/data2/public_data/qwen_mix_sft_32K"}
+dataset=${DATASET:-"/data2/public_data/for_debug_mix_sft_64k"}
 dataset_cache_dir="/data2/public_data/data_cache"
 # dataset=${DATASET:-"/data1/public_data/Pre_filter"}
 task_type="sft" # pretrain or sft
@@ -80,7 +80,7 @@ out_dir="checkpoints/$run_name"
 mkdir -p $out_dir
 nvidia-smi
 
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export CUDA_VISIBLE_DEVICES=6
 # Calculate GPU and node configuration
 if [ -z "$CUDA_VISIBLE_DEVICES" ]; then
     num_gpus=$(nvidia-smi -L | wc -l)

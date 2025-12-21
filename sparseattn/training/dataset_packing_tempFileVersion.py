@@ -409,11 +409,11 @@ if __name__ == "__main__":
 
     # 2. 配置参数
     # 建议先用小数据或少量 worker 测试，跑通后再调大
-    path = "/data2/public_data/qwen_mix_sft_128K" 
+    path = "/data2/public_data/for_debug_mix_sft_64k" 
     data_args = PackedDataArguments(
-        preprocessing_num_workers=32,
+        preprocessing_num_workers=16,
         data_cache_dir="/data2/public_data/data_cache",
-        per_device_max_tokens=131072
+        per_device_max_tokens=32768
     )
 
     # 3. 加载 Tokenizer
@@ -438,7 +438,7 @@ if __name__ == "__main__":
 
     # 5. 【验证环节 1】检查单条数据
     # 注意：根据 PackedDataset.__getitem__ 的实现，这里打印出来的应该是 Tensor
-    item0 = dataset[1000]
+    item0 = dataset[0]
     print("\n--- Sample 0 Check ---")
     print(f"Keys: {item0.keys()}")
     print(f"Input IDs Shape: {item0['input_ids'].shape}")
