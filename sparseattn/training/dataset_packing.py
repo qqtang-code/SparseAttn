@@ -207,7 +207,7 @@ def worker_pack_chunk(chunk_dataset, tokenizer, max_seq_len, min_seq_len, worker
         p_input_ids = processed["input_ids"]
         p_len = len(p_input_ids)
 
-        if p_len > max_seq_len and p_len < min_seq_len:
+        if p_len > max_seq_len or p_len < min_seq_len:
             # 单条过长直接跳过 或者 单条太短也跳过（CUDA illegal memory access）
             continue
 
@@ -414,10 +414,10 @@ if __name__ == "__main__":
     # 建议先用小数据或少量 worker 测试，跑通后再调大
     path = "/data2/public_data/qwen_mix_sft_32K" 
     data_args = PackedDataArguments(
-        preprocessing_num_workers=16,
+        preprocessing_num_workers=32,
         data_cache_dir="/data2/public_data/data_cache",
-        per_device_max_tokens=8192,
-        min_seq_len=1000
+        per_device_max_tokens=4096,
+        min_seq_len=1000,
     )
 
     # 3. 加载 Tokenizer
