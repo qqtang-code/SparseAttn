@@ -25,7 +25,8 @@ CLASS_MAP = {
     'Single QA': 0, 
     'MultiHop QA': 1, 
     'Summarization': 2, 
-    'Code': 3
+    'Code': 3,
+    'In-Context Learning': 4,
 }
 
 @dataclass
@@ -41,6 +42,7 @@ class PackedDataArguments:
     use_packing: bool = False
     data_cache_dir: Optional[str] = None
     preprocessing_num_workers: int = 32
+    suffix: str = "qwen3_8b"
 
 # =========================================================
 #  独立的处理函数 (Worker Function)
@@ -154,7 +156,7 @@ def _process_single_item(item, tokenizer, class_map):
 
     range_ids = [special_start, special_end, user_text_start, user_text_end, user_text_start, user_text_end, a_start, a_end]
 
-    class_id = class_map.get(task_type, 4) # 4 for Other
+    class_id = class_map.get(task_type, 5) # 4 for Other
     labels = list(full_input_ids)
 
     return {
@@ -244,7 +246,8 @@ def worker_pack_chunk(chunk_dataset, tokenizer, max_seq_len, min_seq_len, worker
 # =========================================================
 
 class PackedDataset(Dataset):
-    def __init__(self, raw_dataset, tokenizer, max_seq_len=128*1024, min_seq_len=1000, cache_dir=None, num_proc=8, raw_path = None):
+    def __init__(self, raw_dataset, tokenizer, max_seq_len=128*1024, min_seq_len=1000, 
+    cache_dir=None, num_proc=8, raw_path = None, suffix = None):
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
         self.min_seq_len = min_seq_len
@@ -252,17 +255,19 @@ class PackedDataset(Dataset):
 
         # 缓存逻辑
         self.cache_path = None
+        # suffix = os.path.basename(tokenizer.name_or_path.rstrip("/"))
+
         if cache_dir:
             os.makedirs(cache_dir, exist_ok=True)
-            # 这里的后缀改为 .parquet
-            cache_filename = f"{os.path.basename(raw_path)}_packed_maxseq{max_seq_len}.parquet"
+            cache_filename = f"{os.path.basename(raw_path)}_{suffix}_packed_maxseq{max_seq_len}.parquet"
             self.cache_path = os.path.join(cache_dir, cache_filename)
+            print(f"*** 缓存文件路径：{self.cache_path} ***")
 
         if self.cache_path and os.path.exists(self.cache_path):
             print(f"🚀 发现缓存文件: {self.cache_path}")
             try:
                 self.packed_data = load_dataset("parquet", data_files=self.cache_path, split="train",
-                                                cache_dir="/data2/public_data/data_cache")
+                                                )
                 print(f"✅ 成功加载 Parquet 缓存! 包含 {len(self.packed_data)} 条序列。")
                 return 
             except Exception as e:
@@ -403,6 +408,7 @@ def build_packed_dataset(paths: str, data_args, tokenizer=None):
         cache_dir=data_args.data_cache_dir,
         num_proc=data_args.preprocessing_num_workers, # 使用参数控制核数
         raw_path = paths,
+        suffix = data_args.suffix
     )
 
 
@@ -412,16 +418,17 @@ if __name__ == "__main__":
 
     # 2. 配置参数
     # 建议先用小数据或少量 worker 测试，跑通后再调大
-    path = "/data2/public_data/qwen_mix_sft_32K" 
+    path = "/data2/public_data/qwen_mix_sft_64K4" 
     data_args = PackedDataArguments(
         preprocessing_num_workers=32,
         data_cache_dir="/data2/public_data/data_cache",
         per_device_max_tokens=4096,
         min_seq_len=1000,
+        suffix="llama31_8b",
     )
 
     # 3. 加载 Tokenizer
-    tokenizer = AutoTokenizer.from_pretrained("/data2/hf_models/Qwen3-4B", trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained("/data2/hf_models/Meta-Llama-3.1-8B-Instruct", trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 

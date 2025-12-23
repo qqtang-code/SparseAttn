@@ -1359,6 +1359,7 @@ class Qwen3Attention(nn.Module):
         ] = None,  # will become mandatory in v4.46
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        breakpoint()
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
         q = self.q_norm(self.q_proj(hidden_states).view(hidden_shape))

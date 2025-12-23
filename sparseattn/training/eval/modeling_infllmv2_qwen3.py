@@ -1182,7 +1182,6 @@ class infllmv2_Qwen3Model(infllmv2_Qwen3PreTrainedModel):
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
-
         
         if use_cache and past_key_values is None:
             past_key_values = inflllmv2Cache(config=self.config, num_hidden_layers=self.config.num_hidden_layers)
@@ -1305,7 +1304,7 @@ class infllmv2_Qwen3ForCausalLM(infllmv2_Qwen3PreTrainedModel, GenerationMixin):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        logits_to_keep: Union[int, torch.Tensor] = 0,
+        logits_to_keep: Union[int, torch.Tensor] = 1,
         **kwargs: Unpack[KwargsForCausalLM],
     ) -> CausalLMOutputWithPast:
         r"""

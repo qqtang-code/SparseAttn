@@ -152,6 +152,10 @@ def main():
             pooling_mode=training_args.pooling_mode,
             enable_contrastive_loss=training_args.enable_contrastive_loss,
             
+            enable_lambda_task=training_args.enable_lambda_task,
+            retrieval_mode=training_args.retrieval_mode,
+            use_softmax=training_args.use_softmax,
+            
             enable_ada_sparsity=training_args.enable_ada_sparsity,
             enable_layerwise_sparsity=training_args.enable_layerwise_sparsity,
             erank_analysis_path=training_args.erank_analysis_path
@@ -255,31 +259,31 @@ def main():
                 "Please provide a valid model name."
             )
             
-    if hasattr(model, "reset_masks"):
-        model.reset_masks()
+    # if hasattr(model, "reset_masks"):
+    #     model.reset_masks()
     
-    def init_all_routers(module):
-        if isinstance(module, Qwen3Model):
-            module.reset_parameters()
-        if isinstance(module, AttentionRouter):
-            module.reset_parameters()
-        for child in module.children():
-            init_all_routers(child)
+    # def init_all_routers(module):
+    #     if isinstance(module, Qwen3Model):
+    #         module.reset_parameters()
+    #     if isinstance(module, AttentionRouter):
+    #         module.reset_parameters()
+    #     for child in module.children():
+    #         init_all_routers(child)
     
-    def find_routers(module, name=""):
-        if isinstance(module, AttentionRouter):
-            print(f"🔍 Found router at: {name}")
-            return [module]
-        routers = []
-        for child_name, child in module.named_children():
-            routers.extend(find_routers(child, f"{name}.{child_name}" if name else child_name))
-        return routers
+    # def find_routers(module, name=""):
+    #     if isinstance(module, AttentionRouter):
+    #         print(f"🔍 Found router at: {name}")
+    #         return [module]
+    #     routers = []
+    #     for child_name, child in module.named_children():
+    #         routers.extend(find_routers(child, f"{name}.{child_name}" if name else child_name))
+    #     return routers
 
-    routers = find_routers(model)
-    print(f"✅ Total routers found: {len(routers)}")
+    # routers = find_routers(model)
+    # print(f"✅ Total routers found: {len(routers)}")
 
-    init_all_routers(model)
-    print("✅ All AttentionRouter instances initialized to near-zero.")
+    # init_all_routers(model)
+    # print("✅ All AttentionRouter instances initialized to near-zero.")
 
     if training_args.stripe_init_width_1 is not None:
         # We should initialize with a striped pattern

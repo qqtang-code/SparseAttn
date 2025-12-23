@@ -68,7 +68,7 @@ from transformers.utils import (
     is_sagemaker_mp_enabled,
 )
 from transformers.optimization import get_scheduler
-
+import swanlab
 
 if is_sagemaker_mp_enabled():
     import smdistributed.modelparallel.torch as smp  # type: ignore
@@ -107,6 +107,101 @@ OPTIMIZER_NAME = "optimizer.pt"
 OPTIMIZER_NAME_BIN = "optimizer.bin"
 SCHEDULER_NAME = "scheduler.pt"
 SCALER_NAME = "scaler.pt"
+
+from collections import defaultdict
+
+class SparsityAccumulator:
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        # 记录标量累积 (loss, reg_loss, etc.)
+        self.scalars = defaultdict(float)
+        self.scalar_counts = defaultdict(int)
+        
+        # 记录任务特定指标 (task_name -> {sum, count})
+        self.task_metrics = defaultdict(lambda: {"sum_sparsity": 0.0, "sum_target": 0.0, "sum_z_loss": 0.0, "count": 0})
+
+    def add(self, scalars: dict, task_data: list):
+        """
+        纯本地累积，无分布式通信。
+        scalars: {"loss": val, "reg_loss": val...}
+        task_data: [(task_name, sparsity, target, z_loss), ...]
+        """
+        # 1. 累积全局标量
+        for k, v in scalars.items():
+            if v is not None:
+                # 确保转为 python float，避免显存占用
+                val = v.item() if isinstance(v, torch.Tensor) else v
+                self.scalars[k] += val
+                self.scalar_counts[k] += 1
+
+        # 2. 累积任务特定指标
+        for task_name, sp, tgt, z_loss in task_data:
+            # 同样确保转为 float
+            sp = sp.item() if isinstance(sp, torch.Tensor) else sp
+            tgt = tgt.item() if isinstance(tgt, torch.Tensor) else tgt
+            z_loss = z_loss.item() if isinstance(z_loss, torch.Tensor) else z_loss
+            
+            self.task_metrics[task_name]["sum_sparsity"] += sp
+            self.task_metrics[task_name]["sum_target"] += tgt
+            self.task_metrics[task_name]["sum_z_loss"] += z_loss
+            self.task_metrics[task_name]["count"] += 1
+
+    def compute_global_metrics(self, accelerator):
+        """
+        只在 Sync Step 调用一次。执行分布式聚合。
+        """
+        # --- 第一阶段：聚合标量 ---
+        # 我们需要聚合 Sum 和 Count，然后相除得到 Mean
+        # 为了简单，我们先在本地算好 Sum 和 Count，然后通过 all_gather_object 收集所有卡的数据
+        
+        local_data = {
+            "scalars": dict(self.scalars),
+            "scalar_counts": dict(self.scalar_counts),
+            "tasks": dict(self.task_metrics)
+        }
+        
+        # 收集所有 GPU 的累积数据
+        # gathered_data List[Dict] 长度为 World Size
+        gathered_data = [None for _ in range(dist.get_world_size())]
+        dist.all_gather_object(gathered_data, local_data)
+        
+        # --- 第二阶段：合并所有 GPU 的数据 ---
+        final_scalars = defaultdict(float)
+        final_scalar_counts = defaultdict(int)
+        final_tasks = defaultdict(lambda: {"sum_sparsity": 0.0, "sum_target": 0.0, "sum_z_loss": 0.0, "count": 0})
+        
+        for gpu_data in gathered_data:
+            # 合并标量
+            for k, v in gpu_data["scalars"].items():
+                final_scalars[k] += v
+                final_scalar_counts[k] += gpu_data["scalar_counts"][k]
+            
+            # 合并任务
+            for t_name, t_stats in gpu_data["tasks"].items():
+                final_tasks[t_name]["sum_sparsity"] += t_stats["sum_sparsity"]
+                final_tasks[t_name]["sum_target"] += t_stats["sum_target"]
+                final_tasks[t_name]["sum_z_loss"] += t_stats["sum_z_loss"]
+                final_tasks[t_name]["count"] += t_stats["count"]
+
+        # --- 第三阶段：计算最终平均值 ---
+        metrics = {}
+        
+        # 计算标量平均
+        for k in final_scalars:
+            if final_scalar_counts[k] > 0:
+                metrics[k] = final_scalars[k] / final_scalar_counts[k]
+                
+        # 计算任务平均
+        for t_name, t_stats in final_tasks.items():
+            if t_stats["count"] > 0:
+                cnt = t_stats["count"]
+                metrics[f"Spa-{t_name} sparsity"] = t_stats["sum_sparsity"] / cnt
+                metrics[f"Spa-{t_name} target_sparsity"] = t_stats["sum_target"] / cnt
+                metrics[f"Spa-{t_name} log_z_loss"] = t_stats["sum_z_loss"] / cnt
+                
+        return metrics
 
 
 class LogCallback(TrainerCallback):
@@ -281,12 +376,12 @@ class Trainer(HFTrainer):
         self.task_sparsity_config = {
             "default": {"start": self.start_head_sparsity, "end": self.end_head_sparsity},
             "Code": {"start": 0, "end": 0.5},
-            "Math": {"start": 0, "end": 0.6},
+            "In-Context Learning": {"start": 0, "end": 0.6},
             "MultiHop QA": {"start": 0, "end": 0.8},
             "Single QA": {"start": 0, "end": 0.8},
             "Summarization": {"start": 0, "end": 0.2},
         }
-        self.reverse_class_map = {0: 'Single QA', 1: 'MultiHop QA', 2: 'Summarization', 3: 'Code'}
+        self.reverse_class_map = {0: 'Single QA', 1: 'MultiHop QA', 2: 'Summarization', 3: 'Code', 4:'In-Context Learning'}
         self.use_softmax = args.use_softmax
         
         self.tau_max = 1.5  # 初始 tau
@@ -309,6 +404,8 @@ class Trainer(HFTrainer):
             self.add_callback(SIGUSR1Callback(self))
         except ValueError:
             logger.warning("Couldn't remove PrinterCallback")
+        
+        self.sparsity_accumulator = SparsityAccumulator()
 
     def get_current_target_sparsity(self, global_step: int, tasks: List[str]) -> torch.Tensor:
         """
@@ -477,8 +574,13 @@ class Trainer(HFTrainer):
         outputs = model(**inputs, use_cache=False, target_sparsity=target_sparsity, current_tau=current_tau)
 
         lm_loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+        reg_loss = outputs["sparsity_loss"] if isinstance(outputs, dict) else outputs[-2]
+        
         head_entropy = outputs["head_entropy"]
-        target_sparsity = outputs["target_sparsity"]
+        model_sparsity = outputs["model_sparsity"] # [B] 或者是标量
+        out_target_sparsity = outputs["target_sparsity"] # [B]
+        log_z_loss = outputs['log_z_loss'] # [B]
+        task_ids = outputs['task_ids'] # [B]
         
         if getattr(self.args, "token_scaled_loss", False):
             seq_parallel_world_size = (
@@ -508,192 +610,97 @@ class Trainer(HFTrainer):
                 )  # moving avg
             lm_loss = lm_loss / self.state.avg_num_valid_tokens_per_device
 
-        reg_loss = outputs["sparsity_loss"] if isinstance(outputs, dict) else outputs[-2]
-        
-        # gather_list = [
-        #     torch.zeros_like(reg_loss, device=reg_loss.device)
-        #     for _ in range(dist.get_world_size(group=self.seq_parallel_group))
-        # ]
-        # # detached gather —— 但保留本 rank 的梯度
-        # dist.all_gather(gather_list, reg_loss.detach())
-        # gather_list[dist.get_rank(group=self.seq_parallel_group)] = reg_loss
-        # reg_loss = sum(gather_list)
-        
-        # loss = lm_loss + 10 * reg_loss
         loss = lm_loss + 10 * reg_loss
        
-        model_sparsity = outputs["model_sparsity"]
         
-        print(f"Rank {torch.distributed.get_rank() if torch.distributed.is_initialized() else 0}: "f"[Step {self.state.global_step}] Task={tasks} | model_sparsity={model_sparsity} | reg_loss={reg_loss} | lm_loss={lm_loss}")
-        
-        task_ids = outputs['task_ids']
-        log_z_loss = outputs['log_z_loss']
-        task_sparsity_statistic = dict([(task_name, []) for task_name in self.reverse_class_map.values()])
-        task_sparsity_loss_statistic = dict([(task_name, []) for task_name in self.reverse_class_map.values()])
-        task_target_sparsity_statistic = dict([(task_name, []) for task_name in self.reverse_class_map.values()])
-        
-        if dist.is_initialized():
-            sp_size = dist.get_world_size(self.seq_parallel_group)
-            world_size = dist.get_world_size()
-        else:
-            sp_size = 1
-            world_size = 1
-        
-        distributed_log_z_loss = [None for _ in range(dist.get_world_size())]
-        distributed_task_ids = [None for _ in range(dist.get_world_size())]
-        distributed_model_sparsity = [None for _ in range(dist.get_world_size())]
-        distributed_target_sparsity = [None for _ in range(dist.get_world_size())]
-        dist.all_gather_object(distributed_log_z_loss, log_z_loss.cpu())
-        dist.all_gather_object(distributed_task_ids, task_ids.cpu())
-        dist.all_gather_object(distributed_model_sparsity, model_sparsity.cpu())
-        dist.all_gather_object(distributed_target_sparsity, target_sparsity.cpu())
-        # 只保留每个 SP 组的 Leader (Rank 0) 的数据
-        # 假设 rank 0-3 是 Group A，rank 4-7 是 Group B，我们只取 0 和 4
-        # 这样就把 8 份物理数据还原成了 2 份逻辑数据 (DP Size)
-        valid_indices = [i for i in range(world_size) if i % sp_size == 0]
-        
-        filtered_log_z_loss = []
-        filtered_task_ids = []
-        filtered_model_sparsity = []
-        filtered_target_sparsity = []
+        # A. 准备本地数据 (不进行 gather!)
+        # 提取当前微步(Micro-Step)的标量值
+        local_scalars = {
+            "loss": loss.detach(),
+            "lm_loss": lm_loss.detach(),
+            "reg_loss": reg_loss.detach(),
+            "head_entropy": head_entropy.detach(),
+            # 如果 model_sparsity 是向量，这里先取平均作为整体指标，详细的任务拆分在下面
+            "model_sparsity(avg)": model_sparsity.detach().float().mean(), 
+            "target_sparsity(avg)": out_target_sparsity.detach().float().mean(),
+        }
 
-        for i in valid_indices:
-            filtered_log_z_loss.append(distributed_log_z_loss[i])
-            filtered_task_ids.append(distributed_task_ids[i])
-            filtered_model_sparsity.append(distributed_model_sparsity[i])
-            filtered_target_sparsity.append(distributed_target_sparsity[i])
-
-        # 4. 现在再进行 cat，这时得到的就是真实的 DP Batch 数据了
-        distributed_log_z_loss = torch.cat(filtered_log_z_loss)
-        distributed_task_ids = torch.cat(filtered_task_ids)
-        distributed_model_sparsity = torch.cat(filtered_model_sparsity)
-        distributed_target_sparsity = torch.cat(filtered_target_sparsity)
-        
-        # Loss 的 mean 是没问题的，因为 mean(A, A, A, A, B, B, B, B) == mean(A, B)
-        # 除非你想统计 sum loss，否则这里不用变
-        distributed_loss = self.accelerator.gather(loss).mean()
-        distributed_lm_loss = self.accelerator.gather(lm_loss).mean()
-        distributed_reg_loss = self.accelerator.gather(reg_loss).mean()
-        
-
-        if self.log_loss and self.accelerator.is_main_process:
-            model_sparsity = (
-                outputs["model_sparsity"] if isinstance(outputs, dict) else outputs[-3]
-            )
-            # Fetch diagnostics if present
-            lambda1 = (
-                outputs.get("lambda1", None) if isinstance(outputs, dict) else None
-            )
-            lambda2 = (
-                outputs.get("lambda2", None) if isinstance(outputs, dict) else None
-            )
-
-            extra = []
-            if lambda1 is not None and lambda2 is not None:
-                extra.append(
-                    f"Lambda1: {lambda1[0]} Lambda2: {lambda1[1]} Lambda3: {lambda1[2]} Lambda4: {lambda1[3]}"
-                )
-
-            logger.info(
-                f"@ {self.state.global_step} | Loss: {distributed_loss} | LM Loss: {distributed_lm_loss} | Tau:{current_tau} | "
-                f"Reg Loss: {distributed_reg_loss} | Head Entropy: {head_entropy}"
-                + (" | " + " | ".join(extra) if len(extra) else "")
-            )
+        # B. 准备任务特定数据 (Zip 并不是耗时操作)
+        # 注意：这里我们只处理本 GPU 上的数据，坚决不做 all_gather
+        local_task_data = []
+        if task_ids.numel() > 0: # 确保有数据
+            # 假设这些 tensor 维度是一致的 [B]
+            t_ids = task_ids.detach().cpu().tolist()
+            t_sparsities = model_sparsity.detach().float().tolist()
+            t_targets = out_target_sparsity.detach().float().tolist()
+            t_z_losses = log_z_loss.detach().float().tolist()
             
-            merged_list = [(distributed_log_z_loss[i], distributed_model_sparsity[i], distributed_target_sparsity[i]) for i in range(len(distributed_task_ids))]
+            for i in range(len(t_ids)):
+                t_name = self.reverse_class_map.get(t_ids[i], "Unknown")
+                local_task_data.append((t_name, t_sparsities[i], t_targets[i], t_z_losses[i]))
+
+        # C. 加入累积器 (极快，纯内存操作)
+        self.sparsity_accumulator.add(local_scalars, local_task_data)
+
+        # D. 判断是否是 Global Step 的最后一步 (Sync Gradients)
+        # 只有在这一步，我们才进行昂贵的通信和日志打印
+        if self.accelerator.gradient_state.sync_gradients:
             
-            for task_id, item in zip(distributed_task_ids, merged_list):
-                log_z_loss, task_sparsity, target_sparsity = item[0], item[1], item[2]
-                task_name = self.reverse_class_map[task_id.item()]
-
-                task_sparsity_statistic[task_name].append(task_sparsity)
-                task_sparsity_loss_statistic[task_name].append(log_z_loss)
-                task_target_sparsity_statistic[task_name].append(target_sparsity)
-
-            valid_tasks = []
-
-            for task_name in task_sparsity_statistic.keys():
-                if len(task_sparsity_statistic[task_name]) == 0:
-                    continue
-
-                task_sparsity_statistic[task_name] = (
-                    torch.stack(task_sparsity_statistic[task_name]).mean().item()
-                )
-                task_sparsity_loss_statistic[task_name] = (
-                    torch.stack(task_sparsity_loss_statistic[task_name]).mean().item()
-                )
-                task_target_sparsity_statistic[task_name] = (
-                    torch.stack(task_target_sparsity_statistic[task_name]).mean().item()
-                )
-
-                valid_tasks.append(task_name)
-
-
-            
-            new_task_sparsity_statistic = {
-                f"Spa-{task} sparsity": task_sparsity_statistic[task]
-                for task in valid_tasks
-            }
-
-            new_task_sparsity_loss_statistic = {
-                f"Spa-{task} log_z_loss": task_sparsity_loss_statistic[task]
-                for task in valid_tasks
-            }
-
-            new_task_target_sparsity_statistic = {
-                f"Spa-{task} target_sparsity": task_target_sparsity_statistic[task]
-                for task in valid_tasks
-            }
-
-            
-            for task_name in valid_tasks:
-                logger.info(
-                    f"Statistic -> {task_name} | "
-                    f"Sparsity: {task_sparsity_statistic[task_name]} | "
-                    f"Target_Sparsity: {task_target_sparsity_statistic[task_name]} | "
-                    f"z_loss: {task_sparsity_loss_statistic[task_name]}"
-                )
-
-
-            del task_sparsity_statistic
-            del task_sparsity_loss_statistic
-            del task_target_sparsity_statistic
-
-            if (
-                not return_output_and_metrics
-                and getattr(self.args, "log_train_sparsity_metrics", True)
-                and self.state.global_step > 0
-            ):
-                train_metrics = {
-                    "lm_loss": float(
-                        distributed_lm_loss.detach().item()
-                        if isinstance(distributed_lm_loss, torch.Tensor)
-                        else distributed_lm_loss
-                    ),
-                    "reg_loss": float(
-                        distributed_reg_loss.detach().item()
-                        if isinstance(distributed_reg_loss, torch.Tensor)
-                        else distributed_reg_loss
-                    ),
-                    "loss": float(
-                        distributed_loss.detach().item() if isinstance(distributed_loss, torch.Tensor) else distributed_loss
-                    ),
-                    "head_entropy": head_entropy.detach().item(),
-                    "current_tau": current_tau.detach().item(),
-                    "target_sparsity(avg)": distributed_target_sparsity.detach().float().mean().item(),
-                    "model_sparsity(avg)": distributed_model_sparsity.detach().float().mean().item(),
-                    "step": self.state.global_step,
-                    "lambda1 Single QA": lambda1[0].detach().item() if lambda1 is not None else None,
-                    "lambda2 MultiHop QA": lambda1[1].detach().item() if lambda1 is not None else None,
-                    "lambda3 Summarization": lambda1[2].detach().item() if lambda1 is not None else None,
-                    "lambda4 Code": lambda1[3].detach().item() if lambda1 is not None else None,
-                }
+            # 只有当需要记录日志时才计算 (step > 0 且满足配置)
+            if getattr(self.args, "log_train_sparsity_metrics", True):
                 
-                train_metrics.update(new_task_sparsity_statistic)
-                train_metrics.update(new_task_sparsity_loss_statistic)
-                train_metrics.update(new_task_target_sparsity_statistic)
+                # [Trigger Communication] 计算 Global Mean
+                # 这一步会发生 Block，但每 48 个微步才发生一次，开销可忽略
+                global_metrics = self.sparsity_accumulator.compute_global_metrics(self.accelerator)
                 
-                self.log(train_metrics)
+                # 只有主进程负责打印
+                if self.accelerator.is_main_process:
+                    # 补充一些只需取最后一次值的指标
+                    global_metrics["step"] = self.state.global_step
+                    global_metrics["current_tau"] = current_tau.detach().item()
+                    
+                    # Lambda 诊断信息
+                    lambda1 = outputs.get("lambda1", None) if isinstance(outputs, dict) else None
+                    if lambda1 is not None:
+                        global_metrics.update({
+                            "lambda1 Single QA": lambda1[0].detach().item(),
+                            "lambda2 MultiHop QA": lambda1[1].detach().item(),
+                            "lambda3 Summarization": lambda1[2].detach().item(),
+                            "lambda4 Code": lambda1[3].detach().item(),
+                        })
+
+                    # --- 打印文本日志 ---
+                    logger.info(
+                        f"@ {self.state.global_step} | "
+                        f"Loss: {global_metrics.get('loss', 0):.4f} | "
+                        f"LM: {global_metrics.get('lm_loss', 0):.4f} | "
+                        f"Reg: {global_metrics.get('reg_loss', 0):.4f} | "
+                        f"Spa(Avg): {global_metrics.get('model_sparsity(avg)', 0):.3f}"
+                    )
+                    
+                    # 打印任务日志
+                    for k in sorted(global_metrics.keys()):
+                        if k.startswith("Spa-") and "sparsity" in k and "target" not in k:
+                            task = k.split(" ")[0] # e.g. "Spa-Code"
+                            logger.info(
+                                f"Statistic -> {task[4:]} | " # remove "Spa-"
+                                f"Spa: {global_metrics[k]:.3f} | "
+                                f"Tgt: {global_metrics.get(f'{task} target_sparsity', 0):.3f} | "
+                                f"Z-Loss: {global_metrics.get(f'{task} log_z_loss', 0):.3f}"
+                            )
+
+                    # --- 上传 SwanLab ---
+                    try:
+                        swanlab.log(global_metrics)
+                        import json
+                        logger.info(f"[Micro-Log] {json.dumps(global_metrics, ensure_ascii=False)}")
+                    except Exception:
+                        pass
+
+            # E. [重置累积器] 准备迎接下一个 Global Step
+            self.sparsity_accumulator.reset()
+
+        # =================================================================
 
         if return_outputs:
             return (loss, outputs)

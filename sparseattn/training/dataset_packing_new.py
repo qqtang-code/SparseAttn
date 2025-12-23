@@ -25,7 +25,8 @@ CLASS_MAP = {
     'Single QA': 0, 
     'MultiHop QA': 1, 
     'Summarization': 2, 
-    'Code': 3
+    'Code': 3,
+    'In-Context Learning': 4,
 }
 
 @dataclass
@@ -154,7 +155,7 @@ def _process_single_item(item, tokenizer, class_map):
 
     range_ids = [special_start, special_end, user_text_start, user_text_end, user_text_start, user_text_end, a_start, a_end]
 
-    class_id = class_map.get(task_type, 4) # 4 for Other
+    class_id = class_map.get(task_type, 5) # 4 for Other
     labels = list(full_input_ids)
 
     return {
@@ -207,7 +208,7 @@ def worker_pack_chunk(chunk_dataset, tokenizer, max_seq_len, min_seq_len, worker
         p_input_ids = processed["input_ids"]
         p_len = len(p_input_ids)
 
-        if p_len > max_seq_len and p_len < min_seq_len:
+        if p_len > max_seq_len or p_len < min_seq_len:
             # 单条过长直接跳过 或者 单条太短也跳过（CUDA illegal memory access）
             continue
 
@@ -412,15 +413,16 @@ if __name__ == "__main__":
 
     # 2. 配置参数
     # 建议先用小数据或少量 worker 测试，跑通后再调大
-    path = "/data2/public_data/qwen_mix_sft_32K" 
+    path = "/workspace/mnt/qqt/public_data/qwen_mix_sft_32K4" 
     data_args = PackedDataArguments(
         preprocessing_num_workers=16,
-        data_cache_dir="/data2/public_data/data_cache",
-        per_device_max_tokens=4096
+        data_cache_dir="/workspace/mnt/public_data/data_cache",
+        per_device_max_tokens=32768,
+        min_seq_len=1000
     )
 
     # 3. 加载 Tokenizer
-    tokenizer = AutoTokenizer.from_pretrained("/data2/hf_models/Qwen3-4B", trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained("/workspace/mnt/hf_models/Qwen3-8B", trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 

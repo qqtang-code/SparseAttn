@@ -1,18 +1,11 @@
-#!/bin/bash
-# qwen_parallel_ref.sh - Single GPU Reference Run
-
-export CUDA_VISIBLE_DEVICES=7  # 只见一张卡
-seq_parallel_size=1            # 关闭序列并行
-num_gpus=1                     # 显式设为1
-num_nodes=1
-
+export CUDA_VISIBLE_DEVICES=0
 # Model and training configuration
-model=${MODEL:-"/data2/hf_models/Qwen3-4B"}
-bsz=${BSZ:-1}
+model=${MODEL:-"/data2/hf_models/Meta-Llama-3.1-8B-Instruct"}
+bsz=${BSZ:-16}
 seq=${SEQ:-1}
-lr=${LR:-1e-5}
-steps=${STEPS:-133}
-save_steps=${SAVE:-133}
+lr=${LR:-1e-3}
+steps=${STEPS:-1223}
+save_steps=${SAVE:-20}
 save_total_limit=3
 warmup=${WARMUP:-0.3}
 
@@ -22,11 +15,12 @@ seq_parallel_size=${SEQ_PARALLEL_SIZE:-1}
 
 # FSDP configuration
 # 0=Disable, 1=FULL_SHARD, 2=SHARD_GRAD_OP, 3=NO_SHARD, 4=HYBRID_SHARD, 5=HYBRID_SHARD_ZERO2
-fsdp=${FSDP:-"0"}
+fsdp=${FSDP:-"5"}
 gc=${GC:-"1"}
 
 # PruLong-specific arguments
-max_toks=${MAX_TOKS:-32768} # dataset_packing 中用于计算一个 batch 内最多有多少 tokens
+max_toks=${MAX_TOKS:-4096} # dataset_packing 中用于计算一个 batch 内最多有多少 tokens
+# max_toks=${MAX_TOKS:-131072}
 # max_toks=${MAX_TOKS:-32768}
 # max_toks=${MAX_TOKS:-256}
 start_head_sparsity=${START_HEAD_SPARSITY:-0.0}
@@ -59,7 +53,7 @@ layerwise_sparsity_weight=${LAYERWISE_SPARSITY_WEIGHT:-1.0}
 erank_analysis_path="/"
 
 # Dataset configuration
-dataset=${DATASET:-"/data2/public_data/for_debug_mix_sft_64k"}
+dataset=${DATASET:-"/data2/public_data/qwen_mix_sft_64K4"}
 dataset_cache_dir="/data2/public_data/data_cache"
 # dataset=${DATASET:-"/data1/public_data/Pre_filter"}
 task_type="sft" # pretrain or sft
@@ -71,8 +65,8 @@ enable_lambda_task=false
 use_softmax=true
 
 # Create run name
-suffix=${SUFFIX:-"qwen_parallel_ref"}
-extra_name="seqlen4k"
+suffix=${SUFFIX:-"llama"}
+extra_name="seqlen${max_toks}"
 # extra_name="debug_12.5"
 if [[ $freeze_weights == "true" ]]; then
     extra_name="${extra_name}_wfrozen"
@@ -81,11 +75,12 @@ if [[ $freeze_masks == "true" ]]; then
     extra_name="${extra_name}_mfrozen"
 fi
 
-run_name="${suffix}steps${steps}_${extra_name}"
+run_name="${suffix}_steps${steps}_${extra_name}"
 
 out_dir="checkpoints/$run_name"
 mkdir -p $out_dir
 nvidia-smi
+
 
 # Calculate GPU and node configuration
 if [ -z "$CUDA_VISIBLE_DEVICES" ]; then
@@ -111,7 +106,7 @@ if [ $num_nodes -gt 1 ]; then
     --rdzv-endpoint=$master_addr:56321 \
     --nnodes=$num_nodes \
     --nproc-per-node=$num_gpus \
-    -m training.lh_train_language_model_parallel"
+    -m training.lh_train_language_model"
 else
     master_port=$(comm -23 <(seq 49152 65535 | sort) <(ss -Htan | awk '{print $4}' | cut -d':' -f2 | sort -u) | shuf | head -n 1)
 
@@ -120,7 +115,7 @@ else
     --rdzv-endpoint=localhost:$master_port \
     --nnodes=1 \
     --nproc-per-node=$num_gpus \
-    -m training.lh_train_language_model_parallel"
+    -m training.lh_train_language_model"
 fi
 
 # Calculate Data Parallel Size
@@ -141,14 +136,16 @@ echo "num_nodes=${num_nodes} master_addr=${master_addr} master_port=${master_por
 
 # Environment variables
 export OMP_NUM_THREADS=$num_gpus
-export SWANLAB_API_KEY="g5vUmp1WaDMSV9FNveypn"
+export SWANLAB_API_KEY="7DTdQXX1nMfdXE8Aow4qa"
 export SWANLAB_LOG_DIR=$out_dir
 export SWANLAB_MODE="cloud"
 export TOKENIZERS_PARALLELISM=true
 export LOGIT_BLOCK_SIZE=2048
 
+suffix=${SUFFIX:-"llama31_8b"}
 # Training arguments
 base_arguments=(
+    --suffix $suffix
     --report_to swanlab
     --do_train
 
@@ -186,7 +183,7 @@ base_arguments=(
     --disable_tqdm true
     --use_fast_tokenizer false
     --remove_unused_columns false
-    --ddp_find_unused_parameters true
+    # --ddp_find_unused_parameters true  # 注意：一定要开，不然报错
 
     --cuda_empty_cache
 
@@ -232,6 +229,7 @@ base_arguments=(
     --layerwise_sparsity_power $layerwise_sparsity_power
     --layerwise_sparsity_weight $layerwise_sparsity_weight
     --erank_analysis_path $erank_analysis_path
+
 )
 
 # FSDP configuration

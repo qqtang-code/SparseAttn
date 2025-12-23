@@ -43,6 +43,22 @@ class DataArguments:
     use_packing: bool = False
     data_cache_dir: Optional[str] = None
     preprocessing_num_workers: int = 16
+    suffix: str = "qwen3_8b"
+
+@dataclass
+class PackedDataArguments:
+    single_seq: bool = False
+    subsplit_length: Optional[int] = None
+    per_device_max_tokens: int = 128*1024
+    apply_instruct_masks: bool = False
+    prepack: bool = False
+    streaming: bool = False
+    min_seq_len: Optional[int] = 1000
+    task_type: str = "pretrain" 
+    use_packing: bool = False
+    data_cache_dir: Optional[str] = None
+    preprocessing_num_workers: int = 32
+    suffix: str = "qwen3_8b"
 
 # =========================================================
 #  Datasets

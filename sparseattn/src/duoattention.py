@@ -383,82 +383,6 @@ def old_qwen_for_causal_lm_forward(
         attentions=outputs.attentions,
     )
 
-# From Huggingface's Transformers v4.34.0. This is the forward method of LlamaForCausalLM using the tuple style KV cache.
-def old_llama_for_causal_lm_forward(
-    self,
-    input_ids: torch.LongTensor = None,
-    attention_mask: Optional[torch.Tensor] = None,
-    position_ids: Optional[torch.LongTensor] = None,
-    past_key_values: Optional[List[torch.FloatTensor]] = None,
-    inputs_embeds: Optional[torch.FloatTensor] = None,
-    labels: Optional[torch.LongTensor] = None,
-    use_cache: Optional[bool] = None,
-    output_attentions: Optional[bool] = None,
-    output_hidden_states: Optional[bool] = None,
-    return_dict: Optional[bool] = None,
-    cache_position: Optional[torch.LongTensor] = None,
-    **kwargs,
-) -> Union[Tuple, CausalLMOutputWithPast]:
-    output_attentions = (
-        output_attentions
-        if output_attentions is not None
-        else self.config.output_attentions
-    )
-    output_hidden_states = (
-        output_hidden_states
-        if output_hidden_states is not None
-        else self.config.output_hidden_states
-    )
-    return_dict = (
-        return_dict if return_dict is not None else self.config.use_return_dict
-    )
-
-    # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-    outputs = self.model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        position_ids=position_ids,
-        past_key_values=past_key_values,
-        inputs_embeds=inputs_embeds,
-        use_cache=use_cache,
-        output_attentions=output_attentions,
-        output_hidden_states=output_hidden_states,
-        return_dict=return_dict,
-    )
-
-    hidden_states = outputs[0]
-
-    if self.training:
-        logits = self.lm_head(hidden_states)
-    else:
-        logits = self.lm_head(hidden_states[:, -1:, :])
-
-    logits = logits.float()
-
-    loss = None
-    if labels is not None:
-        # Shift so that tokens < n predict n
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
-        # Flatten the tokens
-        loss_fct = CrossEntropyLoss()
-        shift_logits = shift_logits.view(-1, self.config.vocab_size)
-        shift_labels = shift_labels.view(-1)
-        # Enable model parallelism
-        shift_labels = shift_labels.to(shift_logits.device)
-        loss = loss_fct(shift_logits, shift_labels)
-
-    if not return_dict:
-        output = (logits,) + outputs[1:]
-        return (loss,) + output if loss is not None else output
-
-    return CausalLMOutputWithPast(
-        loss=loss,
-        logits=logits,
-        past_key_values=outputs.past_key_values,
-        hidden_states=outputs.hidden_states,
-        attentions=outputs.attentions,
-    )
 
 
 def old_qwen_model_forward(
@@ -598,143 +522,6 @@ def old_qwen_model_forward(
         attentions=all_self_attns,
     )
 
-# From Huggingface's Transformers v4.34.0. This is the forward method of LlamaModel using the tuple style KV cache.
-def old_llama_model_forward(
-    self,
-    input_ids: torch.LongTensor = None,
-    attention_mask: Optional[torch.Tensor] = None,
-    position_ids: Optional[torch.LongTensor] = None,
-    past_key_values: Optional[List[torch.FloatTensor]] = None,
-    inputs_embeds: Optional[torch.FloatTensor] = None,
-    use_cache: Optional[bool] = None,
-    output_attentions: Optional[bool] = None,
-    output_hidden_states: Optional[bool] = None,
-    return_dict: Optional[bool] = None,
-    cache_position: Optional[torch.LongTensor] = None,
-    **kwargs,
-) -> Union[Tuple, BaseModelOutputWithPast]:
-    output_attentions = (
-        output_attentions
-        if output_attentions is not None
-        else self.config.output_attentions
-    )
-    output_hidden_states = (
-        output_hidden_states
-        if output_hidden_states is not None
-        else self.config.output_hidden_states
-    )
-    use_cache = use_cache if use_cache is not None else self.config.use_cache
-
-    return_dict = (
-        return_dict if return_dict is not None else self.config.use_return_dict
-    )
-
-    # retrieve input_ids and inputs_embeds
-    if input_ids is not None and inputs_embeds is not None:
-        raise ValueError(
-            "You cannot specify both input_ids and inputs_embeds at the same time"
-        )
-    elif input_ids is not None:
-        batch_size, seq_length = input_ids.shape
-    elif inputs_embeds is not None:
-        batch_size, seq_length, _ = inputs_embeds.shape
-    else:
-        raise ValueError("You have to specify either input_ids or inputs_embeds")
-
-    seq_length_with_past = seq_length
-    past_key_values_length = 0
-
-    if past_key_values is not None:
-        past_key_values_length = past_key_values[0][0].shape[2]
-        seq_length_with_past = seq_length_with_past + past_key_values_length
-
-    if position_ids is None:
-        device = input_ids.device if input_ids is not None else inputs_embeds.device
-        position_ids = torch.arange(
-            past_key_values_length,
-            seq_length + past_key_values_length,
-            dtype=torch.long,
-            device=device,
-        )
-        position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
-    else:
-        position_ids = position_ids.view(-1, seq_length).long()
-
-    if inputs_embeds is None:
-        inputs_embeds = self.embed_tokens(input_ids)
-
-    # embed positions
-    if attention_mask is None:
-        attention_mask = torch.ones(
-            (batch_size, seq_length_with_past),
-            dtype=torch.bool,
-            device=inputs_embeds.device,
-        )
-        padding_mask = None
-    else:
-        if 0 in attention_mask:
-            padding_mask = attention_mask
-        else:
-            padding_mask = None
-
-    attention_mask = self._prepare_decoder_attention_mask(
-        attention_mask, (batch_size, seq_length), inputs_embeds, past_key_values_length
-    )
-
-    hidden_states = inputs_embeds
-
-    # decoder layers
-    all_hidden_states = () if output_hidden_states else None
-    all_self_attns = () if output_attentions else None
-    next_decoder_cache = () if use_cache else None
-
-    # create position embeddings to be shared across the decoder layers
-    position_embeddings = self.rotary_emb(hidden_states, position_ids)
-
-    for idx, decoder_layer in enumerate(self.layers):
-        if output_hidden_states:
-            all_hidden_states += (hidden_states,)
-
-        past_key_value = past_key_values[idx] if past_key_values is not None else None
-
-        layer_outputs = decoder_layer(
-            hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_value=past_key_value,
-            output_attentions=output_attentions,
-            use_cache=use_cache,
-            padding_mask=padding_mask,
-            position_embeddings=position_embeddings,
-        )
-
-        hidden_states = layer_outputs[0]
-
-        if use_cache:
-            next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
-
-        if output_attentions:
-            all_self_attns += (layer_outputs[1],)
-
-    hidden_states = self.norm(hidden_states)
-
-    # add hidden states from the last decoder layer
-    if output_hidden_states:
-        all_hidden_states += (hidden_states,)
-
-    next_cache = next_decoder_cache if use_cache else None
-    if not return_dict:
-        return tuple(
-            v
-            for v in [hidden_states, next_cache, all_hidden_states, all_self_attns]
-            if v is not None
-        )
-    return BaseModelOutputWithPast(
-        last_hidden_state=hidden_states,
-        past_key_values=next_cache,
-        hidden_states=all_hidden_states,
-        attentions=all_self_attns,
-    )
 
 def old_qwen_decoder_layer_forward(
     self,
@@ -782,52 +569,6 @@ def old_qwen_decoder_layer_forward(
     return outputs
 
 
-# From Huggingface's Transformers v4.34.0. This is the forward method of LlamaDecoderLayer using the tuple style KV cache.
-def old_llama_decoder_layer_forward(
-    self,
-    hidden_states: torch.Tensor,
-    attention_mask: Optional[torch.Tensor] = None,
-    position_ids: Optional[torch.LongTensor] = None,
-    past_key_value: Optional[Tuple[torch.Tensor]] = None,
-    output_attentions: Optional[bool] = False,
-    use_cache: Optional[bool] = False,
-    position_embeddings: Optional[torch.Tensor] = None,
-    padding_mask: Optional[torch.LongTensor] = None,
-    **kwargs,
-) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
-    residual = hidden_states
-
-    hidden_states = self.input_layernorm(hidden_states)
-
-    # Self Attention
-    hidden_states, self_attn_weights, present_key_value = self.self_attn(
-        hidden_states=hidden_states,
-        attention_mask=attention_mask,
-        position_ids=position_ids,
-        past_key_value=past_key_value,
-        output_attentions=output_attentions,
-        use_cache=use_cache,
-        padding_mask=padding_mask,
-        position_embeddings=position_embeddings,
-    )
-    hidden_states = residual + hidden_states
-
-    # Fully Connected
-    residual = hidden_states
-    hidden_states = self.post_attention_layernorm(hidden_states)
-    hidden_states = self.mlp(hidden_states)
-    hidden_states = residual + hidden_states
-
-    outputs = (hidden_states,)
-
-    if output_attentions:
-        outputs += (self_attn_weights,)
-
-    if use_cache:
-        outputs += (present_key_value,)
-
-    return outputs
-
 # qwen
 def enable_tuple_kv_cache_for_qwen(model: Qwen3ForCausalLM):
     print("Enabling tuple KV cache for Qwen")
@@ -848,32 +589,6 @@ def enable_tuple_kv_cache_for_qwen(model: Qwen3ForCausalLM):
         )
     model.forward = types.MethodType(old_qwen_for_causal_lm_forward, model)
 
-def enable_tuple_kv_cache_for_llama(model: LlamaForCausalLM):
-    print("Enabling tuple KV cache for Llama")
-    model.model._prepare_decoder_attention_mask = lambda *args, **kwargs: None
-    model.model.forward = types.MethodType(old_llama_model_forward, model.model)
-    for idx in range(len(model.model.layers)):
-        model.model.layers[idx].forward = types.MethodType(
-            old_llama_decoder_layer_forward, model.model.layers[idx]
-        )
-        model.model.layers[idx].self_attn.forward = types.MethodType(
-            old_flash_attention_2_forward, model.model.layers[idx].self_attn
-        )
-        model.model.layers[idx].self_attn._upad_input = types.MethodType(
-            _upad_input, model.model.layers[idx].self_attn
-        )
-        model.model.layers[idx].self_attn._flash_attention_forward = types.MethodType(
-            _flash_attention_forward, model.model.layers[idx].self_attn
-        )
-    model.forward = types.MethodType(old_llama_for_causal_lm_forward, model)
-
-
-def enable_tuple_kv_cache(model):
-    if isinstance(model, LlamaForCausalLM):
-        enable_tuple_kv_cache_for_llama(model)
-    else:
-        raise ValueError("Model not supported")
-
 
 import os
 from torch import nn
@@ -892,169 +607,6 @@ from .utils import apply_rope_inplace, enable_flashinfer_rmsnorm
 from tensor_parallel.pretrained_model import TensorParallelPreTrainedModel
 from flash_attn import flash_attn_func, flash_attn_with_kvcache
 
-
-def llama_duo_attention_forward_two_way(
-    self,
-    hidden_states: torch.Tensor,
-    attention_mask: Optional[torch.Tensor] = None,
-    position_ids: Optional[torch.LongTensor] = None,
-    past_key_value: Optional[Tuple[torch.Tensor]] = None,
-    output_attentions: bool = False,
-    use_cache: bool = False,
-    **kwargs,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-    bsz_x_2, q_len, _ = hidden_states.size()
-
-    assert bsz_x_2 % 2 == 0
-
-    bsz = bsz_x_2 // 2
-
-    full_hidden_states = hidden_states[:bsz]
-    streaming_hidden_states = hidden_states[bsz:]
-
-    with torch.no_grad():
-        full_query_states = self.q_proj(full_hidden_states)
-        full_key_states = self.k_proj(full_hidden_states)
-        full_value_states = self.v_proj(full_hidden_states)
-        full_query_states = full_query_states.view(
-            bsz,
-            q_len,
-            self.num_heads
-            if hasattr(self, "num_heads")
-            else self.config.num_attention_heads
-            if hasattr(self, "num_heads")
-            else self.config.num_attention_heads,
-            self.head_dim,
-        )
-        full_key_states = full_key_states.view(
-            bsz,
-            q_len,
-            self.num_key_value_heads
-            if hasattr(self, "num_key_value_heads")
-            else self.config.num_key_value_heads,
-            self.head_dim,
-        )
-        full_value_states = full_value_states.view(
-            bsz,
-            q_len,
-            self.num_key_value_heads
-            if hasattr(self, "num_key_value_heads")
-            else self.config.num_key_value_heads,
-            self.head_dim,
-        )
-
-    streaming_query_states = self.q_proj(streaming_hidden_states)
-    streaming_key_states = self.k_proj(streaming_hidden_states)
-    streaming_value_states = self.v_proj(streaming_hidden_states)
-    streaming_query_states = streaming_query_states.view(
-        bsz,
-        q_len,
-        self.num_heads
-        if hasattr(self, "num_heads")
-        else self.config.num_attention_heads
-        if hasattr(self, "num_heads")
-        else self.config.num_attention_heads,
-        self.head_dim,
-    )
-    streaming_key_states = streaming_key_states.view(
-        bsz,
-        q_len,
-        self.num_key_value_heads
-        if hasattr(self, "num_key_value_heads")
-        else self.config.num_key_value_heads,
-        self.head_dim,
-    )
-    streaming_value_states = streaming_value_states.view(
-        bsz,
-        q_len,
-        self.num_key_value_heads
-        if hasattr(self, "num_key_value_heads")
-        else self.config.num_key_value_heads,
-        self.head_dim,
-    )
-
-    cos, sin = self.rotary_emb(full_value_states, position_ids)
-
-    with torch.no_grad():
-        full_query_states, full_key_states = apply_rotary_pos_emb(
-            full_query_states,
-            full_key_states,
-            cos,
-            sin,
-            unsqueeze_dim=2,  # unsqueeze_dim=2 for the flash attention
-        )
-        full_attn_output = self.full_attn_func(
-            full_query_states,
-            full_key_states,
-            full_value_states,
-            causal=True,
-            dropout_p=0.0,
-        )
-
-    streaming_query_states, streaming_key_states = apply_rotary_pos_emb(
-        streaming_query_states,
-        streaming_key_states,
-        cos,
-        sin,
-        unsqueeze_dim=2,  # unsqueeze_dim=2 for the flash attention
-    )
-
-    streaming_attn_output = self.streaming_attn_func(
-        streaming_query_states,
-        streaming_key_states,
-        streaming_value_states,
-        self.streaming_mask,
-    )
-
-    full_attention_heads = (
-        self.full_attention_heads.clamp(0, 1)
-        .view(
-            1,
-            1,
-            self.num_key_value_heads
-            if hasattr(self, "num_key_value_heads")
-            else self.config.num_key_value_heads,
-            1,
-            1,
-        )
-        .expand(
-            1,
-            1,
-            self.num_key_value_heads
-            if hasattr(self, "num_key_value_heads")
-            else self.config.num_key_value_heads,
-            self.num_key_value_groups,
-            1,
-        )
-        .reshape(
-            1,
-            1,
-            self.num_heads
-            if hasattr(self, "num_heads")
-            else self.config.num_attention_heads
-            if hasattr(self, "num_heads")
-            else self.config.num_attention_heads,
-            1,
-        )
-    )
-
-    streaming_attn_output = (
-        1 - full_attention_heads
-    ) * streaming_attn_output + full_attention_heads * full_attn_output
-
-    with torch.no_grad():
-        full_attn_output = full_attn_output.reshape(bsz, q_len, self.hidden_size)
-        full_attn_output = self.o_proj(full_attn_output)
-
-    streaming_attn_output = streaming_attn_output.reshape(bsz, q_len, self.hidden_size)
-    streaming_attn_output = self.o_proj(streaming_attn_output)
-
-    attn_output = torch.cat([full_attn_output, streaming_attn_output], dim=0)
-
-    if not output_attentions:
-        attn_weights = None
-
-    return attn_output, attn_weights, past_key_value
 
 
 def qwen_duo_attention_forward_one_way_reordered(
@@ -1250,15 +802,175 @@ def qwen_duo_attention_forward_one_way_reordered(
 
     return attn_output, attn_weights, past_key_value
 
-def llama_duo_attention_forward_one_way_reordered(
+# Qwen 
+def enable_qwen_duo_attention_eval(
+    model: Qwen3ForCausalLM,
+    full_attention_heads,
+    sink_size,
+    recent_size,
+):
+    enable_tuple_kv_cache_for_qwen(model)
+
+    device = next(model.parameters()).device
+    dtype = next(model.parameters()).dtype
+    for idx, layer in enumerate(model.model.layers):
+        module = layer.self_attn
+        layer_full_attention_heads = torch.tensor(
+            full_attention_heads[idx], device=device, dtype=dtype
+        )
+
+        module.forward = types.MethodType(
+            qwen_duo_attention_forward_one_way_reordered, module
+        )
+        module.q_proj = reorder_linear_weights(
+            module.q_proj,
+            layer_full_attention_heads,
+            module.num_key_value_groups * module.head_dim,
+            "out",
+        )
+        module.k_proj = reorder_linear_weights(
+            module.k_proj,
+            layer_full_attention_heads,
+            module.head_dim,
+            "out",
+        )
+        module.v_proj = reorder_linear_weights(
+            module.v_proj,
+            layer_full_attention_heads,
+            module.head_dim,
+            "out",
+        )
+        module.o_proj = reorder_linear_weights(
+            module.o_proj,
+            layer_full_attention_heads,
+            module.num_key_value_groups * module.head_dim,
+            "in",
+        )
+        layer_full_attention_heads = reorder_full_attn_heads(layer_full_attention_heads)
+
+        module.sink_size = sink_size
+        module.recent_size = recent_size
+        module.register_buffer(
+            "full_attention_heads",
+            layer_full_attention_heads,
+        )
+
+
+def llama_duo_attention_forward_two_way(
     self,
     hidden_states: torch.Tensor,
+    position_embeddings: Tuple[torch.Tensor, torch.Tensor],
     attention_mask: Optional[torch.Tensor] = None,
     position_ids: Optional[torch.LongTensor] = None,
     past_key_value: Optional[Tuple[torch.Tensor]] = None,
     output_attentions: bool = False,
     use_cache: bool = False,
-    position_embeddings: Optional[torch.Tensor] = None,
+    **kwargs,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    bsz_x_2, q_len, _ = hidden_states.size()
+
+    assert bsz_x_2 % 2 == 0
+
+    bsz = bsz_x_2 // 2
+
+    full_hidden_states = hidden_states[:bsz]
+    streaming_hidden_states = hidden_states[bsz:]
+
+    with torch.no_grad():
+        full_query_states = self.q_proj(full_hidden_states)
+        full_key_states = self.k_proj(full_hidden_states)
+        full_value_states = self.v_proj(full_hidden_states)
+        full_query_states = full_query_states.view(
+            bsz, q_len, self.config.num_attention_heads, self.head_dim
+        )
+        full_key_states = full_key_states.view(
+            bsz, q_len, self.config.num_key_value_heads, self.head_dim
+        )
+        full_value_states = full_value_states.view(
+            bsz, q_len, self.config.num_key_value_heads, self.head_dim
+        )
+
+    streaming_query_states = self.q_proj(streaming_hidden_states)
+    streaming_key_states = self.k_proj(streaming_hidden_states)
+    streaming_value_states = self.v_proj(streaming_hidden_states)
+    streaming_query_states = streaming_query_states.view(
+        bsz, q_len, self.config.num_attention_heads, self.head_dim
+    )
+    streaming_key_states = streaming_key_states.view(
+        bsz, q_len, self.config.num_key_value_heads, self.head_dim
+    )
+    streaming_value_states = streaming_value_states.view(
+        bsz, q_len, self.config.num_key_value_heads, self.head_dim
+    )
+
+    cos, sin = position_embeddings
+
+    with torch.no_grad():
+        full_query_states, full_key_states = apply_rotary_pos_emb(
+            full_query_states,
+            full_key_states,
+            cos,
+            sin,
+            unsqueeze_dim=2,  # unsqueeze_dim=2 for the flash attention
+        )
+        full_attn_output = self.full_attn_func(
+            full_query_states,
+            full_key_states,
+            full_value_states,
+            causal=True,
+            dropout_p=0.0,
+        )
+
+    streaming_query_states, streaming_key_states = apply_rotary_pos_emb(
+        streaming_query_states,
+        streaming_key_states,
+        cos,
+        sin,
+        unsqueeze_dim=2,  # unsqueeze_dim=2 for the flash attention
+    )
+
+    streaming_attn_output = self.streaming_attn_func(
+        streaming_query_states,
+        streaming_key_states,
+        streaming_value_states,
+        self.streaming_mask,
+    )
+
+    full_attention_heads = (
+        self.full_attention_heads.clamp(0, 1)
+        .view(1, 1, self.config.num_key_value_heads, 1, 1)
+        .expand(1, 1, self.config.num_key_value_heads, self.num_key_value_groups, 1)
+        .reshape(1, 1, self.config.num_attention_heads, 1)
+    )
+
+    streaming_attn_output = (
+        1 - full_attention_heads
+    ) * streaming_attn_output + full_attention_heads * full_attn_output
+
+    with torch.no_grad():
+        full_attn_output = full_attn_output.reshape(bsz, q_len, self.config.hidden_size)
+        full_attn_output = self.o_proj(full_attn_output)
+
+    streaming_attn_output = streaming_attn_output.reshape(bsz, q_len, self.config.hidden_size)
+    streaming_attn_output = self.o_proj(streaming_attn_output)
+
+    attn_output = torch.cat([full_attn_output, streaming_attn_output], dim=0)
+
+    if not output_attentions:
+        attn_weights = None
+
+    return attn_output, attn_weights, past_key_value
+
+
+def llama_duo_attention_forward_one_way_reordered(
+    self,
+    hidden_states: torch.Tensor,
+    position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.LongTensor] = None,
+    past_key_value: Optional[Tuple[torch.Tensor]] = None,
+    output_attentions: bool = False,
+    use_cache: bool = False,
     **kwargs,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
     bsz, q_len, _ = hidden_states.size()
@@ -1267,29 +979,10 @@ def llama_duo_attention_forward_one_way_reordered(
     key_states = self.k_proj(hidden_states)
     value_states = self.v_proj(hidden_states)
 
-    query_states = query_states.view(
-        bsz,
-        q_len,
-        self.num_heads
-        if hasattr(self, "num_heads")
-        else self.config.num_attention_heads,
-        self.head_dim,
-    )
-    key_states = key_states.view(
-        bsz,
-        q_len,
-        self.num_key_value_heads
-        if hasattr(self, "num_key_value_heads")
-        else self.config.num_key_value_heads,
-        self.head_dim,
-    )
+    query_states = query_states.view(bsz, q_len, self.config.num_attention_heads, self.head_dim)
+    key_states = key_states.view(bsz, q_len, self.config.num_key_value_heads, self.head_dim)
     value_states = value_states.view(
-        bsz,
-        q_len,
-        self.num_key_value_heads
-        if hasattr(self, "num_key_value_heads")
-        else self.config.num_key_value_heads,
-        self.head_dim,
+        bsz, q_len, self.config.num_key_value_heads, self.head_dim
     )
 
     # new data structure for past_key_value
@@ -1314,17 +1007,11 @@ def llama_duo_attention_forward_one_way_reordered(
         self.full_attn_head_mask = self.full_attention_heads > 0.5
         self.num_full_attn_head = self.full_attn_head_mask.sum().item()
         self.num_streaming_attn_head = (
-            self.num_key_value_heads
-            if hasattr(self, "num_key_value_heads")
-            else self.config.num_key_value_heads - self.num_full_attn_head
+            self.config.num_key_value_heads - self.num_full_attn_head
         )
 
         self.num_full_query_head = self.num_full_attn_head * self.num_key_value_groups
-        self.num_streaming_query_head = (
-            self.num_heads
-            if hasattr(self, "num_heads")
-            else self.config.num_attention_heads - self.num_full_query_head
-        )
+        self.num_streaming_query_head = self.config.num_attention_heads - self.num_full_query_head
 
     full_key_states = key_states[:, :, : self.num_full_attn_head, :]
     full_value_states = value_states[:, :, : self.num_full_attn_head, :]
@@ -1399,11 +1086,7 @@ def llama_duo_attention_forward_one_way_reordered(
         else:
             attn_output = torch.cat([full_attn_output, streaming_attn_output], dim=2)
 
-    attn_output = attn_output.reshape(
-        bsz,
-        q_len,
-        self.hidden_size if hasattr(self, "hidden_size") else self.config.hidden_size,
-    )
+    attn_output = attn_output.reshape(bsz, q_len, self.config.hidden_size)
 
     attn_output = self.o_proj(attn_output)
 
@@ -1460,31 +1143,10 @@ def llama_duo_attention_forward_one_way_reordered_static(
     key_states = self.k_proj(hidden_states)
     value_states = self.v_proj(hidden_states)
 
-    query_states = query_states.view(
-        bsz,
-        q_len,
-        self.num_heads
-        if hasattr(self, "num_heads")
-        else self.config.num_attention_heads
-        if hasattr(self, "num_heads")
-        else self.config.num_attention_heads,
-        self.head_dim,
-    )
-    key_states = key_states.view(
-        bsz,
-        q_len,
-        self.num_key_value_heads
-        if hasattr(self, "num_key_value_heads")
-        else self.config.num_key_value_heads,
-        self.head_dim,
-    )
+    query_states = query_states.view(bsz, q_len, self.config.num_attention_heads, self.head_dim)
+    key_states = key_states.view(bsz, q_len, self.config.num_key_value_heads, self.head_dim)
     value_states = value_states.view(
-        bsz,
-        q_len,
-        self.num_key_value_heads
-        if hasattr(self, "num_key_value_heads")
-        else self.config.num_key_value_heads,
-        self.head_dim,
+        bsz, q_len, self.config.num_key_value_heads, self.head_dim
     )
 
     kv_seq_len = q_len
@@ -1559,13 +1221,7 @@ def llama_duo_attention_forward_one_way_reordered_static(
         else:
             full_attn_output = None
 
-        if (
-            self.num_heads
-            if hasattr(self, "num_heads")
-            else self.config.num_attention_heads
-            if hasattr(self, "num_heads")
-            else self.config.num_attention_heads - num_full_query_head > 0
-        ):
+        if self.config.num_attention_heads - num_full_query_head > 0:
             streaming_query_states = query_states[:, :, num_full_query_head:, :]
             streaming_attn_output = flash_attn_func(
                 streaming_query_states,
@@ -1588,7 +1244,7 @@ def llama_duo_attention_forward_one_way_reordered_static(
         layer_idx, streaming_key_states, streaming_value_states
     )
 
-    attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+    attn_output = attn_output.reshape(bsz, q_len, self.config.hidden_size)
 
     attn_output = self.o_proj(attn_output)
 
@@ -1597,58 +1253,283 @@ def llama_duo_attention_forward_one_way_reordered_static(
 
     return attn_output, attn_weights
 
-# Qwen 
-def enable_qwen_duo_attention_eval(
-    model: Qwen3ForCausalLM,
-    full_attention_heads,
-    sink_size,
-    recent_size,
-):
-    enable_tuple_kv_cache_for_qwen(model)
 
-    device = next(model.parameters()).device
-    dtype = next(model.parameters()).dtype
-    for idx, layer in enumerate(model.model.layers):
-        module = layer.self_attn
-        layer_full_attention_heads = torch.tensor(
-            full_attention_heads[idx], device=device, dtype=dtype
+# From Huggingface's Transformers v4.34.0. This is the forward method of LlamaModel using the tuple style KV cache.
+def old_llama_model_forward(
+    self,
+    input_ids: torch.LongTensor = None,
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.LongTensor] = None,
+    past_key_values: Optional[List[torch.FloatTensor]] = None,
+    inputs_embeds: Optional[torch.FloatTensor] = None,
+    use_cache: Optional[bool] = None,
+    output_attentions: Optional[bool] = None,
+    output_hidden_states: Optional[bool] = None,
+    return_dict: Optional[bool] = None,
+) -> Union[Tuple, BaseModelOutputWithPast]:
+    output_attentions = (
+        output_attentions
+        if output_attentions is not None
+        else self.config.output_attentions
+    )
+    output_hidden_states = (
+        output_hidden_states
+        if output_hidden_states is not None
+        else self.config.output_hidden_states
+    )
+    use_cache = use_cache if use_cache is not None else self.config.use_cache
+
+    return_dict = (
+        return_dict if return_dict is not None else self.config.use_return_dict
+    )
+
+    # retrieve input_ids and inputs_embeds
+    if input_ids is not None and inputs_embeds is not None:
+        raise ValueError(
+            "You cannot specify both input_ids and inputs_embeds at the same time"
+        )
+    elif input_ids is not None:
+        batch_size, seq_length = input_ids.shape
+    elif inputs_embeds is not None:
+        batch_size, seq_length, _ = inputs_embeds.shape
+    else:
+        raise ValueError("You have to specify either input_ids or inputs_embeds")
+
+    seq_length_with_past = seq_length
+    past_key_values_length = 0
+
+    if past_key_values is not None:
+        past_key_values_length = past_key_values[0][0].shape[2]
+        seq_length_with_past = seq_length_with_past + past_key_values_length
+
+    if position_ids is None:
+        device = input_ids.device if input_ids is not None else inputs_embeds.device
+        position_ids = torch.arange(
+            past_key_values_length,
+            seq_length + past_key_values_length,
+            dtype=torch.long,
+            device=device,
+        )
+        position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
+    else:
+        position_ids = position_ids.view(-1, seq_length).long()
+
+    if inputs_embeds is None:
+        inputs_embeds = self.embed_tokens(input_ids)
+
+    # embed positions
+    if attention_mask is None:
+        attention_mask = torch.ones(
+            (batch_size, seq_length_with_past),
+            dtype=torch.bool,
+            device=inputs_embeds.device,
+        )
+        padding_mask = None
+    else:
+        if 0 in attention_mask:
+            padding_mask = attention_mask
+        else:
+            padding_mask = None
+
+    attention_mask = self._prepare_decoder_attention_mask(
+        attention_mask, (batch_size, seq_length), inputs_embeds, past_key_values_length
+    )
+
+    hidden_states = inputs_embeds
+    
+    position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+    # decoder layers
+    all_hidden_states = () if output_hidden_states else None
+    all_self_attns = () if output_attentions else None
+    next_decoder_cache = () if use_cache else None
+
+    for idx, decoder_layer in enumerate(self.layers):
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+
+        past_key_value = past_key_values[idx] if past_key_values is not None else None
+
+        layer_outputs = decoder_layer(
+            hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            padding_mask=padding_mask,
+            position_embeddings=position_embeddings,
         )
 
-        module.forward = types.MethodType(
-            qwen_duo_attention_forward_one_way_reordered, module
-        )
-        module.q_proj = reorder_linear_weights(
-            module.q_proj,
-            layer_full_attention_heads,
-            module.num_key_value_groups * module.head_dim,
-            "out",
-        )
-        module.k_proj = reorder_linear_weights(
-            module.k_proj,
-            layer_full_attention_heads,
-            module.head_dim,
-            "out",
-        )
-        module.v_proj = reorder_linear_weights(
-            module.v_proj,
-            layer_full_attention_heads,
-            module.head_dim,
-            "out",
-        )
-        module.o_proj = reorder_linear_weights(
-            module.o_proj,
-            layer_full_attention_heads,
-            module.num_key_value_groups * module.head_dim,
-            "in",
-        )
-        layer_full_attention_heads = reorder_full_attn_heads(layer_full_attention_heads)
+        hidden_states = layer_outputs[0]
 
-        module.sink_size = sink_size
-        module.recent_size = recent_size
-        module.register_buffer(
-            "full_attention_heads",
-            layer_full_attention_heads,
+        if use_cache:
+            next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
+
+        if output_attentions:
+            all_self_attns += (layer_outputs[1],)
+
+    hidden_states = self.norm(hidden_states)
+
+    # add hidden states from the last decoder layer
+    if output_hidden_states:
+        all_hidden_states += (hidden_states,)
+
+    next_cache = next_decoder_cache if use_cache else None
+    if not return_dict:
+        return tuple(
+            v
+            for v in [hidden_states, next_cache, all_hidden_states, all_self_attns]
+            if v is not None
         )
+    return BaseModelOutputWithPast(
+        last_hidden_state=hidden_states,
+        past_key_values=next_cache,
+        hidden_states=all_hidden_states,
+        attentions=all_self_attns,
+    )
+    
+
+
+# From Huggingface's Transformers v4.34.0. This is the forward method of LlamaDecoderLayer using the tuple style KV cache.
+def old_llama_decoder_layer_forward(
+    self,
+    hidden_states: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.LongTensor] = None,
+    past_key_value: Optional[Tuple[torch.Tensor]] = None,
+    output_attentions: Optional[bool] = False,
+    use_cache: Optional[bool] = False,
+    padding_mask: Optional[torch.LongTensor] = None,
+    position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+    residual = hidden_states
+
+    hidden_states = self.input_layernorm(hidden_states)
+
+    # Self Attention
+    hidden_states, self_attn_weights, present_key_value = self.self_attn(
+        hidden_states=hidden_states,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        past_key_value=past_key_value,
+        output_attentions=output_attentions,
+        use_cache=use_cache,
+        position_embeddings=position_embeddings,
+        padding_mask=padding_mask,
+    )
+    hidden_states = residual + hidden_states
+
+    # Fully Connected
+    residual = hidden_states
+    hidden_states = self.post_attention_layernorm(hidden_states)
+    hidden_states = self.mlp(hidden_states)
+    hidden_states = residual + hidden_states
+
+    outputs = (hidden_states,)
+
+    if output_attentions:
+        outputs += (self_attn_weights,)
+
+    if use_cache:
+        outputs += (present_key_value,)
+
+    return outputs
+
+# From Huggingface's Transformers v4.34.0. This is the forward method of LlamaForCausalLM using the tuple style KV cache.
+def old_llama_for_causal_lm_forward(
+    self,
+    input_ids: torch.LongTensor = None,
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.LongTensor] = None,
+    past_key_values: Optional[List[torch.FloatTensor]] = None,
+    inputs_embeds: Optional[torch.FloatTensor] = None,
+    labels: Optional[torch.LongTensor] = None,
+    use_cache: Optional[bool] = None,
+    output_attentions: Optional[bool] = None,
+    output_hidden_states: Optional[bool] = None,
+    return_dict: Optional[bool] = None,
+    cache_position: Optional[torch.LongTensor] = None,
+) -> Union[Tuple, CausalLMOutputWithPast]:
+    output_attentions = (
+        output_attentions
+        if output_attentions is not None
+        else self.config.output_attentions
+    )
+    output_hidden_states = (
+        output_hidden_states
+        if output_hidden_states is not None
+        else self.config.output_hidden_states
+    )
+    return_dict = (
+        return_dict if return_dict is not None else self.config.use_return_dict
+    )
+
+    # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+    outputs = self.model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        past_key_values=past_key_values,
+        inputs_embeds=inputs_embeds,
+        use_cache=use_cache,
+        output_attentions=output_attentions,
+        output_hidden_states=output_hidden_states,
+        return_dict=return_dict,
+    )
+
+    hidden_states = outputs[0]
+
+    if self.training:
+        logits = self.lm_head(hidden_states)
+    else:
+        logits = self.lm_head(hidden_states[:, -1:, :])
+
+    logits = logits.float()
+
+    loss = None
+    if labels is not None:
+        # Shift so that tokens < n predict n
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        # Flatten the tokens
+        loss_fct = CrossEntropyLoss()
+        shift_logits = shift_logits.view(-1, self.config.vocab_size)
+        shift_labels = shift_labels.view(-1)
+        # Enable model parallelism
+        shift_labels = shift_labels.to(shift_logits.device)
+        loss = loss_fct(shift_logits, shift_labels)
+
+    if not return_dict:
+        output = (logits,) + outputs[1:]
+        return (loss,) + output if loss is not None else output
+
+    return CausalLMOutputWithPast(
+        loss=loss,
+        logits=logits,
+        past_key_values=outputs.past_key_values,
+        hidden_states=outputs.hidden_states,
+        attentions=outputs.attentions,
+    )
+
+def enable_tuple_kv_cache_for_llama(model: LlamaForCausalLM):
+    print("Enabling tuple KV cache for Llama")
+    model.model._prepare_decoder_attention_mask = lambda *args, **kwargs: None
+    model.model.forward = types.MethodType(old_llama_model_forward, model.model)
+    for idx in range(len(model.model.layers)):
+        model.model.layers[idx].forward = types.MethodType(
+            old_llama_decoder_layer_forward, model.model.layers[idx]
+        )
+        model.model.layers[idx].self_attn.forward = types.MethodType(
+            old_flash_attention_2_forward, model.model.layers[idx].self_attn
+        )
+        model.model.layers[idx].self_attn._upad_input = types.MethodType(
+            _upad_input, model.model.layers[idx].self_attn
+        )
+        model.model.layers[idx].self_attn._flash_attention_forward = types.MethodType(
+            _flash_attention_forward, model.model.layers[idx].self_attn
+        )
+    model.forward = types.MethodType(old_llama_for_causal_lm_forward, model)
 
 def enable_llama_duo_attention_eval(
     model: LlamaForCausalLM,

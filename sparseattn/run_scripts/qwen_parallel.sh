@@ -1,10 +1,11 @@
+export CUDA_VISIBLE_DEVICES=5,6
 # Model and training configuration
 model=${MODEL:-"/data2/hf_models/Qwen3-4B"}
-bsz=${BSZ:-16}
+bsz=${BSZ:-1}
 seq=${SEQ:-1}
-lr=${LR:-1e-5}
-steps=${STEPS:-133}
-save_steps=${SAVE:-133}
+lr=${LR:-1e-3}
+steps=${STEPS:-1222}
+save_steps=${SAVE:-20}
 save_total_limit=3
 warmup=${WARMUP:-0.3}
 
@@ -18,7 +19,7 @@ fsdp=${FSDP:-"5"}
 gc=${GC:-"1"}
 
 # PruLong-specific arguments
-max_toks=${MAX_TOKS:-8192} # dataset_packing 中用于计算一个 batch 内最多有多少 tokens
+max_toks=${MAX_TOKS:-4096} # dataset_packing 中用于计算一个 batch 内最多有多少 tokens
 # max_toks=${MAX_TOKS:-131072}
 # max_toks=${MAX_TOKS:-32768}
 # max_toks=${MAX_TOKS:-256}
@@ -80,7 +81,7 @@ out_dir="checkpoints/$run_name"
 mkdir -p $out_dir
 nvidia-smi
 
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+
 # Calculate GPU and node configuration
 if [ -z "$CUDA_VISIBLE_DEVICES" ]; then
     num_gpus=$(nvidia-smi -L | wc -l)

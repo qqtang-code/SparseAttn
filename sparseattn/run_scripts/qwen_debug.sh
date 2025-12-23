@@ -1,6 +1,6 @@
 # Model and training configuration
 model=${MODEL:-"/data2/hf_models/Qwen3-4B"}
-bsz=${BSZ:-16}
+bsz=${BSZ:-1}
 seq=${SEQ:-1}
 lr=${LR:-1e-5}
 steps=${STEPS:-133}
@@ -76,7 +76,7 @@ fi
 
 run_name="${suffix}steps${steps}_${extra_name}"
 
-export CUDA_VISIBLE_DEVICES=0,1,2,3
+export CUDA_VISIBLE_DEVICES=2
 out_dir="checkpoints/$run_name"
 mkdir -p $out_dir
 nvidia-smi

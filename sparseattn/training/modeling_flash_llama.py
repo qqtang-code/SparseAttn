@@ -2027,7 +2027,7 @@ class PawLlamaForCausalLM(LlamaPreTrainedModel):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         self.logit_block_size = int(os.environ.get("LOGIT_BLOCK_SIZE", 16384))
-        self.enable_contrastive_loss = enable_contrastive_loss
+        self.enable_contrastive_loss = False
         # Initialize weights and apply final processing
         self.post_init()
 
