@@ -247,7 +247,7 @@ def worker_pack_chunk(chunk_dataset, tokenizer, max_seq_len, min_seq_len, worker
 
 class PackedDataset(Dataset):
     def __init__(self, raw_dataset, tokenizer, max_seq_len=128*1024, min_seq_len=1000, 
-    cache_dir=None, num_proc=8, raw_path = None, suffix = None):
+    cache_dir=None, num_proc=8, raw_path = None, suffix: str = None):
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
         self.min_seq_len = min_seq_len
@@ -256,7 +256,8 @@ class PackedDataset(Dataset):
         # 缓存逻辑
         self.cache_path = None
         # suffix = os.path.basename(tokenizer.name_or_path.rstrip("/"))
-
+        
+        suffix = suffix.lower()
         if cache_dir:
             os.makedirs(cache_dir, exist_ok=True)
             cache_filename = f"{os.path.basename(raw_path)}_{suffix}_packed_maxseq{max_seq_len}.parquet"
@@ -418,17 +419,17 @@ if __name__ == "__main__":
 
     # 2. 配置参数
     # 建议先用小数据或少量 worker 测试，跑通后再调大
-    path = "/data2/public_data/qwen_mix_sft_64K4" 
+    path = "/data2/public_data/qwen_mix_sft_64K6" 
     data_args = PackedDataArguments(
         preprocessing_num_workers=32,
         data_cache_dir="/data2/public_data/data_cache",
-        per_device_max_tokens=4096,
+        per_device_max_tokens=65536,
         min_seq_len=1000,
-        suffix="llama31_8b",
+        suffix="qwen3-8b",
     )
 
     # 3. 加载 Tokenizer
-    tokenizer = AutoTokenizer.from_pretrained("/data2/hf_models/Meta-Llama-3.1-8B-Instruct", trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained("/data2/hf_models/Qwen3-8B", trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 

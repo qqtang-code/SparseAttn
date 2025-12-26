@@ -42,7 +42,62 @@ import multiprocessing
 
 # from fla.models.nsa import AutoModelForCausalLM as NSAAutoModelForCausalLM
 
+# ================= Color Logging Utility =================
+class ColorFormatter(logging.Formatter):
+    # ANSI Color Codes
+    grey = "\x1b[38;20m"
+    yellow = "\x1b[33;20m"
+    red = "\x1b[31;20m"
+    bold_red = "\x1b[31;1m"
+    green = "\x1b[32;20m"
+    blue = "\x1b[34;20m"
+    cyan = "\x1b[36;20m"
+    magenta = "\x1b[35;20m"
+    reset = "\x1b[0m"
+
+    # Define formats for different levels or keywords
+    def format(self, record):
+        log_fmt = "%(asctime)s - %(levelname)s - %(name)s - %(message)s"
+        
+        # 1. 根据 Log Level 染色
+        if record.levelno == logging.DEBUG:
+            color = self.grey
+        elif record.levelno == logging.INFO:
+            color = self.green
+        elif record.levelno == logging.WARNING:
+            color = self.yellow
+        elif record.levelno == logging.ERROR:
+            color = self.red
+        elif record.levelno == logging.CRITICAL:
+            color = self.bold_red
+        else:
+            color = self.reset
+
+        # 2. 根据内容关键字自定义染色 (这是你最需要的)
+        msg = record.msg
+        if isinstance(msg, str):
+            # [Step ...] -> 蓝色高亮
+            if "[Step" in msg:
+                record.msg = f"{self.blue}{msg}{self.reset}"
+                return super().format(record)
+            
+            # Loss / Sparsity -> 洋红色高亮
+            if "Loss:" in msg or "Sparsity:" in msg:
+                # 还可以更细粒度：把数字变成黄色
+                # record.msg = f"{self.magenta}{msg}{self.reset}"
+                # 或者只高亮这一行
+                color = self.magenta
+
+            # Checkpoint -> 青色
+            if "Checkpoint" in msg or "Saving" in msg:
+                color = self.cyan
+
+        formatter = logging.Formatter(f"{color}{log_fmt}{self.reset}", datefmt="%m/%d/%Y %H:%M:%S")
+        return formatter.format(record)
+
 logger = logging.getLogger(__name__)
+
+
 
 
 def load_masks_from_tsv_file(
@@ -72,10 +127,12 @@ def main():
     script_args, training_args, data_args = parser.parse_args_into_dataclasses()
     
     # Setup logging
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(ColorFormatter())
+    
     logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
-        handlers=[logging.StreamHandler(sys.stdout)],
+        level=logging.INFO,
+        handlers=[handler]
     )
     log_level = training_args.get_process_log_level()
     logger.setLevel(log_level)
@@ -220,6 +277,7 @@ def main():
                 revision=script_args.model_revision,
                 use_auth_token=True if script_args.use_auth_token else None,
                 enable_contrastive_loss=training_args.enable_contrastive_loss,
+                torch_dtype=torch.bfloat16,
             )
         elif "llama" in script_args.model_name_or_path.lower():
             model = PawLlamaForCausalLM.from_pretrained(
@@ -229,6 +287,7 @@ def main():
                 cache_dir=script_args.cache_dir,
                 revision=script_args.model_revision,
                 use_auth_token=True if script_args.use_auth_token else None,
+                torch_dtype=torch.bfloat16,
             )
         elif "phi" in script_args.model_name_or_path.lower():
             model = PawPhi3ForCausalLM.from_pretrained(
@@ -238,6 +297,7 @@ def main():
                 cache_dir=script_args.cache_dir,
                 revision=script_args.model_revision,
                 use_auth_token=True if script_args.use_auth_token else None,
+                torch_dtype=torch.bfloat16,
             )
         else:
             raise ValueError(
@@ -259,31 +319,6 @@ def main():
                 "Please provide a valid model name."
             )
             
-    # if hasattr(model, "reset_masks"):
-    #     model.reset_masks()
-    
-    # def init_all_routers(module):
-    #     if isinstance(module, Qwen3Model):
-    #         module.reset_parameters()
-    #     if isinstance(module, AttentionRouter):
-    #         module.reset_parameters()
-    #     for child in module.children():
-    #         init_all_routers(child)
-    
-    # def find_routers(module, name=""):
-    #     if isinstance(module, AttentionRouter):
-    #         print(f"🔍 Found router at: {name}")
-    #         return [module]
-    #     routers = []
-    #     for child_name, child in module.named_children():
-    #         routers.extend(find_routers(child, f"{name}.{child_name}" if name else child_name))
-    #     return routers
-
-    # routers = find_routers(model)
-    # print(f"✅ Total routers found: {len(routers)}")
-
-    # init_all_routers(model)
-    # print("✅ All AttentionRouter instances initialized to near-zero.")
 
     if training_args.stripe_init_width_1 is not None:
         # We should initialize with a striped pattern
@@ -369,38 +404,6 @@ def main():
             pin_memory=training_args.dataloader_pin_memory,
             drop_last=True, 
         )
-        
-    if training_args.do_eval:
-        eval_dataset = build_dataset(
-            script_args.tokenized_mds_validation[0],
-            tokenizer=tokenizer,
-            data_args=data_args,
-        )
-        world_size = dist.get_world_size()
-        global_rank = dist.get_rank()
-        sp_size = training_args.seq_parallel_size
-
-        dp_size = world_size // sp_size
-        dp_rank = global_rank // sp_size
-        
-        from torch.utils.data.distributed import DistributedSampler
-        sampler = DistributedSampler(
-            dataset=eval_dataset,
-            num_replicas=dp_size,   
-            rank=dp_rank,          
-            shuffle=False,
-            seed=training_args.seed,
-        )
-        
-        eval_dataloader = torch.utils.data.DataLoader(
-            dataset=eval_dataset,
-            batch_size=1,
-            sampler=sampler,
-            collate_fn=None,
-            num_workers=training_args.dataloader_num_workers,
-            pin_memory=training_args.dataloader_pin_memory,
-        )
-        
 
     # Initialize our Trainer
     if training_args.attention_type is not None and "nsa" in training_args.attention_type :
@@ -419,17 +422,12 @@ def main():
             model=model,
             args=training_args,
             train_dataset=train_dataset if training_args.do_train else None,
-            eval_dataset=eval_dataset if training_args.do_eval else None,
             tokenizer=tokenizer,
             # data_collator=data_collator,
             log_loss=script_args.should_log_loss,
         )
     if training_args.do_train:
         trainer.train_dataloader = train_dataloader
-        logger.info("Successfully injected CustomDistributedStratifiedSampler into Trainer.")
-    
-    if training_args.do_eval:
-        trainer.eval_dataloader = eval_dataloader
         logger.info("Successfully injected CustomDistributedStratifiedSampler into Trainer.")
 
     if trainer.is_fsdp_enabled:
@@ -449,7 +447,9 @@ def main():
             checkpoint = training_args.resume_from_checkpoint
         elif last_checkpoint is not None:
             checkpoint = last_checkpoint
-        train_result = trainer.train(resume_from_checkpoint=checkpoint)
+        #FIXME：debug时暂时不加载ckpt
+        # train_result = trainer.train(resume_from_checkpoint=checkpoint)
+        train_result = trainer.train()
         trainer.save_model()
 
         metrics = train_result.metrics
@@ -460,4 +460,5 @@ def main():
 
 
 if __name__ == "__main__":
+    torch.autograd.set_detect_anomaly(True)
     main()

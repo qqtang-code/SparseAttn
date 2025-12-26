@@ -1082,7 +1082,7 @@ class Qwen3Attention(nn.Module):
             mean=4.5, std=0.01
         )  # sigmoid(4.5) ≈ 0.989
         self.threshold_for_deterministic = None
-
+        breakpoint()
         self.mask_allocator = AttentionRouter(
             input_dim=self.hidden_size,
             num_key_value_heads=self.num_key_value_heads,
@@ -1509,7 +1509,6 @@ class Qwen3Attention(nn.Module):
         ] = None,  # will become mandatory in v4.46
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        breakpoint()
         input_shape = hidden_states.shape[:-1] # [S_local, ]
         hidden_shape = (*input_shape, -1, self.head_dim) # [S_local, nhead, head_dim]
         q = self.q_norm(self.q_proj(hidden_states).view(hidden_shape))
@@ -1523,19 +1522,9 @@ class Qwen3Attention(nn.Module):
         )
         
         if is_cp_enabled:
-            # Scatter dim 1 (Heads), Gather dim 0 (Seq)
-            # 因为输入是 3D: [Seq, Head, Dim]
-            if dist.get_rank() == 0:
-                # print("------------- q SeqAllToAll ---------------")
-                q = SeqAllToAll.apply(q, 1, 0, seq_parallel_group)
-                # print("------------- k SeqAllToAll ---------------")
-                k = SeqAllToAll.apply(k, 1, 0, seq_parallel_group)
-                # print("------------- v SeqAllToAll ---------------")
-                v = SeqAllToAll.apply(v, 1, 0, seq_parallel_group)
-            else:
-                q = SeqAllToAll.apply(q, 1, 0, seq_parallel_group)
-                k = SeqAllToAll.apply(k, 1, 0, seq_parallel_group)
-                v = SeqAllToAll.apply(v, 1, 0, seq_parallel_group)
+            q = SeqAllToAll.apply(q, 1, 0, seq_parallel_group)
+            k = SeqAllToAll.apply(k, 1, 0, seq_parallel_group)
+            v = SeqAllToAll.apply(v, 1, 0, seq_parallel_group)
             
             # 此时 q, k, v 变成了 [S_global, H_local, D]
             # unpadded_lengths (cu_seqlens) 是全局的，现在正好匹配 S_global
@@ -1585,7 +1574,7 @@ class Qwen3Attention(nn.Module):
             if z_kv_batch.shape[1] == local_kv_heads:
                 # Expand GQA groups
                 z_kv_batch = z_kv_batch.repeat_interleave(self.num_key_value_groups, dim=1)
-        
+                
         has_layer_past = past_key_value is not None
         if has_layer_past:
             past_kv = past_key_value[0]
@@ -2043,11 +2032,6 @@ class Qwen3Model(Qwen3PreTrainedModel):
         # position_ids = None
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
-        # if dist.get_rank() == 0:
-        #     breakpoint()
-        # else:
-        #     import time
-        #     time.sleep()
             
         hidden_states = inputs_embeds
 
@@ -2163,7 +2147,6 @@ class Qwen3Model(Qwen3PreTrainedModel):
         else:
             model_sparsity = None
             z_loss = None
-            
         if compute_sparsity:
             layerwise_model_sparsity = None
             layerwise_target = None
@@ -2536,13 +2519,6 @@ class PawQwen3ForCausalLM(Qwen3PreTrainedModel):
             logits = self.lm_head(hidden_states)
             loss = None
         
-        if (
-                seq_parallel_group is not None
-                and dist.is_initialized()
-                and dist.get_world_size(seq_parallel_group) > 1
-        ):
-            dist.all_reduce(loss, op=dist.ReduceOp.SUM, group=seq_parallel_group)
-            loss = loss / dist.get_world_size(seq_parallel_group)
         
         if not return_dict:
             output = (logits,) + outputs[1:]

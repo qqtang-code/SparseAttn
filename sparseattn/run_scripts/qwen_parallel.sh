@@ -1,17 +1,17 @@
-export CUDA_VISIBLE_DEVICES=5,6
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 # Model and training configuration
 model=${MODEL:-"/data2/hf_models/Qwen3-4B"}
-bsz=${BSZ:-1}
+bsz=${BSZ:-16}
 seq=${SEQ:-1}
 lr=${LR:-1e-3}
-steps=${STEPS:-1222}
-save_steps=${SAVE:-20}
+steps=${STEPS:-100}
+save_steps=${SAVE:-50}
 save_total_limit=3
-warmup=${WARMUP:-0.3}
+warmup=${WARMUP:-0.0}
 
 overrides=${OVERRIDES:-""}
 min_lr_ratio=${MIN_LR_RATIO:-1e-7}
-seq_parallel_size=${SEQ_PARALLEL_SIZE:-2}
+seq_parallel_size=${SEQ_PARALLEL_SIZE:-1}
 
 # FSDP configuration
 # 0=Disable, 1=FULL_SHARD, 2=SHARD_GRAD_OP, 3=NO_SHARD, 4=HYBRID_SHARD, 5=HYBRID_SHARD_ZERO2
@@ -19,7 +19,7 @@ fsdp=${FSDP:-"5"}
 gc=${GC:-"1"}
 
 # PruLong-specific arguments
-max_toks=${MAX_TOKS:-4096} # dataset_packing 中用于计算一个 batch 内最多有多少 tokens
+max_toks=${MAX_TOKS:-32768} # dataset_packing 中用于计算一个 batch 内最多有多少 tokens
 # max_toks=${MAX_TOKS:-131072}
 # max_toks=${MAX_TOKS:-32768}
 # max_toks=${MAX_TOKS:-256}
@@ -31,7 +31,7 @@ sparsity_warmup_ratio=${SPARSITY_WARMUP_RATIO:-0.0}
 disable_linear_reg_term=${DISABLE_LINEAR_REG_TERM:-false}
 # topk
 context_window_if_toggled=${CONTEXT_WINDOW_IF_TOGGLED:-2048}
-freeze_weights=${FREEZE_WEIGHTS:-true}
+freeze_weights=${FREEZE_WEIGHTS:-false}
 freeze_masks=${FREEZE_MASKS:-false}
 warmup_type=${WARMUP_TYPE:-"linear"}
 
@@ -53,7 +53,7 @@ layerwise_sparsity_weight=${LAYERWISE_SPARSITY_WEIGHT:-1.0}
 erank_analysis_path="/"
 
 # Dataset configuration
-dataset=${DATASET:-"/data2/public_data/qwen_mix_sft_32K"}
+dataset=${DATASET:-"/data2/public_data/qwen_mix_sft_32K5"}
 dataset_cache_dir="/data2/public_data/data_cache"
 # dataset=${DATASET:-"/data1/public_data/Pre_filter"}
 task_type="sft" # pretrain or sft
@@ -106,7 +106,7 @@ if [ $num_nodes -gt 1 ]; then
     --rdzv-endpoint=$master_addr:56321 \
     --nnodes=$num_nodes \
     --nproc-per-node=$num_gpus \
-    -m training.lh_train_language_model_parallel"
+    -m training.lh_train_language_model"
 else
     master_port=$(comm -23 <(seq 49152 65535 | sort) <(ss -Htan | awk '{print $4}' | cut -d':' -f2 | sort -u) | shuf | head -n 1)
 
@@ -115,7 +115,7 @@ else
     --rdzv-endpoint=localhost:$master_port \
     --nnodes=1 \
     --nproc-per-node=$num_gpus \
-    -m training.lh_train_language_model_parallel"
+    -m training.lh_train_language_model"
 fi
 
 # Calculate Data Parallel Size
@@ -201,6 +201,7 @@ base_arguments=(
     --freeze_mask_parameters $freeze_masks
     --should_log_loss true
     --save_total_limit 3
+    --suffix qwen3-4b
 
     --tokenized_mds_train $dataset
 

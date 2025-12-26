@@ -57,7 +57,7 @@ def get_task(metadata_str):
         return None
 
 def main():
-    model_path = "/data1/lcm_lab/qqt/SparseAttn/sparseattn/checkpoints/12.17sp3_templatesteps133_full_xattn_32k_qwen3-4b_test_no_qa_wfrozen/checkpoint-50"
+    model_path = "/data1/lcm_lab/qqt/SparseAttn/sparseattn/checkpoints/qwen3_parallel_steps20_seqlen32768/checkpoint-2"
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
@@ -110,8 +110,8 @@ def main():
     model.eval()
 
     fake_item = {
-        "context": context,                  
-        "question": prompt,               
+        "context": "你好",                  
+        "question": "你是谁？",               
         "answer": "",           
         "metadata": metadata,# Single QA, Summarization
     }
@@ -125,35 +125,35 @@ def main():
     attention_mask = attention_mask[:actual_len].unsqueeze(0).to(model.device)  # [1, L]
     sparsity = []
     
-    longbench_prediction = "/data1/lcm_lab/sora/LOOM-Eval/benchmarks/General/LongBench/prediction/12.17sp3_templatesteps133_full_xattn_32k_qwen3-4b_no_qa_wfrozen_LongBench_noise_64k/multi_news.jsonl"
+    # longbench_prediction = "/data1/lcm_lab/sora/LOOM-Eval/benchmarks/General/LongBench/prediction/12.17sp3_templatesteps133_full_xattn_32k_qwen3-4b_no_qa_wfrozen_LongBench_noise_64k/multi_news.jsonl"
     
-    # 读取jsonl文件
-    with open(longbench_prediction, 'r') as f:
-        data = [json.loads(line) for line in f]
-    for i in range(len(data)):
-        input_ids = tokenizer.encode(data[i]["input_text"], return_tensors="pt").to(model.device)
-        attention_mask = torch.ones_like(input_ids).to(model.device)
-        actual_len = input_ids.shape[-1]
+    # # 读取jsonl文件
+    # with open(longbench_prediction, 'r') as f:
+    #     data = [json.loads(line) for line in f]
+    # for i in range(len(data)):
+    #     input_ids = tokenizer.encode(data[i]["input_text"], return_tensors="pt").to(model.device)
+    #     attention_mask = torch.ones_like(input_ids).to(model.device)
+    #     actual_len = input_ids.shape[-1]
 
-        model_inputs = {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-        }
+    model_inputs = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+    }
 
-        with torch.no_grad():
-            outputs = model.generate(
-                **model_inputs,
-                max_new_tokens=10,
-                use_cache=True,
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-            )
-        print(f"sparsity:{model.prefill_sparsity}")
-        sparsity.append(model.prefill_sparsity)
+    with torch.no_grad():
+        outputs = model.generate(
+            **model_inputs,
+            max_new_tokens=10,
+            use_cache=True,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+    print(f"sparsity:{model.prefill_sparsity}")
+    sparsity.append(model.prefill_sparsity)
 
-        generated_ids = outputs[0][actual_len:]
-        response = tokenizer.decode(generated_ids, skip_special_tokens=True)
-        print("Response:", response)
+    generated_ids = outputs[0][actual_len:]
+    response = tokenizer.decode(generated_ids, skip_special_tokens=True)
+    print("Response:", response)
     print(f"Average Sparsity:{sum(sparsity)/len(sparsity)}")
 
 

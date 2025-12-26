@@ -112,20 +112,15 @@ from collections import defaultdict
 
 class SparsityAccumulator:
     def __init__(self):
-        # 新增：持久化存储，用于跨 Step 记忆各个任务的最后指标
-        # 结构示例: {"Spa-Code sparsity": 0.5, "Spa-Code target_sparsity": 0.5, ...}
-        self.last_known_metrics = {}
         self.reset()
 
     def reset(self):
         # 记录标量累积 (loss, reg_loss, etc.)
         self.scalars = defaultdict(float)
         self.scalar_counts = defaultdict(int)
-
+        
         # 记录任务特定指标 (task_name -> {sum, count})
         self.task_metrics = defaultdict(lambda: {"sum_sparsity": 0.0, "sum_target": 0.0, "sum_z_loss": 0.0, "count": 0})
-
-        # 注意：这里千万不要重置 self.last_known_metrics
 
     def add(self, scalars: dict, task_data: list):
         """
@@ -380,11 +375,11 @@ class Trainer(HFTrainer):
         self.num_sparsity_warmup_steps = math.ceil(self.sparsity_warmup_ratio * self.args.max_steps)
         self.task_sparsity_config = {
             "default": {"start": self.start_head_sparsity, "end": self.end_head_sparsity},
-            "Code": {"start": 0, "end": 0.9},
-            "In-Context Learning": {"start": 0, "end": 0.9},
-            "MultiHop QA": {"start": 0, "end": 0.6},
-            "Single QA": {"start": 0, "end": 0.6},
-            "Summarization": {"start": 0, "end": 0.9},
+            "Code": {"start": 0, "end": 0.5},
+            "In-Context Learning": {"start": 0, "end": 0.6},
+            "MultiHop QA": {"start": 0, "end": 0.8},
+            "Single QA": {"start": 0, "end": 0.8},
+            "Summarization": {"start": 0, "end": 0.2},
         }
         self.reverse_class_map = {0: 'Single QA', 1: 'MultiHop QA', 2: 'Summarization', 3: 'Code', 4:'In-Context Learning'}
         self.use_softmax = args.use_softmax
@@ -494,18 +489,12 @@ class Trainer(HFTrainer):
                 "shifted_labels": shifted_labels_chunks[seq_parallel_rank],  
                 "seq_lengths": global_seq_lengths,                   # Global
                 "seq_parallel_group": self.seq_parallel_group,
-                "range_ids": range_ids,
-                "task_type": task_type,
-                "task_ids": task_ids,
             }
         else:
             inputs = {
                 "input_ids": input_ids,             # Global [S]
                 "labels": labels,                   # Global [S]
-                "task_ids": task_ids,
-                "range_ids": range_ids,
                 "seq_lengths": global_seq_lengths,  # Global [Bi+1]
-                "task_type": task_type,
                 "seq_parallel_group": None
             }
 
@@ -524,12 +513,8 @@ class Trainer(HFTrainer):
 
         Subclass and override for custom behavior.
         """
+        breakpoint()
         inputs = self.get_sequence_parallel_inputs(inputs)
-        tasks = inputs.get("task_type", ["default"] * inputs["range_ids"].size(0)) #[B]
-        # tasks = ["default"] * inputs["input_ids"].size(0)
-        target_sparsity = self.get_current_target_sparsity(self.state.global_step, tasks)
-        target_sparsity = target_sparsity.to(model.device)  # [B]
-        current_tau = self.get_current_tau(self.state.global_step)
         
         seq_lens_display = []
         if "seq_lengths" in inputs and inputs["seq_lengths"] is not None:
@@ -549,19 +534,18 @@ class Trainer(HFTrainer):
 
         # 优化后的 Print
         print(f"[Step {self.state.global_step} / Rank {dist.get_rank()}] "
-              f"Tasks: {tasks} | Lens: {seq_lens_display} "
-              f"→ Tgt Spa: {[f'{s:.3f}' for s in target_sparsity.tolist()]}")
+              f"Lens: {seq_lens_display} ")
         
-        outputs = model(**inputs, use_cache=False, target_sparsity=target_sparsity, current_tau=current_tau)
+        outputs = model(**inputs, use_cache=False)
 
         lm_loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
-        reg_loss = outputs["sparsity_loss"] if isinstance(outputs, dict) else outputs[-2]
+        # reg_loss = outputs["sparsity_loss"] if isinstance(outputs, dict) else outputs[-2]
         
-        head_entropy = outputs["head_entropy"]
-        model_sparsity = outputs["model_sparsity"] # [B] 或者是标量
-        out_target_sparsity = outputs["target_sparsity"] # [B]
-        log_z_loss = outputs['log_z_loss'] # [B]
-        task_ids = outputs['task_ids'] # [B]
+        # head_entropy = outputs["head_entropy"]
+        # model_sparsity = outputs["model_sparsity"] # [B] 或者是标量
+        # out_target_sparsity = outputs["target_sparsity"] # [B]
+        # log_z_loss = outputs['log_z_loss'] # [B]
+        # task_ids = outputs['task_ids'] # [B]
         
         if getattr(self.args, "token_scaled_loss", False):
             seq_parallel_world_size = (
@@ -591,7 +575,7 @@ class Trainer(HFTrainer):
                 )  # moving avg
             lm_loss = lm_loss / self.state.avg_num_valid_tokens_per_device
 
-        loss = lm_loss + 10 * reg_loss
+        loss = lm_loss
        
         
         # A. 准备本地数据 (不进行 gather!)
@@ -599,26 +583,11 @@ class Trainer(HFTrainer):
         local_scalars = {
             "loss": loss.detach(),
             "lm_loss": lm_loss.detach(),
-            "reg_loss": reg_loss.detach(),
-            "head_entropy": head_entropy.detach(),
-            # 如果 model_sparsity 是向量，这里先取平均作为整体指标，详细的任务拆分在下面
-            "model_sparsity(avg)": model_sparsity.detach().float().mean(), 
-            "target_sparsity(avg)": out_target_sparsity.detach().float().mean(),
         }
 
         # B. 准备任务特定数据 (Zip 并不是耗时操作)
         # 注意：这里我们只处理本 GPU 上的数据，坚决不做 all_gather
         local_task_data = []
-        if task_ids.numel() > 0: # 确保有数据
-            # 假设这些 tensor 维度是一致的 [B]
-            t_ids = task_ids.detach().cpu().tolist()
-            t_sparsities = model_sparsity.detach().float().tolist()
-            t_targets = out_target_sparsity.detach().float().tolist()
-            t_z_losses = log_z_loss.detach().float().tolist()
-            
-            for i in range(len(t_ids)):
-                t_name = self.reverse_class_map.get(t_ids[i], "Unknown")
-                local_task_data.append((t_name, t_sparsities[i], t_targets[i], t_z_losses[i]))
 
         # C. 加入累积器 (极快，纯内存操作)
         self.sparsity_accumulator.add(local_scalars, local_task_data)
@@ -638,17 +607,7 @@ class Trainer(HFTrainer):
                 if self.accelerator.is_main_process:
                     # 补充一些只需取最后一次值的指标
                     global_metrics["step"] = self.state.global_step
-                    global_metrics["current_tau"] = current_tau.detach().item()
                     
-                    # Lambda 诊断信息
-                    lambda1 = outputs.get("lambda1", None) if isinstance(outputs, dict) else None
-                    if lambda1 is not None:
-                        global_metrics.update({
-                            "lambda1 Single QA": lambda1[0].detach().item(),
-                            "lambda2 MultiHop QA": lambda1[1].detach().item(),
-                            "lambda3 Summarization": lambda1[2].detach().item(),
-                            "lambda4 Code": lambda1[3].detach().item(),
-                        })
 
                     # --- 打印文本日志 ---
                     logger.info(
@@ -656,20 +615,8 @@ class Trainer(HFTrainer):
                         f"Loss: {global_metrics.get('loss', 0):.4f} | "
                         f"LM: {global_metrics.get('lm_loss', 0):.4f} | "
                         f"Reg: {global_metrics.get('reg_loss', 0):.4f} | "
-                        f"Spa(Avg): {global_metrics.get('model_sparsity(avg)', 0):.3f}"
                     )
                     
-                    # 打印任务日志
-                    for k in sorted(global_metrics.keys()):
-                        if k.startswith("Spa-") and "sparsity" in k and "target" not in k:
-                            task = k.split(" ")[0] # e.g. "Spa-Code"
-                            logger.info(
-                                f"Statistic -> {task[4:]} | " # remove "Spa-"
-                                f"Spa: {global_metrics[k]:.3f} | "
-                                f"Tgt: {global_metrics.get(f'{task} target_sparsity', 0):.3f} | "
-                                f"Z-Loss: {global_metrics.get(f'{task} log_z_loss', 0):.3f}"
-                            )
-
                     # --- 上传 SwanLab ---
                     try:
                         swanlab.log(global_metrics)
@@ -703,10 +650,11 @@ class Trainer(HFTrainer):
 
             optimizer_1_group = []  # params, non decay
             optimizer_2_group = []  # params, decay
-            optimizer_3_group = []  # mask params, decay
-            optimizer_4_group = []  # reg params, decay
-            optimizer_5_group = []  # mask params, decay
+            optimizer_3_group = []  # mask params, decay (log_alpha)
+            optimizer_4_group = []  # reg params, decay (sparsity_lambda)
+            optimizer_5_group = []  # mask allocator params, decay
             optimized_parameters = []
+
             for n, p in opt_model.named_parameters():
                 if not p.requires_grad:
                     continue
@@ -732,25 +680,17 @@ class Trainer(HFTrainer):
                     if self.freeze_non_mask_parameters:
                         p.requires_grad = False
                     else:
-                        if "self_attn.q_proj" in n or "self_attn.k_proj" in n or "self_attn.v_proj" in n :
-                            p.requires_grad = True
-                            optimizer_2_group.append(p)
-                            optimized_parameters.append(n)
-                        elif "lm_head" in n or "embed_tokens" in n:
-                            p.requires_grad = True
+                        optimizer_2_group.append(p)
+                        optimized_parameters.append(n)
                 else:
                     if self.freeze_non_mask_parameters:
                         p.requires_grad = False
                     else:
-                        if "self_attn.q_proj" in n or "self_attn.k_proj" in n or "self_attn.v_proj" in n :
-                            p.requires_grad = True
-                            optimizer_1_group.append(p)
-                            optimized_parameters.append(n)
-                        elif "lm_head" in n or "embed_tokens" in n:
-                            p.requires_grad = True
-                        
+                        optimizer_1_group.append(p)
+                        optimized_parameters.append(n)
+
             optimizer_grouped_parameters = []
-            
+
             if not self.freeze_non_mask_parameters:
                 optimizer_grouped_parameters.append(
                     {
@@ -766,7 +706,7 @@ class Trainer(HFTrainer):
                         "lr": self.learning_rate,
                     }
                 )
-            
+
             if not self.freeze_mask_parameters:
                 optimizer_grouped_parameters.append(
                     {
@@ -790,10 +730,20 @@ class Trainer(HFTrainer):
                         "lr": self.mask_learning_rate,
                     }
                 )
-            
+
+            # >>>>>>>>>> 新增：输出最终参与训练的参数名 <<<<<<<<<<
+            trainable_params = []
+            for n, p in opt_model.named_parameters():
+                if p.requires_grad:
+                    trainable_params.append(n)
+            logger.info("Final trainable parameters (requires_grad=True):")
+            for name in sorted(trainable_params):
+                logger.info(f"  - {name}")
+            # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
             logger.info("optimizer_grouped_parameters -> optimized parameters")
             logger.info(optimized_parameters)
-            
+
             optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(
                 self.args, opt_model
             )

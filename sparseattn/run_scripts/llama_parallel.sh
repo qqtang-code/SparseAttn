@@ -1,6 +1,8 @@
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export CUDA_VISIBLE_DEVICES=0,1
+export CUDA_LAUNCH_BLOCKING=1
+
 # Model and training configuration
-model=${MODEL:-"/data2/hf_models/Qwen3-8B"}
+model=${MODEL:-"/data2/hf_models/Meta-Llama-3.1-8B-Instruct"}
 bsz=${BSZ:-16}
 seq=${SEQ:-1}
 lr=${LR:-1e-3}
@@ -19,9 +21,9 @@ fsdp=${FSDP:-"5"}
 gc=${GC:-"1"}
 
 # PruLong-specific arguments
-max_toks=${MAX_TOKS:-4096} # dataset_packing 中用于计算一个 batch 内最多有多少 tokens
+# max_toks=${MAX_TOKS:-4096} # dataset_packing 中用于计算一个 batch 内最多有多少 tokens
 # max_toks=${MAX_TOKS:-131072}
-# max_toks=${MAX_TOKS:-32768}
+max_toks=${MAX_TOKS:-32768}
 # max_toks=${MAX_TOKS:-256}
 start_head_sparsity=${START_HEAD_SPARSITY:-0.0}
 end_head_sparsity=${END_HEAD_SPARSITY:-0.3}
@@ -65,7 +67,7 @@ enable_lambda_task=false
 use_softmax=true
 
 # Create run name
-suffix=${SUFFIX:-"qwen3_parallel"}
+suffix=${SUFFIX:-"llama_parallel"}
 extra_name="seqlen${max_toks}"
 # extra_name="debug_12.5"
 if [[ $freeze_weights == "true" ]]; then
@@ -142,7 +144,7 @@ export SWANLAB_MODE="cloud"
 export TOKENIZERS_PARALLELISM=true
 export LOGIT_BLOCK_SIZE=2048
 
-suffix=${SUFFIX:-"qwen3_8b"}
+suffix=${SUFFIX:-"llama31-8b"}
 # Training arguments
 base_arguments=(
     --suffix $suffix

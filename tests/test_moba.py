@@ -8,8 +8,8 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="/data1/hf_model/Meta-Llama-3.1-8B-Instruct")
-    parser.add_argument("--moba-chunk-size", type=int, default=4096)
-    parser.add_argument("--moba-topk", type=int, default=12)
+    parser.add_argument("--moba-chunk-size", type=int, default=1024)
+    parser.add_argument("--moba-topk", type=int, default=8)
     parser.add_argument(
         "--attn",
         default="moba",
@@ -20,7 +20,7 @@ if __name__ == "__main__":
 
     args.moba_chunk_size = 1024
     args.moba_topk = 8
-    args.model = "/data1/hf_model/Meta-Llama-3.1-8B-Instruct"
+    args.model = "/data2/hf_models/moba"
     args.attn = "moba"
     register_moba(MoBAConfig(args.moba_chunk_size, args.moba_topk))
     model = AutoModelForCausalLM.from_pretrained(

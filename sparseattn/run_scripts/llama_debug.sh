@@ -1,4 +1,4 @@
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=2
 # Model and training configuration
 model=${MODEL:-"/data2/hf_models/Meta-Llama-3.1-8B-Instruct"}
 bsz=${BSZ:-16}

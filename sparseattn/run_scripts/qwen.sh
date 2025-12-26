@@ -3,10 +3,10 @@ model=${MODEL:-"/data2/hf_models/Qwen3-4B"}
 bsz=${BSZ:-48}
 seq=${SEQ:-1}
 lr=${LR:-1e-5}
-steps=${STEPS:-266}
-save_steps=${SAVE:-133}
+steps=${STEPS:-100}
+save_steps=${SAVE:-50}
 save_total_limit=10
-warmup=${WARMUP:-0.3}
+warmup=${WARMUP:-0.0}
 
 overrides=${OVERRIDES:-""}
 min_lr_ratio=${MIN_LR_RATIO:-1e-7}
@@ -51,8 +51,8 @@ layerwise_sparsity_weight=${LAYERWISE_SPARSITY_WEIGHT:-1.0}
 erank_analysis_path="/"
 
 # Dataset configuration
-dataset=${DATASET:-"/data2/public_data/qwen_mix_sft_64K2"}
-dataset_cache_dir="/data2/public_data/data_cache2"
+dataset=${DATASET:-"/data2/public_data/qwen_mix_sft_32K2"}
+dataset_cache_dir="/data2/public_data/data_cache"
 # dataset=${DATASET:-"/data1/public_data/Pre_filter"}
 task_type="sft" # pretrain or sft
 

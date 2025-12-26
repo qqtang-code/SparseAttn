@@ -17,10 +17,10 @@ import torch
 from transformers import LlamaForCausalLM, AutoTokenizer
 
 from .modeling_flash_llama_parallel import PawLlamaForCausalLM, PawLlamaConfig
-from .modeling_flash_qwen_parallel import PawQwen3ForCausalLM, PawQwen3Config, Qwen3Model, AttentionRouter
+from .modeling_flash_qwen_parallel_full import PawQwen3ForCausalLM, PawQwen3Config, Qwen3Model, AttentionRouter
 
 from .modeling_flash_phi import PawPhi3ForCausalLM, PawPhi3Config
-from .lh_trainer_parallel import Trainer
+from .lh_trainer_parallel_full import Trainer
 # from .lh_trainer_nsa import Trainer as NSATrainer
 
 # from .dataset import build_dataset, DataCollator, DataArguments
