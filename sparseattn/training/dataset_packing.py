@@ -44,6 +44,21 @@ class PackedDataArguments:
     preprocessing_num_workers: int = 32
     suffix: str = "qwen3_8b"
 
+@dataclass
+class DataArguments:
+    single_seq: bool = False
+    subsplit_length: Optional[int] = None
+    per_device_max_tokens: int = 32768
+    apply_instruct_masks: bool = False
+    prepack: bool = False
+    streaming: bool = False
+    min_seq_len: Optional[int] = 1000
+    task_type: str = "pretrain" 
+    use_packing: bool = False
+    data_cache_dir: Optional[str] = None
+    preprocessing_num_workers: int = 16
+    suffix: str = "qwen3_8b"
+
 # =========================================================
 #  独立的处理函数 (Worker Function)
 #  必须放在顶层，以便多进程序列化 (Pickle)
@@ -145,6 +160,11 @@ def _process_single_item(item, tokenizer, class_map):
         segment_ids.append(3) 
         current_len += 1
         a_end = current_len - 1
+    
+    full_input_ids.append(-100)
+    segment_ids.append(3) 
+    current_len += 1
+    a_end = current_len - 1
 
     # --- 4. Apply Truncation ---
     original_len = len(full_input_ids)
@@ -419,17 +439,17 @@ if __name__ == "__main__":
 
     # 2. 配置参数
     # 建议先用小数据或少量 worker 测试，跑通后再调大
-    path = "/data2/public_data/qwen_mix_sft_64K6" 
+    path = "/data2/public_data/for_debug_mix_sft_64k" 
     data_args = PackedDataArguments(
         preprocessing_num_workers=32,
         data_cache_dir="/data2/public_data/data_cache",
         per_device_max_tokens=65536,
         min_seq_len=1000,
-        suffix="qwen3-8b",
+        suffix="qwen3-4b",
     )
 
     # 3. 加载 Tokenizer
-    tokenizer = AutoTokenizer.from_pretrained("/data2/hf_models/Qwen3-8B", trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained("/data2/hf_models/Qwen3-4B", trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -457,6 +477,3 @@ if __name__ == "__main__":
     print(f"Task Types: {item0['task_type']}")
     print(f"Seq Lengths (cum): {item0['seq_lengths']}")
     print(f"Range ids: {item0['range_ids']}")
-
-
-    # breakpoint()

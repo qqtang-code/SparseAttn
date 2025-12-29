@@ -1148,14 +1148,17 @@ class Qwen3Attention(nn.Module):
             total_valid_tokens = cu_seqlens[-1].item()
                 
             if q.shape[0] > total_valid_tokens:
-                q = q[:total_valid_tokens]
+                q_non_padding = q[:total_valid_tokens].clone().contiguous()
                 # 注意：KV Packed 需要小心处理
                 if kv is not None:
                     # kv: [Total_Seq, 2, Heads, Dim]
                     kv = kv[:total_valid_tokens]
+            else:
+                q_non_padding = q.clone().contiguous()
             # Variable Length Flash Attention
+            # breakpoint()
             attn_output = flash_attn_varlen_kvpacked_func(
-                q,
+                q_non_padding,
                 kv,
                 cu_seqlens,
                 cu_seqlens,
@@ -1283,33 +1286,6 @@ class Qwen3DecoderLayer(nn.Module):
 # Output Dataclass (保持不变)
 # ----------------------------------------------------------------------------
 
-@dataclass
-class BaseModelOutputWithPastAndSparsity(ModelOutput):
-    last_hidden_state: torch.FloatTensor
-    past_key_values: Optional[List[torch.FloatTensor]] = None
-    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
-    attentions: Optional[Tuple[torch.FloatTensor]] = None
-    model_sparsity: Optional[torch.FloatTensor] = None
-    target_sparsity: Optional[torch.FloatTensor] = None
-    sparsity_loss: Optional[torch.FloatTensor] = None
-    # Diagnostics
-    expected_model_sparsity: Optional[torch.FloatTensor] = None
-    lambda1: Optional[torch.FloatTensor] = None
-    lambda2: Optional[torch.FloatTensor] = None
-    expected_z_mean: Optional[torch.FloatTensor] = None
-    expected_z_std: Optional[torch.FloatTensor] = None
-    log_alpha_mean: Optional[torch.FloatTensor] = None
-    log_alpha_std: Optional[torch.FloatTensor] = None
-    # Layer-wise sparsity diagnostics
-    layerwise_model_sparsity: Optional[torch.FloatTensor] = None
-    layerwise_target_sparsity: Optional[torch.FloatTensor] = None
-    layerwise_sparsity_loss: Optional[torch.FloatTensor] = None
-    # contrastive_loss
-    log_z_loss: Optional[torch.FloatTensor] = None
-    head_entropy: Optional[torch.FloatTensor] = None
-
-
-
 class Qwen3PreTrainedModel(PreTrainedModel):
     config_class = PawQwen3Config
     base_model_prefix = "model"
@@ -1334,6 +1310,34 @@ class Qwen3PreTrainedModel(PreTrainedModel):
             module.weight.data.normal_(mean=0.0, std=std)
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
+
+
+@dataclass
+class BaseModelOutputWithPastAndSparsity(ModelOutput):
+    last_hidden_state: torch.FloatTensor
+    past_key_values: Optional[List[torch.FloatTensor]] = None
+    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    attentions: Optional[Tuple[torch.FloatTensor]] = None
+    model_sparsity: Optional[torch.FloatTensor] = None
+    target_sparsity: Optional[torch.FloatTensor] = None
+    sparsity_loss: Optional[torch.FloatTensor] = None
+    # Diagnostics
+    expected_model_sparsity: Optional[torch.FloatTensor] = None
+    lambda1: Optional[torch.FloatTensor] = None
+    lambda2: Optional[torch.FloatTensor] = None
+    expected_z_mean: Optional[torch.FloatTensor] = None
+    expected_z_std: Optional[torch.FloatTensor] = None
+    log_alpha_mean: Optional[torch.FloatTensor] = None
+    log_alpha_std: Optional[torch.FloatTensor] = None
+    # Layer-wise sparsity diagnostics
+    layerwise_model_sparsity: Optional[torch.FloatTensor] = None  # (num_layers,)
+    layerwise_target_sparsity: Optional[torch.FloatTensor] = None  # (num_layers,)
+    layerwise_sparsity_loss: Optional[torch.FloatTensor] = None  # scalar
+    # contrastive_loss
+    contrastive_loss: Optional[torch.FloatTensor] = None
+    head_contrastive_loss: Optional[torch.FloatTensor] = None
+    log_z_loss: Optional[torch.FloatTensor] = None
+    head_entropy: Optional[torch.FloatTensor] = None
 
 
 # ----------------------------------------------------------------------------
@@ -1530,6 +1534,9 @@ class CausalLMOutputWithPastAndSparsity(ModelOutput):
     log_z_loss: Optional[torch.FloatTensor] = None
     head_entropy: Optional[torch.FloatTensor] = None
 
+class KwargsForCausalLM(FlashAttentionKwargs, LossKwargs): ...
+
+
 class PawQwen3ForCausalLM(Qwen3PreTrainedModel):
     _tied_weights_keys = ["lm_head.weight"]
     _tp_plan = {"lm_head": "colwise_rep"}
@@ -1606,8 +1613,9 @@ class PawQwen3ForCausalLM(Qwen3PreTrainedModel):
         min_len = min(hidden_states.size(0), labels.size(0))
         hidden_states = hidden_states[:min_len]
         labels = labels[:min_len]
-
+        
         logits = self.lm_head(hidden_states)
+        # logits = logits.float()
         if len(logits.shape) > 2:
             logits = logits.transpose(-1, -2)
         return F.cross_entropy(
@@ -1619,7 +1627,6 @@ class PawQwen3ForCausalLM(Qwen3PreTrainedModel):
 
     def save_pretrained(self, *args, **kwargs):
         # First save the suggested threshold
-        self.model._pre_save_get_threshold()
         return super().save_pretrained(*args, **kwargs)
 
     def forward(
@@ -1644,6 +1651,7 @@ class PawQwen3ForCausalLM(Qwen3PreTrainedModel):
         range_ids: Optional[torch.LongTensor] = None,
         task_ids: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
+        **kwargs: Unpack[KwargsForCausalLM],
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
         Args:

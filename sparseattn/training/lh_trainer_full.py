@@ -220,6 +220,14 @@ class SparsityAccumulator:
                 self.last_known_metrics[k_tgt] = v_tgt
                 self.last_known_metrics[k_z] = v_z
 
+        # --- 第四阶段：前向填充 (Forward Filling) ---
+        # 遍历记忆中的所有 Key，如果当前 metrics 里没有，就补上上次的值
+        for k, v in self.last_known_metrics.items():
+            if k not in metrics:
+                metrics[k] = v
+
+        return metrics
+
 
 class LogCallback(TrainerCallback):
     def __init__(self, *args, **kwargs):
@@ -392,11 +400,11 @@ class Trainer(HFTrainer):
         self.num_sparsity_warmup_steps = math.ceil(self.sparsity_warmup_ratio * self.args.max_steps)
         self.task_sparsity_config = {
             "default": {"start": self.start_head_sparsity, "end": self.end_head_sparsity},
-            "Code": {"start": 0, "end": 0.9},
-            "In-Context Learning": {"start": 0, "end": 0.9},
-            "MultiHop QA": {"start": 0, "end": 0.6},
-            "Single QA": {"start": 0, "end": 0.6},
-            "Summarization": {"start": 0, "end": 0.9},
+            "Code": {"start": 0, "end": 0.5},
+            "In-Context Learning": {"start": 0, "end": 0.6},
+            "MultiHop QA": {"start": 0, "end": 0.8},
+            "Single QA": {"start": 0, "end": 0.8},
+            "Summarization": {"start": 0, "end": 0.2},
         }
         self.reverse_class_map = {0: 'Single QA', 1: 'MultiHop QA', 2: 'Summarization', 3: 'Code', 4:'In-Context Learning'}
         self.use_softmax = args.use_softmax
@@ -567,13 +575,13 @@ class Trainer(HFTrainer):
         outputs = model(**inputs, use_cache=False, target_sparsity=target_sparsity, current_tau=current_tau)
 
         lm_loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
-        reg_loss = outputs["sparsity_loss"] if isinstance(outputs, dict) else outputs[-2]
+        # reg_loss = outputs["sparsity_loss"] if isinstance(outputs, dict) else outputs[-2]
         
-        head_entropy = outputs["head_entropy"]
-        model_sparsity = outputs["model_sparsity"] # [B] 或者是标量
-        out_target_sparsity = outputs["target_sparsity"] # [B]
-        log_z_loss = outputs['log_z_loss'] # [B]
-        task_ids = outputs['task_ids'] # [B]
+        # head_entropy = outputs["head_entropy"]
+        # model_sparsity = outputs["model_sparsity"] # [B] 或者是标量
+        # out_target_sparsity = outputs["target_sparsity"] # [B]
+        # log_z_loss = outputs['log_z_loss'] # [B]
+        # task_ids = outputs['task_ids'] # [B]
         
         if getattr(self.args, "token_scaled_loss", False):
             seq_parallel_world_size = (
@@ -603,7 +611,7 @@ class Trainer(HFTrainer):
                 )  # moving avg
             lm_loss = lm_loss / self.state.avg_num_valid_tokens_per_device
 
-        loss = lm_loss + 10 * reg_loss
+        loss = lm_loss
        
         
         # A. 准备本地数据 (不进行 gather!)
@@ -611,26 +619,11 @@ class Trainer(HFTrainer):
         local_scalars = {
             "loss": loss.detach(),
             "lm_loss": lm_loss.detach(),
-            "reg_loss": reg_loss.detach(),
-            "head_entropy": head_entropy.detach(),
-            # 如果 model_sparsity 是向量，这里先取平均作为整体指标，详细的任务拆分在下面
-            "model_sparsity(avg)": model_sparsity.detach().float().mean(), 
-            "target_sparsity(avg)": out_target_sparsity.detach().float().mean(),
         }
 
         # B. 准备任务特定数据 (Zip 并不是耗时操作)
         # 注意：这里我们只处理本 GPU 上的数据，坚决不做 all_gather
         local_task_data = []
-        if task_ids.numel() > 0: # 确保有数据
-            # 假设这些 tensor 维度是一致的 [B]
-            t_ids = task_ids.detach().cpu().tolist()
-            t_sparsities = model_sparsity.detach().float().tolist()
-            t_targets = out_target_sparsity.detach().float().tolist()
-            t_z_losses = log_z_loss.detach().float().tolist()
-            
-            for i in range(len(t_ids)):
-                t_name = self.reverse_class_map.get(t_ids[i], "Unknown")
-                local_task_data.append((t_name, t_sparsities[i], t_targets[i], t_z_losses[i]))
 
         # C. 加入累积器 (极快，纯内存操作)
         self.sparsity_accumulator.add(local_scalars, local_task_data)
@@ -650,17 +643,7 @@ class Trainer(HFTrainer):
                 if self.accelerator.is_main_process:
                     # 补充一些只需取最后一次值的指标
                     global_metrics["step"] = self.state.global_step
-                    global_metrics["current_tau"] = current_tau.detach().item()
                     
-                    # Lambda 诊断信息
-                    lambda1 = outputs.get("lambda1", None) if isinstance(outputs, dict) else None
-                    if lambda1 is not None:
-                        global_metrics.update({
-                            "lambda1 Single QA": lambda1[0].detach().item(),
-                            "lambda2 MultiHop QA": lambda1[1].detach().item(),
-                            "lambda3 Summarization": lambda1[2].detach().item(),
-                            "lambda4 Code": lambda1[3].detach().item(),
-                        })
 
                     # --- 打印文本日志 ---
                     logger.info(
@@ -668,20 +651,8 @@ class Trainer(HFTrainer):
                         f"Loss: {global_metrics.get('loss', 0):.4f} | "
                         f"LM: {global_metrics.get('lm_loss', 0):.4f} | "
                         f"Reg: {global_metrics.get('reg_loss', 0):.4f} | "
-                        f"Spa(Avg): {global_metrics.get('model_sparsity(avg)', 0):.3f}"
                     )
                     
-                    # 打印任务日志
-                    for k in sorted(global_metrics.keys()):
-                        if k.startswith("Spa-") and "sparsity" in k and "target" not in k:
-                            task = k.split(" ")[0] # e.g. "Spa-Code"
-                            logger.info(
-                                f"Statistic -> {task[4:]} | " # remove "Spa-"
-                                f"Spa: {global_metrics[k]:.3f} | "
-                                f"Tgt: {global_metrics.get(f'{task} target_sparsity', 0):.3f} | "
-                                f"Z-Loss: {global_metrics.get(f'{task} log_z_loss', 0):.3f}"
-                            )
-
                     # --- 上传 SwanLab ---
                     try:
                         swanlab.log(global_metrics)
@@ -701,110 +672,71 @@ class Trainer(HFTrainer):
             return loss
 
     def create_optimizer(self):
+        """
+        Setup the optimizer.
+
+        We provide a reasonable default that works well. If you want to use something else, you can pass a tuple in the
+        Trainer's init through `optimizers`, or subclass and override this method in a subclass.
+        Updates: Also makes sure to separate the parameters into different groups for different learning rates.
+        """
         opt_model = self.model_wrapped if is_sagemaker_mp_enabled() else self.model
 
         if self.optimizer is None:
-            # 获取需要 weight decay 的参数名（通常排除 bias 和 layer norm）
             decay_parameters = self.get_decay_parameter_names(opt_model)
-
-            # 定义 5 个参数组
-            optimizer_1_group = []  # QKV params, non-decay
-            optimizer_2_group = []  # QKV params, decay
-            optimizer_3_group = []  # log_alpha params
-            optimizer_4_group = []  # sparsity_lambda params
-            optimizer_5_group = []  # mask_allocator params
             
-            optimized_parameters = []
-            
-            # 定义我们只想训练的特定层后缀
-            target_submodules = ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"]
+            optimizer_moba_group = []
+            for p in opt_model.parameters():
+                p.requires_grad = False
 
             for n, p in opt_model.named_parameters():
-                # --- 1. 处理 Mask 相关参数 ---
-                if ".mask_allocator." in n or "mask_allocator" in n or "log_alpha" in n or "sparsity_lambda" in n:
-                    if self.freeze_mask_parameters:
-                        p.requires_grad = False
-                    else:
-                        p.requires_grad = True
-                        if "log_alpha" in n:
-                            optimizer_3_group.append(p)
-                        elif "sparsity_lambda" in n:
-                            optimizer_4_group.append(p)
-                        else:
-                            optimizer_5_group.append(p)
-                        optimized_parameters.append(n)
-                    continue
-
-                # --- 2. 处理主体网络参数 (仅保留 Q, K, V) ---
-                is_qkv = any(target in n for target in target_submodules)
-
-                if is_qkv and not self.freeze_non_mask_parameters:
+                if "self_attn.q_proj" in n or "self_attn.k_proj" in n or "self_attn.v_proj" in n : 
+                    p.requires_grad = True  # 解冻该参数
+                    optimizer_moba_group.append(p)
+                elif "lm_head" in n or "embed_tokens" in n:
                     p.requires_grad = True
-                    if n in decay_parameters:
-                        optimizer_2_group.append(p)
-                    else:
-                        optimizer_1_group.append(p)
-                    optimized_parameters.append(n)
-                else:
-                    # 核心修复：必须显式设为 False，否则 FSDP 会报错
-                    p.requires_grad = False
 
             optimizer_grouped_parameters = []
 
-            if not self.freeze_non_mask_parameters:
-                if optimizer_1_group:
-                    optimizer_grouped_parameters.append({
-                        "params": optimizer_1_group,
-                        "weight_decay": 0.0,
-                        "lr": self.learning_rate,
-                    })
-                if optimizer_2_group:
-                    optimizer_grouped_parameters.append({
-                        "params": optimizer_2_group,
-                        "weight_decay": self.args.weight_decay,
-                        "lr": self.learning_rate,
-                    })
-
-            if not self.freeze_mask_parameters:
-                if optimizer_3_group:
-                    optimizer_grouped_parameters.append({
-                        "params": optimizer_3_group,
-                        "weight_decay": self.args.weight_decay,
-                        "lr": self.mask_learning_rate,
-                    })
-                if optimizer_4_group:
-                    optimizer_grouped_parameters.append({
-                        "params": optimizer_4_group,
-                        "weight_decay": self.args.weight_decay,
-                        "lr": self.reg_learning_rate,
-                        "maximize": True,
-                    })
-                if optimizer_5_group:
-                    optimizer_grouped_parameters.append({
-                        "params": optimizer_5_group,
-                        "weight_decay": self.args.weight_decay,
-                        "lr": self.mask_learning_rate,
-                    })
-
-            logger.info(f"Optimizing {len(optimized_parameters)} parameters.")
-            logger.info(f"Optimized parameters list: {optimized_parameters}")
-
-            optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(self.args, opt_model)
+            optimizer_grouped_parameters.append(
+                {
+                    "params": optimizer_moba_group,
+                    "weight_decay": self.args.weight_decay,
+                    "lr": 1e-5,
+                }
+            )
             
-            if not optimizer_grouped_parameters:
-                raise ValueError("No parameters to optimize! Check your freeze logic.")
+            logger.info("optimizer_grouped_parameters -> optimized parameters")
+            #logger.info(optimizer_moba_group)
+            
+            optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(
+                self.args, opt_model
+            )
 
-            self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
+            self.optimizer = optimizer_cls(
+                optimizer_grouped_parameters, **optimizer_kwargs
+            )
 
             if optimizer_cls.__name__ == "Adam8bit":
                 import bitsandbytes
+
                 manager = bitsandbytes.optim.GlobalOptimManager.get_instance()
+
+                skipped = 0
                 for module in opt_model.modules():
                     if isinstance(module, nn.Embedding):
-                        manager.register_module_override(module, "weight", {"optim_bits": 32})
+                        skipped += sum(
+                            {
+                                p.data_ptr(): p.numel() for p in module.parameters()
+                            }.values()
+                        )
+                        logger.info(f"skipped {module}: {skipped / 2**20}M params")
+                        manager.register_module_override(
+                            module, "weight", {"optim_bits": 32}
+                        )
+                        logger.debug(f"bitsandbytes: will optimize {module} in fp32")
+                logger.info(f"skipped: {skipped / 2**20}M params")
 
         if is_sagemaker_mp_enabled():
-            import smdistributed.modelparallel.torch as smp
             self.optimizer = smp.DistributedOptimizer(self.optimizer)
 
         return self.optimizer
@@ -1339,39 +1271,6 @@ class Trainer(HFTrainer):
         return metrics
 
 
-    def _save_checkpoint(self, model, trial, metrics=None):
-        # A wrapper around the original _save_checkpoint function to save streaming dataset state
-        # Save model checkpoint
-        sig = inspect.signature(super()._save_checkpoint)
-        if "metrics" in sig.parameters:
-            super()._save_checkpoint(model, trial, metrics=metrics)
-        else:
-            super()._save_checkpoint(model, trial)
-
-        # Get the path
-        checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
-        run_dir = self._get_output_dir(trial=trial)
-        output_dir = os.path.join(run_dir, checkpoint_folder)
-
-        # Save streaming dataset state
-        if (
-            isinstance(self.train_dataset, StreamingDataset)
-            and self.state.is_world_process_zero
-        ):
-            num_samples = (
-                self.state.global_step
-                * self.args.train_batch_size
-                * self.args.world_size
-                * self.args.gradient_accumulation_steps
-            )
-            if self.train_dataset.replication is not None:
-                num_samples = num_samples // self.train_dataset.replication
-            dataset_state_dict = self.train_dataset.state_dict(num_samples, True)
-            logger.warning(f"Save streaming dataset state: {dataset_state_dict}")
-            json.dump(
-                dataset_state_dict,
-                open(os.path.join(output_dir, "streaming_dataset_state.json"), "w"),
-            )
 
     def _load_optimizer_and_scheduler(self, checkpoint):
         # A wrapper around the original _load_optimizer_and_scheduler to resume dataloader

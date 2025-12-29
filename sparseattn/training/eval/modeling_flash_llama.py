@@ -57,8 +57,8 @@ from block_sparse_attn import block_streaming_attn_func
 
 from dataclasses import dataclass
 
-from .distributed_attention import DistributedAttention
-from .attention_mask import (
+# from .distributed_attention import DistributedAttention
+from sparseattn.training.attention_mask import (
     deterministic_z_from_log_alpha,
     sample_z_from_log_alpha,
     cdf_stretched_concrete,
@@ -71,7 +71,7 @@ logger = logging.get_logger(__name__)
 
 class PawLlamaConfig(LlamaConfig):
     def __init__(self, *args, **kwargs):
-        self.local_window_size = kwargs.pop("local_window_size", 1024)
+        self.local_window_size = kwargs.pop("local_window_size", 1024) # 256
         self.disable_linear_regularization_term = kwargs.pop(
             "disable_linear_regularization_term", False
         )
@@ -79,7 +79,7 @@ class PawLlamaConfig(LlamaConfig):
 
         # Streaming
         self.toggle_type = kwargs.pop("toggle_type", "streaming")
-        self.sink_size = kwargs.pop("sink_size", 128)
+        self.sink_size = kwargs.pop("sink_size", 128) 
         
         # retrieval_mode
         self.retrieval_mode = kwargs.pop("retrieval_mode", "full")
@@ -592,7 +592,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 class AttentionRouter(nn.Module):
     def __init__(self, input_dim, num_key_value_heads, d_feature=128,
-                 use_task_emb=False, temp=0.2, hard=False, 
+                 use_task_emb=False, temp=1.0, hard=False, 
                  router_type='mlp', use_gumbel=True, learnable_temp=False,
                  dropout=0.1, use_softmax=True, pooling_mode='ctx_q'):
         super().__init__()
@@ -637,8 +637,7 @@ class AttentionRouter(nn.Module):
         if learnable_temp:
             self.log_temp = nn.Parameter(torch.log(torch.tensor(temp)))
         else:
-            self.register_buffer("log_temp", torch.log(torch.tensor(temp)))
-            self.tau = torch.exp(self.log_temp).clamp(0.3, 1.0)
+            self.tau = temp
     
     def reset_parameters(self):
         nn.init.kaiming_uniform_(self.cls_router_head_agnostic[0].weight, a=math.sqrt(5))
@@ -675,7 +674,6 @@ class AttentionRouter(nn.Module):
         """
         bsz = (cu_seq_len.shape[0] - 1) if cu_seq_len is not None else 1
         
-        # 目前所有支持的pooling 方法
         if self.pooling_mode == 'first_token':
             if cu_seq_len is not None:
                 pooled_latent = self._segment_pooling(
@@ -692,12 +690,19 @@ class AttentionRouter(nn.Module):
                     x, range_ids, ['q'])
         elif self.pooling_mode == 'ctx_q':
             if cu_seq_len is not None:
-                pooled_latent = self._segment_pooling(
-                    x, range_ids, ['ctx_q'], cu_seq_len)  # [B, H, D]
-            else:
-                pooled_latent = self._segment_pooling_single_batch(
-                    x, range_ids, ['ctx_q'])
+                B = cu_seq_len.shape[0] - 1
+                H, D = x.shape[1:]
+                sample_features = []
+                for i in range(B):
+                    x_s, x_e = cu_seq_len[i], cu_seq_len[i + 1]
+                    seg_slice = x[x_s:x_e]              # [Ti, H, D]
+                    seg_pooled = seg_slice.mean(dim=0)  # [H, D]
+                    sample_features.append(seg_pooled)
 
+                pooled_latent = torch.stack(sample_features, dim=0)
+            else:
+                target = torch.concat([x[:,:100,:] , x[:,-100:,:]],dim=1).mean(dim=1)
+                pooled_latent = target  # [H, D]
         else:
             raise ValueError(f"Unknown pooling_mode: {self.pooling_mode}")
         
@@ -718,38 +723,24 @@ class AttentionRouter(nn.Module):
         else:
             tau = current_tau if current_tau is not None else self.tau
 
-        # --- Gumbel or Softmax routing ---
-        if self.training:
-            u = torch.rand_like(binary_logits)
-            eps = 1e-8
-            g = -torch.log(-torch.log(u + eps) + eps)
-            
-            if not self.use_softmax:
-                z_soft = torch.sigmoid((binary_logits + g) / tau)
-                z_hard = (z_soft > 0.5).float()
-                z = z_hard + (z_soft - z_soft.detach())  # [B, H, 1]
-                entropy = -(z_soft * torch.log(z_soft + eps) + (1 - z_soft) * torch.log(1 - z_soft + eps))
-            else:
-                z_soft = F.softmax((binary_logits + g) / tau, dim=-1)
-                z_hard = torch.zeros_like(z_soft).scatter_(-1, z_soft.argmax(-1, keepdim=True), 1.0)
-                z = z_hard + (z_soft - z_soft.detach())  # [B, H, 2]
-                z = z[..., 1]  # [B, H]
-                z_soft = z_soft[..., 1]
-                z_soft = z_soft.unsqueeze(-1)
-                z = z.unsqueeze(-1)
-                entropy = -(z_soft * torch.log(z_soft + eps)).sum(dim=-1).mean() 
+        u = torch.rand_like(binary_logits)
+        eps = 1e-8
+        g = -torch.log(-torch.log(u + eps) + eps)
+        
+        if not self.use_softmax:
+            z_soft = torch.sigmoid((binary_logits + g) / tau)
+            z_hard = (z_soft > 0.5).float()
+            z = z_hard + (z_soft - z_soft.detach())  # [B, H, 1]
+            entropy = -(z_soft * torch.log(z_soft + eps) + (1 - z_soft) * torch.log(1 - z_soft + eps))
         else:
-            # 推理阶段：直接根据 Logit 确定 (相当于 tau -> 0)
-            # 或者也可以用 sigmoid(logit/tau) > 0.5，但在 deterministic 模式下 logit > 0 即可
-            # z_soft = torch.sigmoid(binary_logits / tau) 
-            if not self.use_softmax:
-                z_soft = torch.sigmoid(binary_logits / tau)
-                z_hard = (z_soft > 0.5).float()
-                z = z_hard
-            else:
-                z_soft = F.softmax(binary_logits / tau, dim=-1)
-                z_hard = z_soft.argmax(-1)
-                z = z_hard
+            z_soft = F.softmax(binary_logits, dim=-1)
+            z_hard = torch.zeros_like(z_soft).scatter_(-1, z_soft.argmax(-1, keepdim=True), 1.0)
+            z = z_hard + (z_soft - z_soft.detach())  # [B, H, 2]
+            z = z[..., 1]  # [B, H]
+            z_soft = z_soft[..., 1]
+            z_soft = z_soft.unsqueeze(-1)
+            z = z.unsqueeze(-1)
+            entropy = -(z_soft * torch.log(z_soft + eps)).sum(dim=-1).mean() 
         
         return {
             'pooled_hidden_states': pooled_hidden_states, # [B, H, D]
@@ -811,32 +802,33 @@ class AttentionRouter(nn.Module):
             torch.Tensor: _description_
         """
         POOL_MAP = {'first_token': (0, 1),'ctx': (2, 3), 'q': (4, 5), 'a': (6, 7), 'ctx_q': (2, 5)} 
-
+        
         B = cu_seq_len.shape[0] - 1
         H, D = x.shape[1:]
         pooled_features_list = []
-
+        
         for i in range(B):
             sample_features = []
             x_s, x_e = cu_seq_len[i], cu_seq_len[i + 1]
             for seg in segments:
                 start_idx, end_idx = POOL_MAP[seg]
                 start, end = range_ids[i, start_idx:end_idx + 1].tolist()[0], range_ids[i, start_idx:end_idx + 1].tolist()[-1]
+
                 if end >= start:
-                    prefix_seg_slice = x[x_s + start: x_s + start + 100,  : , :]
-                    suffix_seg_slice = x[x_s + end - 99: x_s + end + 1,  : , :]
-                    combined_slice = torch.cat((prefix_seg_slice, suffix_seg_slice), dim=0)
+                    start_slice = pooled_input[i, start : start + 100, :, :]
+                    end_slice = pooled_input[i, end - 99 : end + 1, :, :]
+                    combined_slice = torch.cat((start_slice, end_slice), dim=0)
                     seg_pooled = combined_slice.mean(dim=0)  # [H, D]
                 else:
                     seg_pooled = torch.zeros(H, D, device=x.device)
-
+                
                 sample_features.append(seg_pooled)
 
             if sample_features:
                 combined_feature = torch.stack(sample_features, dim=0).mean(dim=0) # [H, D]
             else:
                 combined_feature = torch.zeros(H, D, device=x.device)
-
+                
             pooled_features_list.append(combined_feature)
 
         return torch.stack(pooled_features_list, dim=0) # [B, H, D]
@@ -905,7 +897,6 @@ class LlamaAttention(nn.Module):
             use_softmax=getattr(config, "use_softmax", False)
         )
 
-        self.distributed_attn_func = DistributedAttention(self.interpolated_attention)
 
         self._dtype = self.q_proj.weight.dtype
         self.attn_mask_log_alphas = nn.Parameter(
@@ -924,29 +915,29 @@ class LlamaAttention(nn.Module):
         
         self.retrieval_mode = config.retrieval_mode
 
-        if self.retrieval_mode == "xattn":
-            from sparseattn.utils.ops.xattention_fa import xattn_flash_attn_func
-            self.streaming_info_kwargs = {
-                "sink_block_num": self.sink_blocks,
-                "local_block_num": self.local_blocks,
-            }
-            # self.head_indices = self.num_heads // self.num_key_value_heads
-            self.head_indices = self.num_heads
-            self.xattn_flash_attn_func = xattn_flash_attn_func
-            self.granularity = int(getattr(config, "block_size", 64))
-            self.xattn_params = {
-                "stride": 16,
-                "norm": 1,
-                "softmax": True,
-                "threshold": 0.9,
-                "chunk_size": 16384,
-                "select_mode": "inverse",
-                "use_triton": True,
-                "causal": True,
-                "kdb": 1,
-                "keep_sink": True,
-                "keep_recent": True,
-            }
+
+        from sparseattn.utils.ops.xattention_fa import xattn_flash_attn_func
+        self.streaming_info_kwargs = {
+            "sink_block_num": self.sink_blocks,
+            "local_block_num": self.local_blocks,
+        }
+        # self.head_indices = self.num_heads // self.num_key_value_heads
+        self.head_indices = self.num_heads
+        self.xattn_flash_attn_func = xattn_flash_attn_func
+        self.granularity = int(getattr(config, "block_size", 64))
+        self.xattn_params = {
+            "stride": 16,
+            "norm": 1,
+            "softmax": True,
+            "threshold": 0.9,
+            "chunk_size": 16384,
+            "select_mode": "inverse",
+            "use_triton": True,
+            "causal": True,
+            "kdb": 1,
+            "keep_sink": True,
+            "keep_recent": True,
+        }
 
         if self.toggle_type == "streaming":
             self.streaming_info_kwargs = {
@@ -1038,266 +1029,6 @@ class LlamaAttention(nn.Module):
             .contiguous()
         )
 
-
-    def interpolated_attention(self, q, kv, k, v, unpadded_lengths, z):
-        if self.retrieval_mode == "full":
-            if unpadded_lengths is not None:
-                # varlen, ignore padding tokens, efficient for large batch with many paddings
-                cu_seqlens, max_seqlen = unpadded_lengths
-                attn_output = flash_attn_varlen_kvpacked_func(
-                    q,
-                    kv,
-                    cu_seqlens,
-                    cu_seqlens,
-                    max_seqlen,
-                    max_seqlen,
-                    dropout_p=0.0,
-                    softmax_scale=1.0 / self.norm_factor,
-                    causal=True,
-                    return_attn_probs=False,
-                )
-            else:
-                attn_output = flash_attn_kvpacked_func(
-                    q,
-                    kv,
-                    dropout_p=0.0,
-                    softmax_scale=1.0 / self.norm_factor,
-                    causal=True,
-                    return_attn_probs=False,
-                )
-        elif self.retrieval_mode == "xattn":
-            is_vlen_input = (q.dim() == 3) and (unpadded_lengths is not None)
-
-            if is_vlen_input:
-                k = k.repeat_interleave(self.num_key_value_groups, dim=1)
-                v = v.repeat_interleave(self.num_key_value_groups, dim=1)
-                q, k, v = q.transpose(0, 1).contiguous(), k.transpose(0, 1).contiguous(), v.transpose(0, 1).contiguous() 
-            else:
-                k = k.repeat_interleave(self.num_key_value_groups, dim=2)
-                v = v.repeat_interleave(self.num_key_value_groups, dim=2)
-                q, k, v = q.transpose(1, 2).contiguous(), k.transpose(1, 2).contiguous(), v.transpose(1, 2).contiguous() 
-                
-            stride = self.xattn_params["stride"]
-            threshold = self.xattn_params["threshold"]
-            norm = self.xattn_params["norm"]
-
-            if unpadded_lengths is not None:
-                cu_seqlens, max_seqlen = unpadded_lengths
-                attn_output = Xattention_prefill_dim3(
-                    q,
-                    k,
-                    v,
-                    stride,
-                    cu_seqlens,
-                    norm,
-                    threshold,
-                    use_triton=True,
-                )
-
-            else:
-                bsz,_,seqlen,_ = q.size()
-                if not torch.is_tensor(seqlen):
-                    seqlen = torch.tensor(seqlen, dtype=torch.int32, device=q.device)
-                max_seqlen = torch.max(seqlen).item()
-
-                cu_seqlens = torch.arange(
-                    0, (bsz + 1) * seqlen, step=seqlen, dtype=torch.int32, device=q.device
-                )
-                unpadded_lengths_xattn = (cu_seqlens, max_seqlen)
-
-                cu_seqlens, max_seqlen = unpadded_lengths_xattn
-                attn_output = Xattention_prefill_dim4(
-                    q,
-                    k,
-                    v,
-                    stride,
-                    cu_seqlens,
-                    norm,
-                    threshold,
-                    use_triton=True,
-                ).transpose(1, 2)  # B, T, H, D
-            if is_vlen_input:
-                q = q.transpose(0, 1).contiguous()
-            else:
-                q = q.transpose(1, 2).contiguous()
-        else:
-            raise ValueError(f"Unknown retrieval mode: {self.retrieval_mode}")
-
-        if self.toggle_type == "streaming" or self.toggle_type == "triangle":
-            # breakpoint()
-            if unpadded_lengths is not None:
-                cu_seqlens, max_seqlen = unpadded_lengths
-                cw_attn_output = streaming_attn_varlen_kvpacked_func(
-                    q,
-                    kv,
-                    self.streaming_info_kwargs,
-                    cu_seqlens,
-                    max_seqlen,
-                    dropout_p=0.0,
-                    causal=True,
-                    return_attn_probs=False,
-                )
-            else:
-                cw_attn_output = streaming_attn_kvpacked_func(
-                    q,
-                    kv,
-                    self.streaming_info_kwargs,
-                    dropout_p=0.0,
-                    causal=True,
-                    return_attn_probs=False,
-                )
-            if self.toggle_type == "triangle":
-                if unpadded_lengths is not None:
-                    cu_seqlens, _ = unpadded_lengths
-                    total = q.size(0)
-                    mask = torch.zeros(total, dtype=torch.bool, device=q.device)
-                    B = cu_seqlens.numel() - 1
-                    n_last = self.triangle_n_last
-                    for b in range(B):
-                        start = int(cu_seqlens[b].item())
-                        end = int(cu_seqlens[b + 1].item())
-                        seg_len = end - start
-                        take = min(n_last, seg_len)
-                        if take > 0:
-                            mask[end - take : end] = True
-                    cw_attn_output[mask] = attn_output[mask]
-                else:
-                    seq_len = q.size(1)
-                    take = min(getattr(self, "triangle_n_last", 0), seq_len)
-                    if take > 0:
-                        cw_attn_output[:, -take:] = attn_output[:, -take:]
-
-        elif self.toggle_type == "local":
-            if unpadded_lengths is not None:
-                # varlen, ignore padding tokens, efficient for large batch with many paddings
-                cu_seqlens, max_seqlen = unpadded_lengths
-
-                cw_attn_output = flash_attn_varlen_kvpacked_func(
-                    q,
-                    kv,
-                    cu_seqlens,
-                    cu_seqlens,
-                    max_seqlen,
-                    max_seqlen,
-                    dropout_p=0.0,
-                    softmax_scale=1.0 / self.norm_factor,
-                    causal=True,
-                    return_attn_probs=False,
-                    window_size=(self.context_window_toggle - 1, 0),
-                )
-            else:
-                cw_attn_output = flash_attn_kvpacked_func(
-                    q,
-                    kv,
-                    dropout_p=0.0,
-                    softmax_scale=1.0 / self.norm_factor,
-                    causal=True,
-                    return_attn_probs=False,
-                    window_size=(self.context_window_toggle - 1, 0),
-                )
-        elif self.toggle_type == "xattn":  
-
-            if not self.training :
-                _, seq_len, _, _ = q.size()       
-            if self.training or seq_len != 1:
-
-                is_vlen_input = (q.dim() == 3) and (unpadded_lengths is not None)
-
-                if is_vlen_input:
-                    k = k.repeat_interleave(self.num_key_value_groups, dim=1)
-                    v = v.repeat_interleave(self.num_key_value_groups, dim=1)
-                    q, k, v = q.transpose(0, 1).contiguous(), k.transpose(0, 1).contiguous(), v.transpose(0, 1).contiguous() 
-                else:
-                    k = k.repeat_interleave(self.num_key_value_groups, dim=2)
-                    v = v.repeat_interleave(self.num_key_value_groups, dim=2)
-                    q, k, v = q.transpose(1, 2).contiguous(), k.transpose(1, 2).contiguous(), v.transpose(1, 2).contiguous() 
-                    
-                stride = self.xattn_params["stride"]
-                threshold = self.xattn_params["threshold"]
-                norm = self.xattn_params["norm"]
-
-                if unpadded_lengths is not None:
-                    cu_seqlens, max_seqlen = unpadded_lengths
-                    cw_attn_output = Xattention_prefill_dim3(
-                        q,
-                        k,
-                        v,
-                        stride,
-                        cu_seqlens,
-                        norm,
-                        threshold,
-                        use_triton=True,
-                    )
-
-                else:
-                    bsz,_,seqlen,_ = q.size()
-                    if not torch.is_tensor(seqlen):
-                        seqlen = torch.tensor(seqlen, dtype=torch.int32, device=q.device)
-                    max_seqlen = torch.max(seqlen).item()
-
-                    cu_seqlens = torch.arange(
-                        0, (bsz + 1) * seqlen, step=seqlen, dtype=torch.int32, device=q.device
-                    )
-                    unpadded_lengths = (cu_seqlens, max_seqlen)
-
-                    cu_seqlens, max_seqlen = unpadded_lengths
-                    cw_attn_output = Xattention_prefill_dim4(
-                        q,
-                        k,
-                        v,
-                        stride,
-                        cu_seqlens,
-                        norm,
-                        threshold,
-                        use_triton=True,
-                    ).transpose(1, 2)  # B, T, H, D
-            else:
-                if unpadded_lengths is not None:
-                    # varlen, ignore padding tokens, efficient for large batch with many paddings
-                    cu_seqlens, max_seqlen = unpadded_lengths
-
-                    cw_attn_output, _, attn_probs = flash_attn_varlen_kvpacked_func(
-                        q,
-                        kv,
-                        cu_seqlens,
-                        cu_seqlens,
-                        max_seqlen,
-                        max_seqlen,
-                        dropout_p=0.0,
-                        softmax_scale=1.0 / self.norm_factor,
-                        causal=True,
-                        return_attn_probs=True,
-                    )
-                else:
-                    cw_attn_output, _, attn_probs = flash_attn_kvpacked_func(
-                        q,
-                        kv,
-                        dropout_p=0.0,
-                        softmax_scale=1.0 / self.norm_factor,
-                        causal=True,
-                        return_attn_probs=True,
-                    )
-        elif self.toggle_type == "none":
-            cw_attn_output = torch.zeros_like(attn_output)
-        else:
-            raise ValueError(f"Unknown toggle type: {self.toggle_type}")
-
-        if unpadded_lengths is not None:
-            effective_attn_output = []
-            cu_seqlens, max_seqlen = unpadded_lengths
-            bsz = len(cu_seqlens) - 1
-            for i in range(bsz):
-                effective_attn_output.append(
-                    attn_output[cu_seqlens[i]:cu_seqlens[i + 1], :, :] * z[i, None, ...] + cw_attn_output[cu_seqlens[i]:cu_seqlens[i + 1], :, :] * (1 - z)[i, None, ...]
-                )
-            effective_attn_output = torch.cat(effective_attn_output, dim=0)
-        else:        
-            effective_attn_output = attn_output * z[:,None,...] + cw_attn_output * (
-                1 - z
-            )[:,None,...]
-
-        return effective_attn_output
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1311,12 +1042,12 @@ class LlamaAttention(nn.Module):
         segment_ids: Optional[torch.LongTensor] = None,
         range_ids: Optional[torch.LongTensor] = None,
         task_ids: Optional[torch.LongTensor] = None,
-        current_tau: Optional[torch.Tensor] = None,
         position_embeddings: Optional[
             Tuple[torch.Tensor, torch.Tensor]
         ] = None,  # will become mandatory in v4.46
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
@@ -1324,27 +1055,31 @@ class LlamaAttention(nn.Module):
         k = self.k_proj(hidden_states).view(hidden_shape)
         v = self.v_proj(hidden_states).view(hidden_shape)
 
-        if not self.config.enable_ada_sparsity:
-            z_kv = get_mask(
-                self.attn_mask_log_alphas,
-                training=self.training,
-                threshold_for_deterministic=self.threshold_for_deterministic,
-            )  # (num_key_value_heads,)
-            # Next: expand z_kv to (num_key_value_heads, num_key_value_groups) and then flatten it to (num_heads)
-            z_kv_batch = z_kv.unsqueeze(-1).expand(-1, self.num_key_value_groups).reshape(-1)
-        else:
-            if unpadded_lengths is not None:
-                res = self.mask_allocator(k, unpadded_lengths[0], range_ids, task_ids, current_tau)
-            else:
-                res = self.mask_allocator(k, None, range_ids, task_ids, current_tau)
-            
-            z_kv_batch, entropy, pooled_hidden_states = res['sparse_mask'], res['entropy'], res['pooled_hidden_states']
-            z_constrast = res['decisions']
-
-            if z_kv_batch.shape[-2] == self.num_key_value_heads:
-                z_kv_batch = z_kv_batch.repeat_interleave(self.num_key_value_groups, 1)
-        
         has_layer_past = past_key_value is not None
+        
+        if not has_layer_past:
+            if not self.config.enable_ada_sparsity:
+                z_kv = get_mask(
+                    self.attn_mask_log_alphas,
+                    training=self.training,
+                    threshold_for_deterministic=self.threshold_for_deterministic,
+                )  # (num_key_value_heads,)
+                # Next: expand z_kv to (num_key_value_heads, num_key_value_groups) and then flatten it to (num_heads)
+                z = z_kv.unsqueeze(-1).expand(-1, self.num_key_value_groups).reshape(-1)
+            else:
+                if unpadded_lengths is not None:
+                    res = self.mask_allocator(k, unpadded_lengths[0], range_ids, task_ids)
+                else:
+                    res = self.mask_allocator(k, None, range_ids, task_ids)
+                
+                z_kv_batch, entropy, pooled_hidden_states = res['sparse_mask'], res['entropy'], res['pooled_hidden_states']
+                z_constrast = res['decisions']
+
+                if z_kv_batch.shape[-2] == self.num_key_value_heads:
+                    z_kv_batch = z_kv_batch.repeat_interleave(self.num_key_value_groups, 1)
+        else:
+            # decode
+            z_kv_batch = past_key_value[2]
 
         if has_layer_past:
             past_kv = past_key_value[0]
@@ -1352,15 +1087,12 @@ class LlamaAttention(nn.Module):
         else:
             past_len = 0
 
-        # NOTE: Hack to include position_ids, assuming they are increasing uniformly per block
         if position_ids is not None:
             past_len += position_ids.min()
 
         q, k = self.rotary_emb(q, k, past_len, unpadded_lengths)
         
         kv = torch.stack([k, v], -3)
-       if self.num_key_value_groups > 1:
-            kv = kv.repeat_interleave(self.num_key_value_groups, dim=-2)
 
         # Cache QKV values
         if has_layer_past:
@@ -1385,37 +1117,123 @@ class LlamaAttention(nn.Module):
             kv = past_kv[:, :new_len]
         else:
             past_kv = kv
-        past_key_value = (past_kv, past_len + q.size(1)) if use_cache else None
-        
-        if (
-            seq_parallel_group is not None
-            and dist.is_initialized()
-            and dist.get_world_size(seq_parallel_group) > 1
-        ):
-            attention_func = self.distributed_attn_func
-            kwargs = {
-                "group": seq_parallel_group,
-                "gather_idx": (0 if unpadded_lengths is not None else 1),
-            }
-            if not self.config.enable_ada_sparsity:
-                z = torch.split(
-                    z, self.num_heads // dist.get_world_size(seq_parallel_group), dim=0
-                )[dist.get_rank(seq_parallel_group)]
-            else:
-                z_splits = torch.split(z, self.num_heads // dist.get_world_size(seq_parallel_group), dim=1)
-                z = z_splits[dist.get_rank(seq_parallel_group)]
-        else:
-            attention_func = self.interpolated_attention
-            kwargs = {}
+        past_key_value = (past_kv, past_len + q.size(1), z_kv_batch) if use_cache else None
+             
+        if not has_layer_past:
 
-        attn_output = attention_func(q, kv, k, v, unpadded_lengths, z_kv_batch, **kwargs)
+            is_vlen_input = (q.dim() == 3) and (unpadded_lengths is not None)
+
+            if is_vlen_input:
+                k = k.repeat_interleave(self.num_key_value_groups, dim=1)
+                v = v.repeat_interleave(self.num_key_value_groups, dim=1)
+                q, k, v = q.transpose(0, 1).contiguous(), k.transpose(0, 1).contiguous(), v.transpose(0, 1).contiguous() 
+            else:
+                k = k.repeat_interleave(self.num_key_value_groups, dim=2)
+                v = v.repeat_interleave(self.num_key_value_groups, dim=2)
+                q, k, v = q.transpose(1, 2).contiguous(), k.transpose(1, 2).contiguous(), v.transpose(1, 2).contiguous() 
+                
+            stride = self.xattn_params["stride"]
+            threshold = self.xattn_params["threshold"]
+            norm = self.xattn_params["norm"]
+
+            if unpadded_lengths is not None:
+                cu_seqlens, max_seqlen = unpadded_lengths
+                cw_attn_output = Xattention_prefill_dim3(
+                    q,
+                    k,
+                    v,
+                    stride,
+                    cu_seqlens,
+                    norm,
+                    threshold,
+                    use_triton=True,
+                )
+
+            else:
+                bsz,_,seqlen,_ = q.size()
+                if not torch.is_tensor(seqlen):
+                    seqlen = torch.tensor(seqlen, dtype=torch.int32, device=q.device)
+                max_seqlen = torch.max(seqlen).item()
+
+                cu_seqlens = torch.arange(
+                    0, (bsz + 1) * seqlen, step=seqlen, dtype=torch.int32, device=q.device
+                )
+                unpadded_lengths = (cu_seqlens, max_seqlen)
+
+                cu_seqlens, max_seqlen = unpadded_lengths
+                if self.retrieval_mode == "full" and self.toggle_type == "xattn":
+                    head_mask_type = (1 - z_kv_batch[0, :, 0]).int()
+                elif self.retrieval_mode == "full" and self.toggle_type == "streaming":
+                    head_mask_type = torch.where(
+                        z_kv_batch[0, :, 0] == 1,
+                        torch.tensor(0, dtype=torch.int, device=z_kv_batch.device),
+                        torch.tensor(-1, dtype=torch.int, device=z_kv_batch.device)
+                    )
+                elif self.retrieval_mode == "xattn" and self.toggle_type == "streaming":
+                    head_mask_type = torch.where(
+                        z_kv_batch[0, :, 0] == 1,
+                        torch.tensor(1, dtype=torch.int, device=z_kv_batch.device),
+                        torch.tensor(-1, dtype=torch.int, device=z_kv_batch.device)
+                    )
+                elif self.retrieval_mode == "xattn" and self.toggle_type == "xattn":
+                    head_mask_type = torch.ones_like(z_kv_batch[0, :, 0], dtype=torch.int)
+                elif self.retrieval_mode == "full" and self.toggle_type == "full":
+                    head_mask_type = 1 - torch.ones_like(z_kv_batch[0, :, 0], dtype=torch.int)
+                else:
+                    raise SamplerConditionError(
+                        f"retrieval_mode: {self.retrieval_mode} and toggle_type: {self.toggle_type} is not supported"
+                    )
+                    
+                
+                attn_output = Xattention_prefill_dim4(
+                    q,
+                    k,
+                    v,
+                    stride,
+                    cu_seqlens,
+                    norm,
+                    threshold,
+                    use_triton=True,
+                    head_mask_type=head_mask_type,
+                    sink_num=self.sink_blocks,
+                    local_num=self.local_blocks,
+                ).transpose(1, 2)  # B, T, H, D
+        else:
+            if self.num_key_value_groups > 1:
+                kv = kv.repeat_interleave(self.num_key_value_groups, dim=-2)
+            if unpadded_lengths is not None:
+                # varlen, ignore padding tokens, efficient for large batch with many paddings
+                cu_seqlens, max_seqlen = unpadded_lengths
+
+                attn_output = flash_attn_varlen_kvpacked_func(
+                    q,
+                    kv,
+                    cu_seqlens,
+                    cu_seqlens,
+                    max_seqlen,
+                    max_seqlen,
+                    dropout_p=0.0,
+                    softmax_scale=1.0 / self.norm_factor,
+                    causal=True,
+                    return_attn_probs=False,
+                )
+            else:
+                attn_output = flash_attn_kvpacked_func(
+                    q,
+                    kv,
+                    dropout_p=0.0,
+                    softmax_scale=1.0 / self.norm_factor,
+                    causal=True,
+                    return_attn_probs=False,
+                )
+
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output.to(self.o_proj.weight.dtype))
 
         attn_weights = None        
         # print(f"task id: {task_ids}, layer sparsity: {z.squeeze(-1).sum(dim=-1)}")
         # z: [B, H, 1] -> [B, H] -> [B]
-        return z_kv_batch.squeeze(-1).sum(dim=-1), entropy.mean(), pooled_hidden_states, z_constrast.squeeze(-1), attn_output, attn_weights, past_key_value
+        return z_kv_batch.squeeze(-1).sum(dim=-1), None, None, None, attn_output, attn_weights, past_key_value
 
 class LlamaDecoderLayer(nn.Module):
     def __init__(
@@ -1464,7 +1282,6 @@ class LlamaDecoderLayer(nn.Module):
         segment_ids: Optional[torch.LongTensor] = None,
         range_ids: Optional[torch.LongTensor] = None,
         task_ids: Optional[torch.LongTensor] = None,
-        current_tau: Optional[torch.Tensor] = None,
     ) -> Tuple[
         torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]
     ]:
@@ -1499,7 +1316,6 @@ class LlamaDecoderLayer(nn.Module):
             segment_ids=segment_ids,
             range_ids=range_ids,
             task_ids=task_ids,
-            current_tau=current_tau,
         )
         hidden_states = residual + hidden_states
 
@@ -1750,12 +1566,10 @@ class LlamaModel(LlamaPreTrainedModel):
         unpadded_lengths: Optional[Tuple[torch.Tensor]] = None,
         seq_parallel_group: Optional[Any] = None,
         target_sparsity: Optional[float] = None,
-        current_tau: Optional[torch.Tensor] = None,
         segment_ids: Optional[torch.LongTensor] = None,
         range_ids: Optional[torch.LongTensor] = None,
         task_ids: Optional[torch.LongTensor] = None,
         erank_analysis_path: Optional[str] = None,
-        enable_contrastive_loss: bool = False,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         compute_sparsity = self.training
         # compute_sparsity = True
@@ -1834,7 +1648,6 @@ class LlamaModel(LlamaPreTrainedModel):
                     segment_ids=segment_ids,
                     range_ids=range_ids,
                     task_ids=task_ids,
-                    current_tau=current_tau,
                 )
             else:
                 layer_outputs = decoder_layer(
@@ -1849,22 +1662,23 @@ class LlamaModel(LlamaPreTrainedModel):
                     segment_ids=segment_ids,
                     range_ids=range_ids,
                     task_ids=task_ids,
-                    current_tau=current_tau,
                 )
 
             z_layer_sum, entropy, pooled_hidden_states, z_constrast, hidden_states = layer_outputs[0], layer_outputs[1], layer_outputs[2], layer_outputs[3], layer_outputs[4]
 
-            if compute_sparsity:
-                z_sum += z_layer_sum
-                head_entropy = (head_entropy + entropy) / 2
-            layer_z_sums.append(z_layer_sum)
-            layer_z_constrast.append(z_constrast)
-
+            z_layer_sum = z_layer_sum.to(hidden_states.device)
+            
+            if z_sum is None:
+                z_sum = z_layer_sum
+            else:
+                z_sum = z_sum.to(z_layer_sum.device)
+                z_sum = z_sum + z_layer_sum
+            
             if use_cache:
-                next_decoder_cache += (layer_outputs[5 if output_attentions else 4],)
+                next_decoder_cache += (layer_outputs[6 if output_attentions else 5],)
 
             if output_attentions:
-                all_self_attns += (layer_outputs[4],)
+                all_self_attns += (layer_outputs[5],)
 
         hidden_states = self.norm(hidden_states)
 
@@ -1873,81 +1687,8 @@ class LlamaModel(LlamaPreTrainedModel):
             all_hidden_states += (hidden_states,)
 
         next_cache = next_decoder_cache if use_cache else None
-        if compute_sparsity:
-            if (
-                seq_parallel_group is not None
-                and dist.is_initialized()
-                and dist.get_world_size(seq_parallel_group) > 1
-            ):
-                # Collect z_sum across GPUs in sequence parallel group (i.e., across all the heads during attention)
-                z_sums = [
-                    torch.zeros_like(z_sum)
-                    for _ in range(dist.get_world_size(seq_parallel_group))
-                ]
-                dist.all_gather(z_sums, z_sum, group=seq_parallel_group)
-                z_sum = sum(z_sums)
-
-                gathered_layer_z_sums = []
-                for z_l in layer_z_sums:
-                    tmp = [
-                        torch.zeros_like(z_l)
-                        for _ in range(dist.get_world_size(seq_parallel_group))
-                    ]
-                    dist.all_gather(tmp, z_l, group=seq_parallel_group)
-                    gathered_layer_z_sums.append(sum(tmp))
-                layer_z_sums = gathered_layer_z_sums
-
-            model_sparsity = 1 - (z_sum / self.total_num_heads)
-        else:
-            model_sparsity = None
-            z_loss = None
-        # print("Model sparsity:", model_sparsity.item() if model_sparsity is not None else None)
-        if compute_sparsity:
-            layerwise_model_sparsity = None
-            layerwise_target = None
-            layerwise_loss = None
-            if len(layer_z_sums) > 0:
-                per_layer_heads = self.config.num_attention_heads
-                layerwise_model_sparsity = (
-                    1.0 - torch.stack(layer_z_sums) / per_layer_heads
-                )  # (num_layers,)
-
-            if target_sparsity is None:
-                z_loss = None
-            else:
-                if self.config.enable_lambda_task:
-                    diff = (model_sparsity - target_sparsity)
-
-                    # per-sample lambda
-                    lambda1_per_sample = self.sparsity_lambda1_task[task_ids]   # [B]
-                    lambda2_per_sample = self.sparsity_lambda2_task[task_ids]   # [B]
-
-                    # per-sample loss
-                    per_sample_loss = (
-                        lambda1_per_sample * diff
-                        + lambda2_per_sample * diff.pow(2)
-                    )
-
-                    log_z_loss = per_sample_loss.detach()
-
-                    task_losses = []
-                    for task_id in range(self.num_tasks):
-                        mask = (task_ids == task_id)
-                        if mask.sum() > 0:
-                            task_losses.append(per_sample_loss[mask].mean())
-
-                    z_loss = torch.stack(task_losses).mean()
-                else:
-                    z_loss = (model_sparsity - target_sparsity).abs()
-                    log_z_loss = z_loss.detach()
-                    z_loss = z_loss.mean() 
-        else:
-            layerwise_model_sparsity = None
-            layerwise_target = None
-            layerwise_loss = None
-        if z_loss is not None:
-            z_loss = z_loss.sum()
-
+        model_sparsity = 1 - (z_sum / self.total_num_heads)
+        
         if not return_dict:
             # return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns, model_sparsity, target_sparsity, z_loss] if v is not None)
             return tuple(
@@ -1958,10 +1699,6 @@ class LlamaModel(LlamaPreTrainedModel):
                     all_hidden_states,
                     all_self_attns,
                     model_sparsity,
-                    target_sparsity,
-                    z_loss,
-                    self.sparsity_lambda1_task,
-                    self.sparsity_lambda2_task,
                 ]
                 if v is not None
             )
@@ -1970,15 +1707,7 @@ class LlamaModel(LlamaPreTrainedModel):
             past_key_values=next_cache,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
-            model_sparsity=model_sparsity,
-            target_sparsity=target_sparsity,
-            sparsity_loss=z_loss,
-            lambda1=self.sparsity_lambda1_task,
-            lambda2=self.sparsity_lambda2_task,
-            layerwise_model_sparsity=layerwise_model_sparsity,
-            layerwise_target_sparsity=layerwise_target,
-            log_z_loss=log_z_loss,
-            head_entropy=head_entropy,
+            model_sparsity=model_sparsity
         )
 
 
@@ -2014,6 +1743,8 @@ class KwargsForCausalLM(FlashAttentionKwargs, LossKwargs): ...
 
 class PawLlamaForCausalLM(LlamaPreTrainedModel):
     _tied_weights_keys = ["lm_head.weight"]
+    _tp_plan = {"lm_head": "colwise_rep"}
+    _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
     def __init__(
         self,
@@ -2027,7 +1758,7 @@ class PawLlamaForCausalLM(LlamaPreTrainedModel):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         self.logit_block_size = int(os.environ.get("LOGIT_BLOCK_SIZE", 16384))
-        self.enable_contrastive_loss = enable_contrastive_loss
+        self.prefill_sparsity = None
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -2118,7 +1849,6 @@ class PawLlamaForCausalLM(LlamaPreTrainedModel):
         shifted_labels: Optional[torch.LongTensor] = None,
         seq_parallel_group: Optional[Any] = None,
         target_sparsity: Optional[float] = None,
-        current_tau: Optional[torch.Tensor] = None,
         segment_ids: Optional[torch.LongTensor] = None,
         range_ids: Optional[torch.LongTensor] = None,
         task_ids: Optional[torch.LongTensor] = None,
@@ -2137,9 +1867,9 @@ class PawLlamaForCausalLM(LlamaPreTrainedModel):
         Example:
 
         ```python
-        >>> from transformers import AutoTokenizer, LlamaForCausalLM
+        >>> from transformers import AutoTokenizer, Qwen3ForCausalLM
 
-        >>> model = LlamaForCausalLM.from_pretrained(PATH_TO_CONVERTED_WEIGHTS)
+        >>> model = Qwen3ForCausalLM.from_pretrained(PATH_TO_CONVERTED_WEIGHTS)
         >>> tokenizer = AutoTokenizer.from_pretrained(PATH_TO_CONVERTED_TOKENIZER)
 
         >>> prompt = "Hey, are you conscious? Can you talk to me?"
@@ -2163,7 +1893,6 @@ class PawLlamaForCausalLM(LlamaPreTrainedModel):
         return_dict = (
             return_dict if return_dict is not None else self.config.use_return_dict
         )
-
         if seq_lengths is not None:
             if inputs_embeds is not None:
                 assert len(inputs_embeds.shape) == 2, (
@@ -2180,8 +1909,13 @@ class PawLlamaForCausalLM(LlamaPreTrainedModel):
                 "attention_mask should be None or all ones for `seq_lengths`"
             )
             assert not use_cache, "use_cache is not supported with `seq_lengths`"
-            max_seqlen = (seq_lengths[1:]-seq_lengths[:-1]).max().item()
-            unpadded_lengths = (seq_lengths, max_seqlen)
+
+            cu_seqlens = F.pad(
+                torch.cumsum(seq_lengths, dim=0, dtype=torch.torch.int32), (1, 0)
+            )
+            max_seqlen = seq_lengths.max().item()
+
+            unpadded_lengths = (cu_seqlens, max_seqlen)
         elif attention_mask is not None and not use_cache and attention_mask.size(0) != 1:
             if inputs_embeds is not None:
                 bsz = inputs_embeds.size(0)
@@ -2197,9 +1931,7 @@ class PawLlamaForCausalLM(LlamaPreTrainedModel):
             unpadded_lengths = (cu_seqlens, max_seqlen)
         else:
             unpadded_lengths = None
-
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-        # Use inference_mode during generation/prefill to avoid building graphs / caching many traces.
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -2213,15 +1945,15 @@ class PawLlamaForCausalLM(LlamaPreTrainedModel):
             unpadded_lengths=unpadded_lengths,
             seq_parallel_group=seq_parallel_group,
             target_sparsity=target_sparsity,
-            current_tau=current_tau,
             segment_ids=segment_ids,
             range_ids=range_ids,
             task_ids=task_ids,
-            enable_contrastive_loss=self.enable_contrastive_loss,
         )
 
+        if input_ids.shape[1] > 1 and use_cache:
+            self.prefill_sparsity = outputs.model_sparsity.detach()
+        
         hidden_states = outputs[0]
-
         if seq_lengths is None and unpadded_lengths is not None:
             hidden_states = pad_input(hidden_states, unpad_indices, bsz, max_seqlen_for_pad_seq)
         if labels is not None or shifted_labels is not None:
@@ -2268,7 +2000,7 @@ class PawLlamaForCausalLM(LlamaPreTrainedModel):
 
             logits = None
         else:
-            logits = self.lm_head(hidden_states)
+            logits = self.lm_head(hidden_states[:, -1:, :])
             loss = None
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -2281,15 +2013,6 @@ class PawLlamaForCausalLM(LlamaPreTrainedModel):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
             model_sparsity=outputs.model_sparsity,
-            target_sparsity=outputs.target_sparsity,
-            sparsity_loss=outputs.sparsity_loss,
-            lambda1=outputs.lambda1,
-            lambda2=outputs.lambda2,
-            layerwise_model_sparsity=outputs.layerwise_model_sparsity,
-            layerwise_target_sparsity=outputs.layerwise_target_sparsity,
-            task_ids=task_ids,
-            log_z_loss=outputs.log_z_loss,
-            head_entropy=outputs.head_entropy,
         )
 
     def prepare_inputs_for_generation(
@@ -2308,6 +2031,25 @@ class PawLlamaForCausalLM(LlamaPreTrainedModel):
             model_inputs = {"inputs_embeds": inputs_embeds}
         else:
             model_inputs = {"input_ids": input_ids}
+
+        # These are static or need special handling during generation
+        custom_keys = ["segment_ids", "range_ids", "task_ids"]
+        for key in custom_keys:
+            if key in kwargs:
+                value = kwargs[key]
+                # For segment_ids: may need to extend to match input_ids length (if generating)
+                if key == "segment_ids" and value is not None:
+                    # Extend segment_ids with answer segment ID (3) for new tokens
+                    if value.shape[1] < input_ids.shape[1]:
+                        pad_len = input_ids.shape[1] - value.shape[1]
+                        pad_seg = torch.full(
+                            (value.shape[0], pad_len),
+                            fill_value=3,  # answer segment ID (as in training)
+                            dtype=value.dtype,
+                            device=value.device,
+                        )
+                        value = torch.cat([value, pad_seg], dim=1)
+                model_inputs[key] = value
 
         model_inputs.update(
             {

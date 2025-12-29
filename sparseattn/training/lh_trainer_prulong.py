@@ -68,7 +68,7 @@ from transformers.utils import (
     is_sagemaker_mp_enabled,
 )
 from transformers.optimization import get_scheduler
-import swanlab
+
 
 if is_sagemaker_mp_enabled():
     import smdistributed.modelparallel.torch as smp  # type: ignore
@@ -107,101 +107,6 @@ OPTIMIZER_NAME = "optimizer.pt"
 OPTIMIZER_NAME_BIN = "optimizer.bin"
 SCHEDULER_NAME = "scheduler.pt"
 SCALER_NAME = "scaler.pt"
-
-from collections import defaultdict
-
-class SparsityAccumulator:
-    def __init__(self):
-        self.reset()
-
-    def reset(self):
-        # 记录标量累积 (loss, reg_loss, etc.)
-        self.scalars = defaultdict(float)
-        self.scalar_counts = defaultdict(int)
-        
-        # 记录任务特定指标 (task_name -> {sum, count})
-        self.task_metrics = defaultdict(lambda: {"sum_sparsity": 0.0, "sum_target": 0.0, "sum_z_loss": 0.0, "count": 0})
-
-    def add(self, scalars: dict, task_data: list):
-        """
-        纯本地累积，无分布式通信。
-        scalars: {"loss": val, "reg_loss": val...}
-        task_data: [(task_name, sparsity, target, z_loss), ...]
-        """
-        # 1. 累积全局标量
-        for k, v in scalars.items():
-            if v is not None:
-                # 确保转为 python float，避免显存占用
-                val = v.item() if isinstance(v, torch.Tensor) else v
-                self.scalars[k] += val
-                self.scalar_counts[k] += 1
-
-        # 2. 累积任务特定指标
-        for task_name, sp, tgt, z_loss in task_data:
-            # 同样确保转为 float
-            sp = sp.item() if isinstance(sp, torch.Tensor) else sp
-            tgt = tgt.item() if isinstance(tgt, torch.Tensor) else tgt
-            z_loss = z_loss.item() if isinstance(z_loss, torch.Tensor) else z_loss
-            
-            self.task_metrics[task_name]["sum_sparsity"] += sp
-            self.task_metrics[task_name]["sum_target"] += tgt
-            self.task_metrics[task_name]["sum_z_loss"] += z_loss
-            self.task_metrics[task_name]["count"] += 1
-
-    def compute_global_metrics(self, accelerator):
-        """
-        只在 Sync Step 调用一次。执行分布式聚合。
-        """
-        # --- 第一阶段：聚合标量 ---
-        # 我们需要聚合 Sum 和 Count，然后相除得到 Mean
-        # 为了简单，我们先在本地算好 Sum 和 Count，然后通过 all_gather_object 收集所有卡的数据
-        
-        local_data = {
-            "scalars": dict(self.scalars),
-            "scalar_counts": dict(self.scalar_counts),
-            "tasks": dict(self.task_metrics)
-        }
-        
-        # 收集所有 GPU 的累积数据
-        # gathered_data List[Dict] 长度为 World Size
-        gathered_data = [None for _ in range(dist.get_world_size())]
-        dist.all_gather_object(gathered_data, local_data)
-        
-        # --- 第二阶段：合并所有 GPU 的数据 ---
-        final_scalars = defaultdict(float)
-        final_scalar_counts = defaultdict(int)
-        final_tasks = defaultdict(lambda: {"sum_sparsity": 0.0, "sum_target": 0.0, "sum_z_loss": 0.0, "count": 0})
-        
-        for gpu_data in gathered_data:
-            # 合并标量
-            for k, v in gpu_data["scalars"].items():
-                final_scalars[k] += v
-                final_scalar_counts[k] += gpu_data["scalar_counts"][k]
-            
-            # 合并任务
-            for t_name, t_stats in gpu_data["tasks"].items():
-                final_tasks[t_name]["sum_sparsity"] += t_stats["sum_sparsity"]
-                final_tasks[t_name]["sum_target"] += t_stats["sum_target"]
-                final_tasks[t_name]["sum_z_loss"] += t_stats["sum_z_loss"]
-                final_tasks[t_name]["count"] += t_stats["count"]
-
-        # --- 第三阶段：计算最终平均值 ---
-        metrics = {}
-        
-        # 计算标量平均
-        for k in final_scalars:
-            if final_scalar_counts[k] > 0:
-                metrics[k] = final_scalars[k] / final_scalar_counts[k]
-                
-        # 计算任务平均
-        for t_name, t_stats in final_tasks.items():
-            if t_stats["count"] > 0:
-                cnt = t_stats["count"]
-                metrics[f"Spa-{t_name} sparsity"] = t_stats["sum_sparsity"] / cnt
-                metrics[f"Spa-{t_name} target_sparsity"] = t_stats["sum_target"] / cnt
-                metrics[f"Spa-{t_name} log_z_loss"] = t_stats["sum_z_loss"] / cnt
-                
-        return metrics
 
 
 class LogCallback(TrainerCallback):
@@ -376,12 +281,12 @@ class Trainer(HFTrainer):
         self.task_sparsity_config = {
             "default": {"start": self.start_head_sparsity, "end": self.end_head_sparsity},
             "Code": {"start": 0, "end": 0.5},
-            "In-Context Learning": {"start": 0, "end": 0.6},
+            "Math": {"start": 0, "end": 0.6},
             "MultiHop QA": {"start": 0, "end": 0.8},
             "Single QA": {"start": 0, "end": 0.8},
             "Summarization": {"start": 0, "end": 0.2},
         }
-        self.reverse_class_map = {0: 'Single QA', 1: 'MultiHop QA', 2: 'Summarization', 3: 'Code', 4:'In-Context Learning'}
+        self.reverse_class_map = {0: 'Single QA', 1: 'MultiHop QA', 2: 'Summarization', 3: 'Code'}
         self.use_softmax = args.use_softmax
         
         self.tau_max = 1.5  # 初始 tau
@@ -404,23 +309,36 @@ class Trainer(HFTrainer):
             self.add_callback(SIGUSR1Callback(self))
         except ValueError:
             logger.warning("Couldn't remove PrinterCallback")
-        
-        self.sparsity_accumulator = SparsityAccumulator()
 
-    def get_current_target_sparsity(self, global_step: int, tasks: List[str]) -> torch.Tensor:
-        """
-        Returns: torch.Tensor of shape [len(tasks)], device=cpu (will be moved later)
-        """
-        sparsities = []
-        for task in tasks:
-            cfg = self.task_sparsity_config.get(task, self.task_sparsity_config["default"])
-            start_sp = cfg["start"]
-            end_sp = cfg["end"]
+    # def get_current_target_sparsity(self, global_step: int, tasks: List[str]) -> torch.Tensor:
+    #     """
+    #     Returns: torch.Tensor of shape [len(tasks)], device=cpu (will be moved later)
+    #     """
+    #     sparsities = []
+    #     for task in tasks:
+    #         cfg = self.task_sparsity_config.get(task, self.task_sparsity_config["default"])
+    #         start_sp = cfg["start"]
+    #         end_sp = cfg["end"]
             
-            sp = end_sp
-            sparsities.append(sp)
+    #         sp = end_sp
+    #         sparsities.append(sp)
 
-        return torch.tensor(sparsities, dtype=torch.float32)  # shape: [B]
+    #     return torch.tensor(sparsities, dtype=torch.float32)  # shape: [B]
+    def get_current_target_sparsity(self, global_step):
+        if global_step < self.num_sparsity_warmup_steps:
+            if self.warmup_type == 'linear':
+                return (
+                    self.start_head_sparsity + 
+                    (self.end_head_sparsity - self.start_head_sparsity) * global_step / self.num_sparsity_warmup_steps
+                )
+            elif self.warmup_type == 'logarithmic':
+                log_one_minus_sparsity = math.log(1 - self.start_head_sparsity) + (math.log(1 - self.end_head_sparsity) - 
+                    math.log(1 - self.start_head_sparsity)) * global_step / self.num_sparsity_warmup_steps
+                return 1 - math.exp(log_one_minus_sparsity)
+            else:
+                raise ValueError(f'Unknown warmup type: {self.warmup_type}')
+        else:
+            return self.end_head_sparsity
     
     def get_current_tau(self, global_step: int) -> torch.Tensor:
         
@@ -439,7 +357,6 @@ class Trainer(HFTrainer):
         else:
             # 保持 0.2
             return torch.tensor(tau_min, dtype=torch.float32)
-        
     def get_sequence_parallel_inputs(self, inputs):
         """
         Args:
@@ -489,12 +406,18 @@ class Trainer(HFTrainer):
                 "shifted_labels": shifted_labels_chunks[seq_parallel_rank],  
                 "seq_lengths": global_seq_lengths,                   # Global
                 "seq_parallel_group": self.seq_parallel_group,
+                "range_ids": range_ids,
+                "task_type": task_type,
+                "task_ids": task_ids,
             }
         else:
             inputs = {
                 "input_ids": input_ids,             # Global [S]
                 "labels": labels,                   # Global [S]
+                "task_ids": task_ids,
+                "range_ids": range_ids,
                 "seq_lengths": global_seq_lengths,  # Global [Bi+1]
+                "task_type": task_type,
                 "seq_parallel_group": None
             }
 
@@ -513,39 +436,22 @@ class Trainer(HFTrainer):
 
         Subclass and override for custom behavior.
         """
-        breakpoint()
         inputs = self.get_sequence_parallel_inputs(inputs)
+        # tasks = inputs.get("task_type", ["default"] * inputs["range_ids"].size(0)) #[B]
+        tasks = ["default"]
+        # target_sparsity = self.get_current_target_sparsity(self.state.global_step, tasks)
+        target_sparsity = self.get_current_target_sparsity(self.state.global_step)
+        # target_sparsity = target_sparsity.to(model.device)  # [B]
+        current_tau = self.get_current_tau(self.state.global_step)
         
-        seq_lens_display = []
-        if "seq_lengths" in inputs and inputs["seq_lengths"] is not None:
-            # inputs["seq_lengths"] 是 cu_seqlens (e.g. [0, 512, 1024])
-            # 需要转为 list 并计算差值得到每个 sequence 的实际长度
-            cu_seqlens = inputs["seq_lengths"]
-            if isinstance(cu_seqlens, torch.Tensor):
-                cu_seqlens = cu_seqlens.tolist()
-            
-            if len(cu_seqlens) > 1:
-                seq_lens_display = [cu_seqlens[i+1] - cu_seqlens[i] for i in range(len(cu_seqlens)-1)]
-            else:
-                seq_lens_display = ["Unknown"]
-        else:
-            # Fallback: 如果不是 Packing 模式，长度就是 input_ids 的长度
-            seq_lens_display = [inputs["input_ids"].shape[0]]
+        # print(f"[Step {self.state.global_step} / Rank {dist.get_rank()}] Sample tasks: {tasks} → Target Sparsity: {[f'{s:.3f}' for s in target_sparsity.tolist()]}")
 
-        # 优化后的 Print
-        print(f"[Step {self.state.global_step} / Rank {dist.get_rank()}] "
-              f"Lens: {seq_lens_display} ")
-        
-        outputs = model(**inputs, use_cache=False)
-
+        # outputs = model(**inputs, use_cache=False, target_sparsity=target_sparsity, current_tau=current_tau)
+        outputs = model(**inputs, use_cache=False, target_sparsity=target_sparsity, current_tau=current_tau)
         lm_loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
-        # reg_loss = outputs["sparsity_loss"] if isinstance(outputs, dict) else outputs[-2]
-        
         # head_entropy = outputs["head_entropy"]
-        # model_sparsity = outputs["model_sparsity"] # [B] 或者是标量
-        # out_target_sparsity = outputs["target_sparsity"] # [B]
-        # log_z_loss = outputs['log_z_loss'] # [B]
-        # task_ids = outputs['task_ids'] # [B]
+        head_entropy = 0.0
+        target_sparsity = outputs["target_sparsity"]
         
         if getattr(self.args, "token_scaled_loss", False):
             seq_parallel_world_size = (
@@ -575,60 +481,172 @@ class Trainer(HFTrainer):
                 )  # moving avg
             lm_loss = lm_loss / self.state.avg_num_valid_tokens_per_device
 
-        loss = lm_loss
-       
+        reg_loss = outputs["sparsity_loss"] if isinstance(outputs, dict) else outputs[-2]
         
-        # A. 准备本地数据 (不进行 gather!)
-        # 提取当前微步(Micro-Step)的标量值
-        local_scalars = {
-            "loss": loss.detach(),
-            "lm_loss": lm_loss.detach(),
-        }
+        # gather_list = [
+        #     torch.zeros_like(reg_loss, device=reg_loss.device)
+        #     for _ in range(dist.get_world_size(group=self.seq_parallel_group))
+        # ]
+        # # detached gather —— 但保留本 rank 的梯度
+        # dist.all_gather(gather_list, reg_loss.detach())
+        # gather_list[dist.get_rank(group=self.seq_parallel_group)] = reg_loss
+        # reg_loss = sum(gather_list)
+        
+        loss = lm_loss + reg_loss
+       
+        model_sparsity = outputs["model_sparsity"]
+        
+        print(f"Rank {torch.distributed.get_rank() if torch.distributed.is_initialized() else 0}: "f"[Step {self.state.global_step}] Task={tasks} | model_sparsity={model_sparsity} | reg_loss={reg_loss}")
+        
+        task_ids = outputs['task_ids']
+        log_z_loss = outputs['log_z_loss']
+        task_sparsity_statistic = dict([(task_name, []) for task_name in self.reverse_class_map.values()])
+        task_sparsity_loss_statistic = dict([(task_name, []) for task_name in self.reverse_class_map.values()])
+        task_target_sparsity_statistic = dict([(task_name, []) for task_name in self.reverse_class_map.values()])
+        
+        # all gather task ids and model_sparsity
+        # distributed_log_z_loss = self.accelerator.gather(log_z_loss)
+        # distributed_task_ids = self.accelerator.gather(task_ids)
+        # distributed_model_sparsity = self.accelerator.gather(model_sparsity)
+        # distributed_target_sparsity = self.accelerator.gather(target_sparsity)
+        
+        distributed_log_z_loss = [None for _ in range(dist.get_world_size())]
+        distributed_task_ids = [None for _ in range(dist.get_world_size())]
+        distributed_model_sparsity = [None for _ in range(dist.get_world_size())]
+        distributed_target_sparsity = [None for _ in range(dist.get_world_size())]
+        dist.all_gather_object(distributed_log_z_loss, log_z_loss.cpu())
+        dist.all_gather_object(distributed_task_ids, task_ids.cpu())
+        dist.all_gather_object(distributed_model_sparsity, model_sparsity.cpu())
+        # dist.all_gather_object(distributed_target_sparsity, target_sparsity.cpu())
+        dist.all_gather_object(distributed_target_sparsity, target_sparsity)
+        # distributed_log_z_loss = torch.cat(distributed_log_z_loss)
+        # distributed_task_ids = torch.cat(distributed_task_ids)
+        # distributed_model_sparsity = torch.stack(distributed_model_sparsity)
+        # distributed_target_sparsity = torch.stack(distributed_target_sparsity)
+        
+        distributed_loss = self.accelerator.gather(loss).mean()
+        distributed_lm_loss = self.accelerator.gather(lm_loss).mean()
+        distributed_reg_loss = self.accelerator.gather(reg_loss).mean()
+        
 
-        # B. 准备任务特定数据 (Zip 并不是耗时操作)
-        # 注意：这里我们只处理本 GPU 上的数据，坚决不做 all_gather
-        local_task_data = []
+        if self.log_loss and self.accelerator.is_main_process:
+            model_sparsity = (
+                outputs["model_sparsity"] if isinstance(outputs, dict) else outputs[-3]
+            )
+            # Fetch diagnostics if present
+            lambda1 = (
+                outputs.get("lambda1", None) if isinstance(outputs, dict) else None
+            )
+            lambda2 = (
+                outputs.get("lambda2", None) if isinstance(outputs, dict) else None
+            )
 
-        # C. 加入累积器 (极快，纯内存操作)
-        self.sparsity_accumulator.add(local_scalars, local_task_data)
+            extra = []
+            if lambda1 is not None and lambda2 is not None:
+                extra.append(
+                    f"Lambda1: {lambda1} Lambda2: {lambda2}"
+                )
 
-        # D. 判断是否是 Global Step 的最后一步 (Sync Gradients)
-        # 只有在这一步，我们才进行昂贵的通信和日志打印
-        if self.accelerator.gradient_state.sync_gradients:
+            logger.info(
+                f"@ {self.state.global_step} | Loss: {distributed_loss} | LM Loss: {distributed_lm_loss} | Tau:{current_tau} | "
+                f"Reg Loss: {distributed_reg_loss} | Head Entropy: {head_entropy}"
+                + (" | " + " | ".join(extra) if len(extra) else "")
+            )
             
-            # 只有当需要记录日志时才计算 (step > 0 且满足配置)
-            if getattr(self.args, "log_train_sparsity_metrics", True):
+            # merged_list = [(distributed_log_z_loss[i], distributed_model_sparsity[i], distributed_target_sparsity[i]) for i in range(len(distributed_task_ids))]
+            
+            # for task_id, item in zip(distributed_task_ids, merged_list):
+            #     log_z_loss, task_sparsity, target_sparsity = item[0], item[1], item[2]
+            #     task_name = self.reverse_class_map[task_id.item()]
+
+            #     task_sparsity_statistic[task_name].append(task_sparsity)
+            #     task_sparsity_loss_statistic[task_name].append(log_z_loss)
+            #     task_target_sparsity_statistic[task_name].append(target_sparsity)
+
+            valid_tasks = []
+
+            # for task_name in task_sparsity_statistic.keys():
+            #     if len(task_sparsity_statistic[task_name]) == 0:
+            #         continue
+
+            #     task_sparsity_statistic[task_name] = (
+            #         torch.stack(task_sparsity_statistic[task_name]).mean().item()
+            #     )
+            #     task_sparsity_loss_statistic[task_name] = (
+            #         torch.stack(task_sparsity_loss_statistic[task_name]).mean().item()
+            #     )
+            #     task_target_sparsity_statistic[task_name] = (
+            #         torch.stack(task_target_sparsity_statistic[task_name]).mean().item()
+            #     )
+
+            #     valid_tasks.append(task_name)
+
+
+            
+            # new_task_sparsity_statistic = {
+            #     f"Spa-{task} sparsity": task_sparsity_statistic[task]
+            #     for task in valid_tasks
+            # }
+
+            # new_task_sparsity_loss_statistic = {
+            #     f"Spa-{task} log_z_loss": task_sparsity_loss_statistic[task]
+            #     for task in valid_tasks
+            # }
+
+            # new_task_target_sparsity_statistic = {
+            #     f"Spa-{task} target_sparsity": task_target_sparsity_statistic[task]
+            #     for task in valid_tasks
+            # }
+
+            
+            # for task_name in valid_tasks:
+            #     logger.info(
+            #         f"Statistic -> {task_name} | "
+            #         f"Sparsity: {task_sparsity_statistic[task_name]} | "
+            #         f"Target_Sparsity: {task_target_sparsity_statistic[task_name]} | "
+            #         f"z_loss: {task_sparsity_loss_statistic[task_name]}"
+            #     )
+
+
+            # del task_sparsity_statistic
+            # del task_sparsity_loss_statistic
+            # del task_target_sparsity_statistic
+
+            if (
+                not return_output_and_metrics
+                and getattr(self.args, "log_train_sparsity_metrics", True)
+                and self.state.global_step > 0
+            ):
+                train_metrics = {
+                    "lm_loss": float(
+                        distributed_lm_loss.detach().item()
+                        if isinstance(distributed_lm_loss, torch.Tensor)
+                        else distributed_lm_loss
+                    ),
+                    "reg_loss": float(
+                        distributed_reg_loss.detach().item()
+                        if isinstance(distributed_reg_loss, torch.Tensor)
+                        else distributed_reg_loss
+                    ),
+                    "loss": float(
+                        distributed_loss.detach().item() if isinstance(distributed_loss, torch.Tensor) else distributed_loss
+                    ),
+                    # "head_entropy": head_entropy.detach().item(),
+                    # "current_tau": current_tau.detach().item(),
+                    # "target_sparsity(avg)": distributed_target_sparsity.detach().float().mean().item(),
+                    # "model_sparsity(avg)": distributed_model_sparsity.detach().float().mean().item(),
+                    "step": self.state.global_step,
+                    "lambda1": lambda1.detach().item() if lambda1 is not None else None,
+                    "lambda2": lambda2.detach().item() if lambda2 is not None else None,
+                    # "lambda3 Summarization": lambda1[2].detach().item() if lambda1 is not None else None,
+                    # "lambda4 Code": lambda1[3].detach().item() if lambda1 is not None else None,
+                }
                 
-                # [Trigger Communication] 计算 Global Mean
-                # 这一步会发生 Block，但每 48 个微步才发生一次，开销可忽略
-                global_metrics = self.sparsity_accumulator.compute_global_metrics(self.accelerator)
+                # train_metrics.update(new_task_sparsity_statistic)
+                # train_metrics.update(new_task_sparsity_loss_statistic)
+                # train_metrics.update(new_task_target_sparsity_statistic)
                 
-                # 只有主进程负责打印
-                if self.accelerator.is_main_process:
-                    # 补充一些只需取最后一次值的指标
-                    global_metrics["step"] = self.state.global_step
-                    
-
-                    # --- 打印文本日志 ---
-                    logger.info(
-                        f"@ {self.state.global_step} | "
-                        f"Loss: {global_metrics.get('loss', 0):.4f} | "
-                        f"LM: {global_metrics.get('lm_loss', 0):.4f} | "
-                        f"Reg: {global_metrics.get('reg_loss', 0):.4f} | "
-                    )
-                    
-                    # --- 上传 SwanLab ---
-                    try:
-                        swanlab.log(global_metrics)
-                        import json
-                        logger.info(f"[Micro-Log] {json.dumps(global_metrics, ensure_ascii=False)}")
-                    except Exception:
-                        pass
-
-            # E. [重置累积器] 准备迎接下一个 Global Step
-            self.sparsity_accumulator.reset()
-
-        # =================================================================
+                self.log(train_metrics)
 
         if return_outputs:
             return (loss, outputs)
@@ -650,11 +668,10 @@ class Trainer(HFTrainer):
 
             optimizer_1_group = []  # params, non decay
             optimizer_2_group = []  # params, decay
-            optimizer_3_group = []  # mask params, decay (log_alpha)
-            optimizer_4_group = []  # reg params, decay (sparsity_lambda)
-            optimizer_5_group = []  # mask allocator params, decay
+            optimizer_3_group = []  # mask params, decay
+            optimizer_4_group = []  # reg params, decay
+            optimizer_5_group = []  # mask params, decay
             optimized_parameters = []
-
             for n, p in opt_model.named_parameters():
                 if not p.requires_grad:
                     continue
@@ -688,9 +705,9 @@ class Trainer(HFTrainer):
                     else:
                         optimizer_1_group.append(p)
                         optimized_parameters.append(n)
-
+                        
             optimizer_grouped_parameters = []
-
+            
             if not self.freeze_non_mask_parameters:
                 optimizer_grouped_parameters.append(
                     {
@@ -706,7 +723,7 @@ class Trainer(HFTrainer):
                         "lr": self.learning_rate,
                     }
                 )
-
+            
             if not self.freeze_mask_parameters:
                 optimizer_grouped_parameters.append(
                     {
@@ -730,20 +747,10 @@ class Trainer(HFTrainer):
                         "lr": self.mask_learning_rate,
                     }
                 )
-
-            # >>>>>>>>>> 新增：输出最终参与训练的参数名 <<<<<<<<<<
-            trainable_params = []
-            for n, p in opt_model.named_parameters():
-                if p.requires_grad:
-                    trainable_params.append(n)
-            logger.info("Final trainable parameters (requires_grad=True):")
-            for name in sorted(trainable_params):
-                logger.info(f"  - {name}")
-            # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
-
+            
             logger.info("optimizer_grouped_parameters -> optimized parameters")
             logger.info(optimized_parameters)
-
+            
             optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(
                 self.args, opt_model
             )
@@ -1549,57 +1556,3 @@ class Trainer(HFTrainer):
 
     def _fsdp_qlora_plugin_updates(self):
         pass  # This messes with autowrap policy
-    
-    
-    def get_batch_samples(self, epoch_iterator, num_batches, device):
-        batch_samples = []
-        num_items_in_batch = None
-        
-        # i=0
-        # while i<num_batches:
-        #     temp = next(epoch_iterator)
-        #     if temp['seq_lengths'][0,-1]%2 == 0:
-        #         batch_samples.append(temp)
-        #         i+=1
-                
-  
-        for _ in range(num_batches):
-            try:
-                batch_samples.append(next(epoch_iterator))
-            except StopIteration:
-                break
-
-        count_num_items_in_batch = (
-            len(batch_samples) > 0
-            and "labels" in batch_samples[0]
-            and (
-                # num_items_in_batch is passed to model forward
-                # https://github.com/huggingface/transformers/blob/v4.49.0/src/transformers/trainer.py#L3757
-                self.model_accepts_loss_kwargs
-                # num_items_in_batch is passed to compute_loss_func
-                # https://github.com/huggingface/transformers/blob/v4.49.0/src/transformers/trainer.py#L3773
-                or self.compute_loss_func is not None
-                # num_items_in_batch is also verified if (self.model_accepts_loss_kwargs or self.compute_loss_func)
-                # https://github.com/huggingface/transformers/blob/v4.49.0/src/transformers/trainer.py#L3790
-            )
-        )
-
-        if count_num_items_in_batch:
-            # For now we don't support object detection
-            try:
-                num_items_in_batch = sum([(batch["labels"].ne(-100)).sum() for batch in batch_samples])
-            except (TypeError, AttributeError):
-                pass
-
-        if num_items_in_batch is not None:
-            if self.args.average_tokens_across_devices:
-                num_items_in_batch = self.accelerator.gather(num_items_in_batch).sum()
-
-            if torch.is_tensor(num_items_in_batch):
-                num_items_in_batch = num_items_in_batch.to(device)
-
-                if self.args.n_gpu > 1 and num_items_in_batch.dim() == 0:
-                    # In the DataParallel case, convert the scalar tensor into a 1-dim tensor
-                    num_items_in_batch = num_items_in_batch.unsqueeze(0)
-
-        return batch_samples, num_items_in_batch
