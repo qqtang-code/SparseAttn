@@ -57,83 +57,25 @@ def get_task(metadata_str):
         return None
 
 def main():
-    model_path = "/data1/lcm_lab/qqt/SparseAttn/sparseattn/checkpoints/qwen3_parallel_steps20_seqlen32768/checkpoint-2"
+    model_path = "/data1/lcm_lab/qqt/SparseAttn/sparseattn/checkpoints/1.1router4steps266_full_streaming_64k_qwen3-4b_wfrozen/checkpoint-230"
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    
-    from datasets import Dataset as HFDataset
-    from sparseattn.training.dataset_batch import ParquetDataset
-
-    import pandas as pd
-    import ast
-    import numpy as np
-
-    # file_path = "/data2/lcm_lab/public_data/Longbench/all.parquet"
-    file_path = "/data2/public_data/qwen_mix_sft_64K2/all.parquet"
-
-    df = pd.read_parquet(file_path)
-
-    target_task = "Code"# Single QA, Summarization
-
-    df["task"] = df["metadata"].apply(get_task)
-
-    df_target = df[df["task"] == target_task]
-    
-    row = df_target.iloc[0]
-    prompt = row['question']
-    context = row['context']
-    answer = row['answer']
-    metadata = row['metadata']
-
-    dummy_data = {
-        "context": [""],
-        "question": [""],
-        "answer": [""],
-        "metadata": [""],
-    }
-    dummy_hf_dataset = HFDataset.from_dict(dummy_data)
-
-    dataset = ParquetDataset(
-        raw_dataset=dummy_hf_dataset,
-        tokenizer=tokenizer,
-        data_args=None,
-        max_seq_len=None,
-        is_training=False,
-    )
-
     model = load_sparse_model(model_path)
-
-    config = model.config
-
     model.eval()
-
-    fake_item = {
-        "context": "你好",                  
-        "question": "你是谁？",               
-        "answer": "",           
-        "metadata": metadata,# Single QA, Summarization
-    }
-
-    input_ids, labels, attention_mask, segment_ids, range_ids, class_id = dataset._build_sft_input_and_labels(
-        fake_item, tokenizer, max_seq_len=32768
-    )
-
-    actual_len = attention_mask.sum().item()  # number of non-pad tokens
-    input_ids = input_ids[:actual_len].unsqueeze(0).to(model.device)          # [1, L]
-    attention_mask = attention_mask[:actual_len].unsqueeze(0).to(model.device)  # [1, L]
+    
     sparsity = []
     
-    # longbench_prediction = "/data1/lcm_lab/sora/LOOM-Eval/benchmarks/General/LongBench/prediction/12.17sp3_templatesteps133_full_xattn_32k_qwen3-4b_no_qa_wfrozen_LongBench_noise_64k/multi_news.jsonl"
+    longbench_prediction = "/data1/lcm_lab/sora/loomeval/benchmarks/General/RULER/data/cwe_8192.jsonl"
     
-    # # 读取jsonl文件
-    # with open(longbench_prediction, 'r') as f:
-    #     data = [json.loads(line) for line in f]
-    # for i in range(len(data)):
-    #     input_ids = tokenizer.encode(data[i]["input_text"], return_tensors="pt").to(model.device)
-    #     attention_mask = torch.ones_like(input_ids).to(model.device)
-    #     actual_len = input_ids.shape[-1]
+    # 读取jsonl文件
+    with open(longbench_prediction, 'r') as f:
+        data = [json.loads(line) for line in f]
+    for i in range(len(data)):
+        input_ids = tokenizer.encode(data[i]["input"], return_tensors="pt").to(model.device)
+        attention_mask = torch.ones_like(input_ids).to(model.device)
+        actual_len = input_ids.shape[-1]
 
     model_inputs = {
         "input_ids": input_ids,

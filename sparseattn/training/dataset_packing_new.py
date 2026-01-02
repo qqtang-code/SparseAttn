@@ -417,11 +417,11 @@ if __name__ == "__main__":
         data_cache_dir="/data2/public_data/data_cache",
         per_device_max_tokens=65536,
         min_seq_len=1000,
-        suffix="qwen3-4b_new",
+        suffix="qwen3-8b_new",
     )
 
     # 3. 加载 Tokenizer
-    tokenizer = AutoTokenizer.from_pretrained("/data2/hf_models/Qwen3-4B", trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained("/data2/hf_models/Qwen3-8B", trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 

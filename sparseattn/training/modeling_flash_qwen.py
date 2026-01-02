@@ -643,26 +643,26 @@ class AttentionRouter(nn.Module):
         self.use_softmax = use_softmax
 
         self.cls_feat_extractor = nn.Sequential( 
-            nn.Linear(d_feature, 2 * d_feature),
+            nn.Linear(d_feature, 4 * d_feature),
             nn.SiLU(),
-            nn.Linear(2 * d_feature, d_feature),
+            nn.Linear(4 * d_feature, d_feature),
         )
         
         if self.use_softmax:
             logger.info("using softmax for attention router")
             self.cls_router_head_agnostic = nn.Sequential( 
-                nn.Linear(d_feature, 2 * d_feature),
+                nn.Linear(d_feature, 4 * d_feature),
                 nn.SiLU(),
-                nn.Linear(2 * d_feature, d_feature),
+                nn.Linear(4 * d_feature, d_feature),
                 nn.SiLU(),
                 nn.Linear(d_feature, 2),
             )
         else:
             logger.info("use sigmoid function for attention router")
             self.cls_router_head_agnostic = nn.Sequential( 
-                nn.Linear(d_feature, 2 * d_feature),
+                nn.Linear(d_feature, 4 * d_feature),
                 nn.SiLU(),
-                nn.Linear(2 * d_feature, d_feature),
+                nn.Linear(4 * d_feature, d_feature),
                 nn.SiLU(),
                 nn.Linear(d_feature, 1),
                 nn.LayerNorm([self.num_kv, 1], elementwise_affine=False)
@@ -766,7 +766,9 @@ class AttentionRouter(nn.Module):
                 z_soft = torch.sigmoid((binary_logits + g) / tau)
                 z_hard = (z_soft > 0.5).float()
                 z = z_hard + (z_soft - z_soft.detach())  # [B, H, 1]
-                entropy = -(z_soft * torch.log(z_soft + eps) + (1 - z_soft) * torch.log(1 - z_soft + eps))
+                # 修改：在 Heads 维度(dim=1)平均，保留 Batch 维度(dim=0)。最终 shape [B]
+                entropy_per_head = -(z_soft * torch.log(z_soft + eps)).sum(dim=-1)
+                entropy = entropy_per_head.mean(dim=1)
             else:
                 z_soft = F.softmax((binary_logits + g) / tau, dim=-1)
                 z_hard = torch.zeros_like(z_soft).scatter_(-1, z_soft.argmax(-1, keepdim=True), 1.0)
@@ -775,7 +777,9 @@ class AttentionRouter(nn.Module):
                 z_soft = z_soft[..., 1]
                 z_soft = z_soft.unsqueeze(-1)
                 z = z.unsqueeze(-1)
-                entropy = -(z_soft * torch.log(z_soft + eps)).sum(dim=-1).mean() 
+                # 修改：在 Heads 维度(dim=1)平均，保留 Batch 维度(dim=0)。最终 shape [B]
+                entropy_per_head = -(z_soft * torch.log(z_soft + eps)).sum(dim=-1)
+                entropy = entropy_per_head.mean(dim=1)
         else:
             # 推理阶段：直接根据 Logit 确定 (相当于 tau -> 0)
             # 或者也可以用 sigmoid(logit/tau) > 0.5，但在 deterministic 模式下 logit > 0 即可
@@ -795,7 +799,7 @@ class AttentionRouter(nn.Module):
             'hard_decisions': z_hard,
             'sparse_mask': z, # [B, H], 这是一个 STE Tensor
             'logits': binary_logits,
-            'entropy': entropy
+            'entropy': entropy # [B]
         }
         
     def _segment_pooling_single_batch(self, pooled_input: torch.Tensor, range_ids: torch.Tensor, segments: list) -> torch.Tensor:
@@ -878,6 +882,8 @@ class AttentionRouter(nn.Module):
             pooled_features_list.append(combined_feature)
 
         return torch.stack(pooled_features_list, dim=0) # [B, H, D]
+
+
 
 
 class Qwen3Attention(nn.Module):
@@ -1452,7 +1458,8 @@ class Qwen3Attention(nn.Module):
         attn_weights = None        
         # print(f"task id: {task_ids}, layer sparsity: {z.squeeze(-1).sum(dim=-1)}")
         # z: [B, H, 1] -> [B, H] -> [B]
-        return z_kv_batch.squeeze(-1).sum(dim=-1), entropy.mean(), pooled_hidden_states, z_constrast.squeeze(-1), attn_output, attn_weights, past_key_value
+        
+        return z_kv_batch.squeeze(-1).sum(dim=-1), entropy, pooled_hidden_states, z_constrast.squeeze(-1), attn_output, attn_weights, past_key_value
 
 
 class Qwen3DecoderLayer(nn.Module):
@@ -1838,6 +1845,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
             )
 
         # position_ids = None
+
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
@@ -1856,10 +1864,10 @@ class Qwen3Model(Qwen3PreTrainedModel):
         next_decoder_cache = () if use_cache else None
 
         z_sum = 0 if compute_sparsity else None
-
-        layer_z_sums = []  # 收集每层 z_sum 以计算逐层稀疏度
-        # all_pooled_hidden_states = []
-        head_entropy = 0 if compute_sparsity else None
+        layer_z_sums = []
+        
+        # 修改：用于收集每层每个样本的 entropy
+        all_layers_entropy = [] # List[Tensor[B]]
         layer_z_constrast = []
 
         for idx, decoder_layer in enumerate(self.layers):
@@ -1908,7 +1916,8 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
             if compute_sparsity:
                 z_sum += z_layer_sum
-                head_entropy = (head_entropy + entropy) / 2
+                # 修改：不再在这里做累积平均，而是收集起来
+                all_layers_entropy.append(entropy)
             layer_z_sums.append(z_layer_sum)
             layer_z_constrast.append(z_constrast)
 
@@ -1925,45 +1934,46 @@ class Qwen3Model(Qwen3PreTrainedModel):
             all_hidden_states += (hidden_states,)
 
         next_cache = next_decoder_cache if use_cache else None
-        
+
+        # 修改
+        head_entropy = None
         if compute_sparsity:
-            
-            # model_sparsity = 1 - (z_sum / self.total_num_heads)
+            # A. 计算该 GPU 上，整个模型的平均 Entropy (跨层平均)
+            # stack [L, B] -> mean(0) -> [B]
+            avg_sample_entropy = torch.stack(all_layers_entropy).mean(dim=0) 
+
+            # B. 处理 Sequence Parallel (SP)
+            # 因为 Router 只计算了 Local Heads 的平均值，我们需要通过 AllReduce 得到 Global Heads 的平均值
             if (
                 seq_parallel_group is not None
                 and dist.is_initialized()
                 and dist.get_world_size(seq_parallel_group) > 1
             ):
-                # Collect z_sum across GPUs in sequence parallel group (i.e., across all the heads during attention)
+                # Z_sum 是总数，直接 SUM
+                dist.all_reduce(z_sum, op=dist.ReduceOp.SUM, group=seq_parallel_group)
+                
+                # Entropy 是平均值，SUM 之后需要除以 SP Size
+                dist.all_reduce(avg_sample_entropy, op=dist.ReduceOp.SUM, group=seq_parallel_group)
+                avg_sample_entropy = avg_sample_entropy / dist.get_world_size(seq_parallel_group)
 
-                z_sums = [
-                    torch.zeros_like(z_sum)
-                    for _ in range(dist.get_world_size(seq_parallel_group))
-                ]
-                dist.all_gather(z_sums, z_sum, group=seq_parallel_group)
-                z_sum = sum(z_sums)
-
-                gathered_layer_z_sums = []
-                for z_l in layer_z_sums:
-                    tmp = [
-                        torch.zeros_like(z_l)
-                        for _ in range(dist.get_world_size(seq_parallel_group))
-                    ]
-                    dist.all_gather(tmp, z_l, group=seq_parallel_group)
-                    gathered_layer_z_sums.append(sum(tmp))
-                layer_z_sums = gathered_layer_z_sums
-
-            # 1. z_sum / H 表示full attn占所有head的比例
-            # 2. 1 - z_sum / H 表示当前模型稀疏度
+                if layer_z_sums:
+                    stacked_layer_z = torch.stack(layer_z_sums)
+                    dist.all_reduce(stacked_layer_z, op=dist.ReduceOp.SUM, group=seq_parallel_group)
+                    layer_z_sums = list(stacked_layer_z)
+                
+                # total_num_heads 是全局的总 Head 数，z_sum 现在也是全局的 Active Head 数
+            head_entropy = avg_sample_entropy
             model_sparsity = 1 - (z_sum / self.total_num_heads)
         else:
             model_sparsity = None
             z_loss = None
         
+
+        # print("Model sparsity:", model_sparsity.item() if model_sparsity is not None else None)
         if compute_sparsity:
             layerwise_model_sparsity = None
             layerwise_target = None
-
+            layerwise_loss = None
             if len(layer_z_sums) > 0:
                 per_layer_heads = self.config.num_attention_heads
                 layerwise_model_sparsity = (
@@ -1982,7 +1992,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
                     # per-sample loss
                     per_sample_loss = (
-                        lambda1_per_sample * diff
+                        lambda1_per_sample * diff.abs()
                         + lambda2_per_sample * diff.pow(2)
                     )
 
@@ -1998,14 +2008,14 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 else:
                     z_loss = (model_sparsity - target_sparsity).abs()
                     log_z_loss = z_loss.detach()
-                    z_loss = z_loss.mean() # 标量
+                    z_loss = z_loss.mean() 
         else:
             layerwise_model_sparsity = None
             layerwise_target = None
-        
+            layerwise_loss = None
         if z_loss is not None:
             z_loss = z_loss.sum()
-        
+
         if not return_dict:
             # return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns, model_sparsity, target_sparsity, z_loss] if v is not None)
             return tuple(

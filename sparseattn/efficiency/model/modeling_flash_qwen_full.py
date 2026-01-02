@@ -44,7 +44,7 @@ from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
-from flash_attn import flash_attn_kvpacked_func, flash_attn_varlen_kvpacked_func, flash_attn_func
+from flash_attn import flash_attn_kvpacked_func, flash_attn_varlen_kvpacked_func
 from flash_attn.bert_padding import unpad_input, pad_input
 import math
 
@@ -622,247 +622,6 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
-class AttentionRouter(nn.Module):
-    def __init__(self, input_dim, num_key_value_heads, d_feature=128,
-                 use_task_emb=False, temp=1.0, hard=False, 
-                 router_type='mlp', use_gumbel=True, learnable_temp=False,
-                 dropout=0.1, use_softmax=True, pooling_mode='ctx_q'):
-        super().__init__()
-        self.num_kv = num_key_value_heads
-        self.use_task_emb = use_task_emb
-        self.router_type = router_type
-        self.use_gumbel = use_gumbel
-        self.learnable_temp = learnable_temp
-        self.pooling_mode = pooling_mode
-        self.use_softmax = use_softmax
-
-        self.cls_feat_extractor = nn.Sequential( 
-            nn.Linear(d_feature, 4 * d_feature),
-            nn.SiLU(),
-            nn.Linear(4 * d_feature, d_feature),
-        )
-        
-        if self.use_softmax: 
-            self.cls_router_head_agnostic = nn.Sequential( 
-                nn.Linear(d_feature, 4 * d_feature),
-                nn.SiLU(),
-                nn.Linear(4 * d_feature, d_feature),
-                nn.SiLU(),
-                nn.Linear(d_feature, 2),
-            )
-        else:
-            self.cls_router_head_agnostic = nn.Sequential( 
-                nn.Linear(d_feature, 2 * d_feature),
-                nn.SiLU(),
-                nn.Linear(2 * d_feature, d_feature),
-                nn.SiLU(),
-                nn.Linear(d_feature, 1),
-                nn.LayerNorm([self.num_kv, 1], elementwise_affine=False)
-            )
-        
-        if self.use_task_emb:
-            self.task_embedding = nn.Embedding(4, d_feature)
-
-        # ---- learnable temperature ----
-        if learnable_temp:
-            self.log_temp = nn.Parameter(torch.log(torch.tensor(temp)))
-        else:
-            self.tau = temp
-    
-    def reset_parameters(self):
-        nn.init.kaiming_uniform_(self.cls_router_head_agnostic[0].weight, a=math.sqrt(5))
-        nn.init.zeros_(self.cls_router_head_agnostic[0].bias)
-        
-        nn.init.kaiming_uniform_(self.cls_router_head_agnostic[2].weight, a=math.sqrt(5))
-        nn.init.zeros_(self.cls_router_head_agnostic[2].bias)
-
-        nn.init.zeros_(self.cls_router_head_agnostic[4].weight)
-        nn.init.constant_(self.cls_router_head_agnostic[4].bias, 1.0)
-
-        
-    def forward(
-        self, 
-        x, 
-        cu_seq_len=None,
-        range_ids: torch.Tensor = None, 
-        task_ids: Optional[torch.Tensor] = None,
-        current_tau: Optional[torch.Tensor] = None,
-    ):
-        """
-        x: [cu_seq_len, H, D]
-        cu_seq_len: [0, seq_len_1, seq_len_2 + seq_len_1, ...]
-        range_ids: [B, 6]
-        task_ids: [B]
-        
-        return:
-            {
-              'decisions': [B, H],
-              'hard_decisions': [B, H, 2],
-              'sparse_mask': [B, H],
-              'logits': [B, H, 1]
-            }
-        """
-        bsz = (cu_seq_len.shape[0] - 1) if cu_seq_len is not None else 1
-        
-        if self.pooling_mode == 'first_token':
-            if cu_seq_len is not None:
-                pooled_latent = self._segment_pooling(
-                    x, range_ids, ['first_token'], cu_seq_len)  # [B, H, D]
-            else:
-                pooled_latent = self._segment_pooling_single_batch(
-                    x, range_ids, ['first_token'])
-        elif self.pooling_mode == 'q':
-            if cu_seq_len is not None:
-                pooled_latent = self._segment_pooling(
-                    x, range_ids, ['q'], cu_seq_len)  # [B, H, D]
-            else:
-                pooled_latent = self._segment_pooling_single_batch(
-                    x, range_ids, ['q'])
-        elif self.pooling_mode == 'ctx_q':
-            if cu_seq_len is not None:
-                B = cu_seq_len.shape[0] - 1
-                H, D = x.shape[1:]
-                sample_features = []
-                for i in range(B):
-                    x_s, x_e = cu_seq_len[i], cu_seq_len[i + 1]
-                    seg_slice = x[x_s:x_e]              # [Ti, H, D]
-                    seg_pooled = seg_slice.mean(dim=0)  # [H, D]
-                    sample_features.append(seg_pooled)
-
-                pooled_latent = torch.stack(sample_features, dim=0)
-            else:
-                target = torch.concat([x[:,:100,:] , x[:,-100:,:]],dim=1).mean(dim=1)
-                pooled_latent = target  # [H, D]
-        else:
-            raise ValueError(f"Unknown pooling_mode: {self.pooling_mode}")
-        
-        if self.use_task_emb:
-            if self.training:
-                task_emb = self.task_embedding(task_ids) # [B, D]
-                task_emb_expanded = task_emb.unsqueeze(1) 
-                pooled_latent = pooled_latent + task_emb_expanded
-            else:
-                pooled_latent = pooled_latent
-                                
-        pooled_hidden_states = self.cls_feat_extractor(pooled_latent)
-
-        binary_logits = self.cls_router_head_agnostic(pooled_hidden_states)
-        
-        if self.learnable_temp:
-            tau = torch.exp(self.log_temp).clamp(0.3, 1.0)
-        else:
-            tau = current_tau if current_tau is not None else self.tau
-
-        u = torch.rand_like(binary_logits)
-        eps = 1e-8
-        g = -torch.log(-torch.log(u + eps) + eps)
-        
-        if not self.use_softmax:
-            z_soft = torch.sigmoid((binary_logits + g) / tau)
-            z_hard = (z_soft > 0.5).float()
-            z = z_hard + (z_soft - z_soft.detach())  # [B, H, 1]
-            entropy = -(z_soft * torch.log(z_soft + eps) + (1 - z_soft) * torch.log(1 - z_soft + eps))
-        else:
-            z_soft = F.softmax(binary_logits, dim=-1)
-            z_hard = torch.zeros_like(z_soft).scatter_(-1, z_soft.argmax(-1, keepdim=True), 1.0)
-            z = z_hard + (z_soft - z_soft.detach())  # [B, H, 2]
-            z = z[..., 1]  # [B, H]
-            z_soft = z_soft[..., 1]
-            z_soft = z_soft.unsqueeze(-1)
-            z = z.unsqueeze(-1)
-            entropy = -(z_soft * torch.log(z_soft + eps)).sum(dim=-1).mean() 
-        
-        return {
-            'pooled_hidden_states': pooled_hidden_states, # [B, H, D]
-            'decisions': z_soft,
-            'hard_decisions': z_hard,
-            'sparse_mask': z, # [B, H], 这是一个 STE Tensor
-            'logits': binary_logits,
-            'entropy': entropy
-        }
-        
-    def _segment_pooling_single_batch(self, pooled_input: torch.Tensor, range_ids: torch.Tensor, segments: list) -> torch.Tensor:
-        B, S, H, D = pooled_input.shape
-        pooled_features_list = []
-        
-        POOL_MAP = {'first_token': (0, 1),'ctx': (2, 3), 'q': (4, 5), 'a': (6, 7), 'ctx_q': (2, 5)} 
-        for i in range(B):
-            sample_features = []
-
-            for seg in segments:
-                start_idx, end_idx = POOL_MAP[seg]
-                start, end = range_ids[i, start_idx:end_idx + 1].tolist()[0], range_ids[i, start_idx:end_idx + 1].tolist()[-1]
-                if end >= start:
-                    # seg_slice = pooled_input[i, start : end + 1, :, :]
-                    start_slice = pooled_input[i, start : start + 100, :, :]
-                    end_slice = pooled_input[i, end - 100 : end + 1, :, :]
-                    combined_slice = torch.cat((start_slice, end_slice), dim=0)
-                    seg_pooled = combined_slice.mean(dim=0)  # [H, D]
-                else:
-                    seg_pooled = torch.zeros(H, D, device=pooled_input.device)
-                
-                sample_features.append(seg_pooled)
-
-            if sample_features:
-                combined_feature = torch.stack(sample_features, dim=0).mean(dim=0) # [H, D]
-            else:
-                combined_feature = torch.zeros(H, D, device=pooled_input.device)
-                
-            pooled_features_list.append(combined_feature)
-
-        return torch.stack(pooled_features_list, dim=0) # [B, H, D]
-        
-        
-    def _segment_pooling(
-        self, 
-        x: torch.Tensor, 
-        range_ids: torch.Tensor, 
-        segments: list[str],
-        cu_seq_len: torch.Tensor,
-    ) -> torch.Tensor:
-        """_summary_
-
-        Args:
-            x (torch.Tensor): [cu_seqlen, H, D]
-            range_ids (torch.Tensor): _description_
-            segments (list[str]): _description_
-            cu_seq_len (torch.Tensor): _description_
-
-        Returns:
-            torch.Tensor: _description_
-        """
-        POOL_MAP = {'first_token': (0, 1),'ctx': (2, 3), 'q': (4, 5), 'a': (6, 7), 'ctx_q': (2, 5)} 
-        
-        B = cu_seq_len.shape[0] - 1
-        H, D = x.shape[1:]
-        pooled_features_list = []
-        
-        for i in range(B):
-            sample_features = []
-            x_s, x_e = cu_seq_len[i], cu_seq_len[i + 1]
-            for seg in segments:
-                start_idx, end_idx = POOL_MAP[seg]
-                start, end = range_ids[i, start_idx:end_idx + 1].tolist()[0], range_ids[i, start_idx:end_idx + 1].tolist()[-1]
-
-                if end >= start:
-                    start_slice = pooled_input[i, start : start + 100, :, :]
-                    end_slice = pooled_input[i, end - 99 : end + 1, :, :]
-                    combined_slice = torch.cat((start_slice, end_slice), dim=0)
-                    seg_pooled = combined_slice.mean(dim=0)  # [H, D]
-                else:
-                    seg_pooled = torch.zeros(H, D, device=x.device)
-                
-                sample_features.append(seg_pooled)
-
-            if sample_features:
-                combined_feature = torch.stack(sample_features, dim=0).mean(dim=0) # [H, D]
-            else:
-                combined_feature = torch.zeros(H, D, device=x.device)
-                
-            pooled_features_list.append(combined_feature)
-
-        return torch.stack(pooled_features_list, dim=0) # [B, H, D]
-
 
 class Qwen3Attention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -930,23 +689,10 @@ class Qwen3Attention(nn.Module):
         )  # sigmoid(4.5) ≈ 0.989
         self.threshold_for_deterministic = None
 
-        self.mask_allocator = AttentionRouter(
-            input_dim=self.hidden_size,
-            num_key_value_heads=self.num_key_value_heads,
-            # head_dim = self.head_dim,
-            d_feature=self.head_dim,
-            use_task_emb=getattr(config, "use_task_emb_for_mask", False),
-            temp=getattr(config, "mask_temp", 1.0),
-            hard=getattr(config, "mask_hard_sample", False),
-            pooling_mode=getattr(config, "pooling_mode", "first_token"),
-            use_softmax=getattr(config, "use_softmax", False)
-        )
 
         self.context_window_toggle = context_window_toggle
 
         self.toggle_type = config.toggle_type
-        self.sink_num = config.sink_size
-        self.local_window_size = config.local_window_size
         self.sink_blocks = (config.sink_size + 127) // 128
         self.local_blocks = (config.local_window_size + 127) // 128
         
@@ -1092,29 +838,6 @@ class Qwen3Attention(nn.Module):
         v = self.v_proj(hidden_states).view(hidden_shape)
         has_layer_past = past_key_value is not None
         
-        if not has_layer_past:
-            if not self.config.enable_ada_sparsity:
-                z_kv = get_mask(
-                    self.attn_mask_log_alphas,
-                    training=self.training,
-                    threshold_for_deterministic=self.threshold_for_deterministic,
-                )  # (num_key_value_heads,)
-                # Next: expand z_kv to (num_key_value_heads, num_key_value_groups) and then flatten it to (num_heads)
-                z = z_kv.unsqueeze(-1).expand(-1, self.num_key_value_groups).reshape(-1)
-            else:
-                if unpadded_lengths is not None:
-                    res = self.mask_allocator(k, unpadded_lengths[0], range_ids, task_ids)
-                else:
-                    res = self.mask_allocator(k, None, range_ids, task_ids)
-                
-                z_kv_batch, entropy, pooled_hidden_states = res['sparse_mask'], res['entropy'], res['pooled_hidden_states']
-                z_constrast = res['decisions']
-
-                if z_kv_batch.shape[-2] == self.num_key_value_heads:
-                    z_kv_batch = z_kv_batch.repeat_interleave(self.num_key_value_groups, 1)
-        else:
-            # decode
-            z_kv_batch = past_key_value[2]
 
         if has_layer_past:
             past_kv = past_key_value[0]
@@ -1152,7 +875,7 @@ class Qwen3Attention(nn.Module):
             kv = past_kv[:, :new_len]
         else:
             past_kv = kv
-        past_key_value = (past_kv, past_len + q.size(1), z_kv_batch) if use_cache else None
+        past_key_value = (past_kv, past_len + q.size(1)) if use_cache else None
              
         if not has_layer_past:
 
@@ -1196,28 +919,9 @@ class Qwen3Attention(nn.Module):
                 unpadded_lengths = (cu_seqlens, max_seqlen)
 
                 cu_seqlens, max_seqlen = unpadded_lengths
-                if self.retrieval_mode == "full" and self.toggle_type == "xattn":
-                    head_mask_type = (1 - z_kv_batch[0, :, 0]).int()
-                elif self.retrieval_mode == "full" and self.toggle_type == "streaming":
-                    head_mask_type = torch.where(
-                        z_kv_batch[0, :, 0] == 1,
-                        torch.tensor(0, dtype=torch.int, device=z_kv_batch.device),
-                        torch.tensor(-1, dtype=torch.int, device=z_kv_batch.device)
-                    )
-                elif self.retrieval_mode == "xattn" and self.toggle_type == "streaming":
-                    head_mask_type = torch.where(
-                        z_kv_batch[0, :, 0] == 1,
-                        torch.tensor(1, dtype=torch.int, device=z_kv_batch.device),
-                        torch.tensor(-1, dtype=torch.int, device=z_kv_batch.device)
-                    )
-                elif self.retrieval_mode == "xattn" and self.toggle_type == "xattn":
-                    head_mask_type = torch.ones_like(z_kv_batch[0, :, 0], dtype=torch.int)
-                elif self.retrieval_mode == "full" and self.toggle_type == "full":
-                    head_mask_type = 1 - torch.ones_like(z_kv_batch[0, :, 0], dtype=torch.int)
-                else:
-                    raise SamplerConditionError(
-                        f"retrieval_mode: {self.retrieval_mode} and toggle_type: {self.toggle_type} is not supported"
-                    )
+                
+                head_mask_type = torch.zeros
+                
                 attn_output = Xattention_prefill_dim4(
                     q,
                     k,
@@ -1232,45 +936,33 @@ class Qwen3Attention(nn.Module):
                     local_num=self.local_blocks,
                 ).transpose(1, 2)  # B, T, H, D
         else:
-            # --- Decode ---
             if self.num_key_value_groups > 1:
                 kv = kv.repeat_interleave(self.num_key_value_groups, dim=-2)
-            # z_kv_batch shape: [B, H, 1]
-            head_mask = z_kv_batch[0, :, 0] 
-            print(f"DEBUG: head_mask:{head_mask}")
-            sparse_head_indices = torch.where(head_mask == 0)[0]
-            full_head_indices = torch.where(head_mask == 1)[0]
-            
-            attn_output = torch.empty_like(q)
-            bsz, q_len, num_heads, head_dim = q.shape
+            if unpadded_lengths is not None:
+                # varlen, ignore padding tokens, efficient for large batch with many paddings
+                cu_seqlens, max_seqlen = unpadded_lengths
 
-            if len(sparse_head_indices) > 0:
-                q_sparse = q[:, :, sparse_head_indices, :]
-                k_sparse = kv[:, :, 0, sparse_head_indices, :] # [B, T, 2, H_sparse, D]
-                v_sparse = kv[:, :, 1, sparse_head_indices, :] # [B, T, 2, H_sparse, D]
-
-                attn_sparse = flash_attn_func(
-                    q_sparse, k_sparse, v_sparse,
-                    window_size=(self.sink_num, self.local_window_size),
+                attn_output = flash_attn_varlen_kvpacked_func(
+                    q,
+                    kv,
+                    cu_seqlens,
+                    cu_seqlens,
+                    max_seqlen,
+                    max_seqlen,
                     dropout_p=0.0,
                     softmax_scale=1.0 / self.norm_factor,
-                    causal=False,
+                    causal=True,
+                    return_attn_probs=False,
                 )
-                attn_output[:, :, sparse_head_indices, :] = attn_sparse
-
-            if len(full_head_indices) > 0:
-                q_full = q[:, :, full_head_indices, :]
-                k_full = kv[:, :, 0, full_head_indices, :]
-                v_full = kv[:, :, 1, full_head_indices, :]
-                
-                attn_full = flash_attn_func(
-                    q_full, k_full, v_full,
-                    window_size=(-1, -1),
+            else:
+                attn_output = flash_attn_kvpacked_func(
+                    q,
+                    kv,
                     dropout_p=0.0,
                     softmax_scale=1.0 / self.norm_factor,
-                    causal=False,
+                    causal=True,
+                    return_attn_probs=False,
                 )
-                attn_output[:, :, full_head_indices, :] = attn_full
         
         
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()

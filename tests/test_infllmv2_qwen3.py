@@ -51,18 +51,3 @@ generated_tokens = outputs[0][input_length:]
 # 解码生成的部分
 result = tokenizer.decode(generated_tokens, skip_special_tokens=True)
 print(result)
-
-
-
-# 检查词汇表大小
-print(f"Tokenizer vocab size: {tokenizer.vocab_size}")
-print(f"Model vocab size: {model.config.vocab_size}")
-
-# 检查是否有padding token
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = tokenizer.eos_token
-    print("Set pad_token to eos_token")
-    
-model_path = "/data2/hf_models/Qwen3-4B/"
-tokenizer = AutoTokenizer.from_pretrained(model_path)
-print(f"Tokenizer vocab size: {tokenizer.vocab_size}")

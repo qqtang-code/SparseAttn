@@ -1082,7 +1082,6 @@ class Qwen3Attention(nn.Module):
             mean=4.5, std=0.01
         )  # sigmoid(4.5) ≈ 0.989
         self.threshold_for_deterministic = None
-        breakpoint()
         self.mask_allocator = AttentionRouter(
             input_dim=self.hidden_size,
             num_key_value_heads=self.num_key_value_heads,
@@ -1847,7 +1846,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
         self.sparsity_lambda_2 = nn.Parameter(torch.tensor([0.0], dtype=self._dtype))
         
         if self.config.enable_lambda_task:
-            self.num_tasks = 4
+            self.num_tasks = 5
             self.sparsity_lambda1_task = nn.Parameter(
                 torch.zeros(self.num_tasks, dtype=self._dtype)
             )
@@ -2169,7 +2168,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
                     # per-sample loss
                     per_sample_loss = (
-                        lambda1_per_sample * diff
+                        lambda1_per_sample * diff.abs()
                         + lambda2_per_sample * diff.pow(2)
                     )
 

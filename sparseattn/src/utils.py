@@ -1,6 +1,5 @@
 import torch
 
-
 def create_causal_mask(batch_size, head_num, block_size, block_num, divide_block_num):
     """
     Creates a causal attention mask used in transformer-based models.
@@ -185,6 +184,7 @@ def find_blocks_chunked(
     else:
         raise NotImplementedError("block num chunk prefill not impleted")
 
+    # breakpoint()
     try:
         if causal:
             assert (~mask[:, :, :, current_index + chunk_num :]).all()

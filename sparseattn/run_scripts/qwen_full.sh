@@ -2,7 +2,7 @@
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 # Model and training configuration
 model=${MODEL:-"/data2/hf_models/Qwen3-4B"}
-bsz=${BSZ:-48}
+bsz=${BSZ:-8}
 seq=${SEQ:-1}
 lr=${LR:-1e-5}
 steps=${STEPS:-50}
@@ -58,7 +58,7 @@ erank_analysis_path="/"
 # Dataset configuration
 dataset=${DATASET:-"/data2/public_data/qwen_ruler_64k"}
 dataset_cache_dir="/data2/public_data/data_cache"
-# dataset=${DATASET:-"/data1/public_data/Pre_filter"}
+suffix=${SUFFIX:-"qwen3-4b"}
 task_type="sft" # pretrain or sft
 
 pooling_mode="ctx_q" # first_token,mean_all,ctx,q,ctx_q
@@ -67,8 +67,6 @@ use_task_emb_for_mask=false
 enable_lambda_task=false
 use_softmax=true
 
-# Create run name
-suffix=${SUFFIX:-"qwen3-4b_full_ruler"}
 extra_name="seqlen${max_toks}"
 
 if [[ $freeze_weights == "true" ]]; then
@@ -145,7 +143,7 @@ export SWANLAB_MODE="cloud"
 export TOKENIZERS_PARALLELISM=true
 export LOGIT_BLOCK_SIZE=2048
 
-suffix=${SUFFIX:-"qwen3-4b"}
+
 # Training arguments
 base_arguments=(
     --suffix $suffix

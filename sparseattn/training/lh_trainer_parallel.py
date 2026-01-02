@@ -110,8 +110,6 @@ SCALER_NAME = "scaler.pt"
 
 from collections import defaultdict
 
-from collections import defaultdict
-
 class SparsityAccumulator:
     def __init__(self):
         # 新增：持久化存储，用于跨 Step 记忆各个任务的最后指标
@@ -123,10 +121,10 @@ class SparsityAccumulator:
         # 记录标量累积 (loss, reg_loss, etc.)
         self.scalars = defaultdict(float)
         self.scalar_counts = defaultdict(int)
-
+        
         # 记录任务特定指标 (task_name -> {sum, count})
         self.task_metrics = defaultdict(lambda: {"sum_sparsity": 0.0, "sum_target": 0.0, "sum_z_loss": 0.0, "count": 0})
-
+        
         # 注意：这里千万不要重置 self.last_known_metrics
 
     def add(self, scalars: dict, task_data: list):
@@ -149,7 +147,7 @@ class SparsityAccumulator:
             sp = sp.item() if isinstance(sp, torch.Tensor) else sp
             tgt = tgt.item() if isinstance(tgt, torch.Tensor) else tgt
             z_loss = z_loss.item() if isinstance(z_loss, torch.Tensor) else z_loss
-
+            
             self.task_metrics[task_name]["sum_sparsity"] += sp
             self.task_metrics[task_name]["sum_target"] += tgt
             self.task_metrics[task_name]["sum_z_loss"] += z_loss
@@ -165,22 +163,22 @@ class SparsityAccumulator:
             "scalar_counts": dict(self.scalar_counts),
             "tasks": dict(self.task_metrics)
         }
-
+        
         # 收集所有 GPU 的累积数据
         gathered_data = [None for _ in range(dist.get_world_size())]
         dist.all_gather_object(gathered_data, local_data)
-
+        
         # --- 第二阶段：合并所有 GPU 的数据 ---
         final_scalars = defaultdict(float)
         final_scalar_counts = defaultdict(int)
         final_tasks = defaultdict(lambda: {"sum_sparsity": 0.0, "sum_target": 0.0, "sum_z_loss": 0.0, "count": 0})
-
+        
         for gpu_data in gathered_data:
             # 合并标量
             for k, v in gpu_data["scalars"].items():
                 final_scalars[k] += v
                 final_scalar_counts[k] += gpu_data["scalar_counts"][k]
-
+            
             # 合并任务
             for t_name, t_stats in gpu_data["tasks"].items():
                 final_tasks[t_name]["sum_sparsity"] += t_stats["sum_sparsity"]
@@ -190,12 +188,12 @@ class SparsityAccumulator:
 
         # --- 第三阶段：计算当前 Step 的平均值 ---
         metrics = {}
-
+        
         # 计算标量平均
         for k in final_scalars:
             if final_scalar_counts[k] > 0:
                 metrics[k] = final_scalars[k] / final_scalar_counts[k]
-
+                
         # 计算任务平均
         for t_name, t_stats in final_tasks.items():
             if t_stats["count"] > 0:
@@ -209,7 +207,7 @@ class SparsityAccumulator:
                 v_sp = t_stats["sum_sparsity"] / cnt
                 v_tgt = t_stats["sum_target"] / cnt
                 v_z = t_stats["sum_z_loss"] / cnt
-
+                
                 # 放入 metrics
                 metrics[k_sp] = v_sp
                 metrics[k_tgt] = v_tgt
@@ -220,6 +218,13 @@ class SparsityAccumulator:
                 self.last_known_metrics[k_tgt] = v_tgt
                 self.last_known_metrics[k_z] = v_z
 
+        # --- 第四阶段：前向填充 (Forward Filling) ---
+        # 遍历记忆中的所有 Key，如果当前 metrics 里没有，就补上上次的值
+        for k, v in self.last_known_metrics.items():
+            if k not in metrics:
+                metrics[k] = v
+                
+        return metrics
 
 class LogCallback(TrainerCallback):
     def __init__(self, *args, **kwargs):
@@ -374,10 +379,38 @@ def min_lr_bound(
 
 # - Callbacks: transformers.trainer_callback.DefaultFlowCallback, transformers.integrations.WandbCallback, transformers.trainer_callback.ProgressCallback
 class Trainer(HFTrainer):
-    def __init__(self, model, args, *more_args, **kwargs):
+    def __init__(self, 
+        model=None, 
+        args=None, 
+        data_collator=None, 
+        train_dataset=None, 
+        eval_dataset=None, 
+        tokenizer=None, 
+        model_init=None, 
+        compute_metrics=None, 
+        callbacks=None, 
+        optimizers=(None, None), 
+        preprocess_logits_for_metrics=None,
+        **kwargs):
+        # 1. 安全地提取自定义参数，并不再传给父类
         self.log_loss = kwargs.pop("log_loss", False)
 
-        super().__init__(model, args, *more_args, **kwargs)
+        # 2. 显式调用父类初始化，明确指定关键参数 (特别是 tokenizer)
+        # 这样可以防止 log_loss 或其他参数被误识别为 processing_class
+        super().__init__(
+            model=model,
+            args=args,
+            data_collator=data_collator,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            tokenizer=tokenizer,
+            model_init=model_init,
+            compute_metrics=compute_metrics,
+            callbacks=callbacks,
+            optimizers=optimizers,
+            preprocess_logits_for_metrics=preprocess_logits_for_metrics,
+            **kwargs
+        )
         self.start_head_sparsity = args.start_head_sparsity
         self.end_head_sparsity = args.end_head_sparsity
         self.learning_rate = args.learning_rate
@@ -603,7 +636,7 @@ class Trainer(HFTrainer):
                 )  # moving avg
             lm_loss = lm_loss / self.state.avg_num_valid_tokens_per_device
 
-        loss = lm_loss + 10 * reg_loss
+        loss = lm_loss + reg_loss
        
         
         # A. 准备本地数据 (不进行 gather!)

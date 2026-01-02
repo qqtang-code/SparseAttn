@@ -24,7 +24,8 @@ from .lh_trainer import Trainer
 # from .lh_trainer_nsa import Trainer as NSATrainer
 
 
-from .dataset_packing import DataArguments, build_packed_dataset
+from .dataset_packing import PackedDataArguments as DataArguments
+from .dataset_packing_new import build_packed_dataset
 from .dataset import logger as dataset_logger
 from .script_arguments import ScriptArguments, TrainingArguments
 
@@ -334,6 +335,7 @@ def main():
             script_args.tokenized_mds_train[0],  # FIXME: 这里只能传入一个文件，不支持多个文件传入
             tokenizer=tokenizer,
             data_args=data_args,
+            is_sft=False,
         )
         
         world_size = dist.get_world_size()

@@ -1,9 +1,9 @@
 # Model and training configuration
-model=${MODEL:-"/data2/hf_models/Qwen3-4B"}
+model=${MODEL:-"/data1/lcm_lab/qqt/SparseAttn/sparseattn/checkpoints/12.30tasklambdasteps266_full_streaming_64k_qwen3-4b_wfrozen/checkpoint-229"}
 bsz=${BSZ:-48}
 seq=${SEQ:-1}
 lr=${LR:-1e-5}
-steps=${STEPS:-266}
+steps=${STEPS:-100}
 save_steps=${SAVE:-100}
 save_total_limit=10
 warmup=${WARMUP:-0.2}
@@ -29,7 +29,7 @@ sparsity_warmup_ratio=${SPARSITY_WARMUP_RATIO:-0.0}
 disable_linear_reg_term=${DISABLE_LINEAR_REG_TERM:-false}
 # topk
 context_window_if_toggled=${CONTEXT_WINDOW_IF_TOGGLED:-2048}
-freeze_weights=${FREEZE_WEIGHTS:-true}
+freeze_weights=${FREEZE_WEIGHTS:-false}
 freeze_masks=${FREEZE_MASKS:-false}
 warmup_type=${WARMUP_TYPE:-"linear"}
 
@@ -59,12 +59,12 @@ task_type="sft" # pretrain or sft
 pooling_mode="ctx_q" # first_token,mean_all,ctx,q,ctx_q
 enable_contrastive_loss=false
 use_task_emb_for_mask=false
-enable_lambda_task=true
+enable_lambda_task=false
 use_softmax=true
 
 # Create run name
-suffix=${SUFFIX:-"1.1router4"}
-extra_name="full_streaming_64k_qwen3-4b"
+suffix=${SUFFIX:-"12.30tasklambda"}
+extra_name="full_streaming_64k_qwen3-4b_continue"
 # extra_name="debug_12.5"
 if [[ $freeze_weights == "true" ]]; then
     extra_name="${extra_name}_wfrozen"

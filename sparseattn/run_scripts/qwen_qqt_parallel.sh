@@ -1,16 +1,17 @@
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 # Model and training configuration
-model=${MODEL:-"/data2/hf_models/Qwen3-4B"}
+model=${MODEL:-"/data2/hf_models/Qwen3-8B"}
 bsz=${BSZ:-48}
 seq=${SEQ:-1}
 lr=${LR:-1e-5}
-steps=${STEPS:-266}
-save_steps=${SAVE:-100}
-save_total_limit=10
-warmup=${WARMUP:-0.2}
+steps=${STEPS:-200}
+save_steps=${SAVE:-50}
+save_total_limit=3
+warmup=${WARMUP:-0.3}
 
 overrides=${OVERRIDES:-""}
 min_lr_ratio=${MIN_LR_RATIO:-1e-7}
-seq_parallel_size=${SEQ_PARALLEL_SIZE:-1}
+seq_parallel_size=${SEQ_PARALLEL_SIZE:-2}
 
 # FSDP configuration
 # 0=Disable, 1=FULL_SHARD, 2=SHARD_GRAD_OP, 3=NO_SHARD, 4=HYBRID_SHARD, 5=HYBRID_SHARD_ZERO2
@@ -18,7 +19,8 @@ fsdp=${FSDP:-"5"}
 gc=${GC:-"1"}
 
 # PruLong-specific arguments
-max_toks=${MAX_TOKS:-65536}
+max_toks=${MAX_TOKS:-65536} # dataset_packing 中用于计算一个 batch 内最多有多少 tokens
+# max_toks=${MAX_TOKS:-131072}
 # max_toks=${MAX_TOKS:-32768}
 # max_toks=${MAX_TOKS:-256}
 start_head_sparsity=${START_HEAD_SPARSITY:-0.0}
@@ -29,7 +31,7 @@ sparsity_warmup_ratio=${SPARSITY_WARMUP_RATIO:-0.0}
 disable_linear_reg_term=${DISABLE_LINEAR_REG_TERM:-false}
 # topk
 context_window_if_toggled=${CONTEXT_WINDOW_IF_TOGGLED:-2048}
-freeze_weights=${FREEZE_WEIGHTS:-true}
+freeze_weights=${FREEZE_WEIGHTS:-false}
 freeze_masks=${FREEZE_MASKS:-false}
 warmup_type=${WARMUP_TYPE:-"linear"}
 
@@ -63,8 +65,8 @@ enable_lambda_task=true
 use_softmax=true
 
 # Create run name
-suffix=${SUFFIX:-"1.1router4"}
-extra_name="full_streaming_64k_qwen3-4b"
+suffix=${SUFFIX:-"12.31tasklambda"}
+extra_name="full_streaming_64k_qwen3-8b"
 # extra_name="debug_12.5"
 if [[ $freeze_weights == "true" ]]; then
     extra_name="${extra_name}_wfrozen"
@@ -73,11 +75,12 @@ if [[ $freeze_masks == "true" ]]; then
     extra_name="${extra_name}_mfrozen"
 fi
 
-run_name="${suffix}steps${steps}_${extra_name}"
+run_name="${suffix}_steps${steps}_${extra_name}"
 
 out_dir="checkpoints/$run_name"
 mkdir -p $out_dir
 nvidia-smi
+
 
 # Calculate GPU and node configuration
 if [ -z "$CUDA_VISIBLE_DEVICES" ]; then
@@ -103,7 +106,7 @@ if [ $num_nodes -gt 1 ]; then
     --rdzv-endpoint=$master_addr:56321 \
     --nnodes=$num_nodes \
     --nproc-per-node=$num_gpus \
-    -m training.lh_train_language_model"
+    -m training.lh_train_language_model_parallel"
 else
     master_port=$(comm -23 <(seq 49152 65535 | sort) <(ss -Htan | awk '{print $4}' | cut -d':' -f2 | sort -u) | shuf | head -n 1)
 
@@ -112,10 +115,21 @@ else
     --rdzv-endpoint=localhost:$master_port \
     --nnodes=1 \
     --nproc-per-node=$num_gpus \
-    -m training.lh_train_language_model"
+    -m training.lh_train_language_model_parallel"
 fi
 
-accu=$(($bsz / $seq / $num_gpus / $num_nodes))
+# Calculate Data Parallel Size
+# 如果 seq_parallel_size=8, num_gpus=8, 那么 dp_size=1 (相当于只有1个数据并行组)
+dp_size=$(($num_gpus / $seq_parallel_size))
+# 防止除0错误 (以防万一)
+if [ $dp_size -lt 1 ]; then dp_size=1; fi
+
+# 修正后的 Gradient Accumulation 计算
+# 全局 BSZ = micro_bsz * dp_size * accu
+# 所以 accu = global_bsz / micro_bsz / dp_size
+accu=$(($bsz / $seq / $dp_size))
+
+echo "SP_Size=${seq_parallel_size} DP_Size=${dp_size} -> Accumulation=${accu} (Target Global BS=${bsz})"
 # accu=1
 
 echo "num_nodes=${num_nodes} master_addr=${master_addr} master_port=${master_port} num_gpus=${num_gpus}"
@@ -128,7 +142,7 @@ export SWANLAB_MODE="cloud"
 export TOKENIZERS_PARALLELISM=true
 export LOGIT_BLOCK_SIZE=2048
 
-suffix=${SUFFIX:-"qwen3-4b_new"}
+suffix=${SUFFIX:-"qwen3-8b_new"}
 # Training arguments
 base_arguments=(
     --suffix $suffix
@@ -169,7 +183,7 @@ base_arguments=(
     --disable_tqdm true
     --use_fast_tokenizer false
     --remove_unused_columns false
-    --ddp_find_unused_parameters false
+    # --ddp_find_unused_parameters true  # 注意：一定要开，不然报错
 
     --cuda_empty_cache
 
@@ -215,6 +229,7 @@ base_arguments=(
     --layerwise_sparsity_power $layerwise_sparsity_power
     --layerwise_sparsity_weight $layerwise_sparsity_weight
     --erank_analysis_path $erank_analysis_path
+
 )
 
 # FSDP configuration
