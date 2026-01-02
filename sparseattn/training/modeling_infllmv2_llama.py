@@ -23,6 +23,7 @@ from typing import Callable, Optional, Tuple, Union
 import torch
 import torch.utils.checkpoint
 from torch import nn
+import torch.nn.functional as F
 
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache, StaticCache
@@ -59,6 +60,19 @@ if is_torch_flex_attn_available():
     from torch.nn.attention.flex_attention import BlockMask
 
     from transformers.integrations.flex_attention import make_flex_block_causal_mask
+
+try:
+    from flash_attn import flash_attn_func, flash_attn_varlen_func
+    from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
+    from infllm_v2 import (
+        infllmv2_attn_stage1,
+        infllmv2_attn_varlen_func,
+        infllmv2_attn_with_kvcache,
+        max_pooling_1d,
+        max_pooling_1d_varlen
+    )
+except:
+    pass
 
 
 logger = logging.get_logger(__name__)
@@ -653,7 +667,7 @@ class infllmv2_LlamaAttention(nn.Module):
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
-        return attn_output, attn_weights
+        return attn_output, None
     def _sparse_attention_forward(
             self, query_states, key_states, value_states, attention_mask, query_length, dropout=0.0, softmax_scale=None, no_rope_param=None, past_key_value=None
         ):
@@ -985,8 +999,6 @@ class infllmv2_LlamaDecoderLayer(nn.Module):
         self.mlp = LlamaMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        breakpoint()
-
     def forward(
         self,
         hidden_states: torch.Tensor,

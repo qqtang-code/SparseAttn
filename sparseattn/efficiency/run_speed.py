@@ -8,7 +8,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 # -----------------------------------------------------------------------------
 # 1. 统一模型加载器
 # -----------------------------------------------------------------------------
-def load_model(model_path):
+def load_model(model_path, is_sparse):
     print(f"\n📥 [System] Loading model from: {model_path} ...")
     config_path = f"{model_path}/config.json"
     if not os.path.exists(config_path):
@@ -21,26 +21,38 @@ def load_model(model_path):
     arch_name = archs[0] if archs else "Unknown"
     print(f"🏗️  [System] Detected architecture: {arch_name}")
 
-    # --- 自定义 Sparse 模型注册逻辑 ---
-    if "PawLlama" in arch_name:
-        from sparseattn.training.eval.modeling_flash_llama import (
-            PawLlamaForCausalLM, PawLlamaConfig
-        )
-        AutoModelForCausalLM.register(PawLlamaConfig, PawLlamaForCausalLM)
-        model_cls = PawLlamaForCausalLM
-        is_sparse = True
-    elif "PawQwen" in arch_name:
-        from sparseattn.efficiency.model.modeling_flash_qwen import (
-            PawQwen3ForCausalLM, PawQwen3Config
-        )
-        AutoModelForCausalLM.register(PawQwen3Config, PawQwen3ForCausalLM)
-        model_cls = PawQwen3ForCausalLM
-        is_sparse = True
+    if is_sparse:
+        # --- 自定义 Sparse 模型注册逻辑 ---
+        if "PawLlama" in arch_name:
+            from sparseattn.training.eval.modeling_flash_llama import (
+                PawLlamaForCausalLM, PawLlamaConfig
+            )
+            AutoModelForCausalLM.register(PawLlamaConfig, PawLlamaForCausalLM)
+            model_cls = PawLlamaForCausalLM
+        elif "PawQwen" in arch_name:
+            from sparseattn.efficiency.model.modeling_flash_qwen import (
+                PawQwen3ForCausalLM, PawQwen3Config
+            )
+            AutoModelForCausalLM.register(PawQwen3Config, PawQwen3ForCausalLM)
+            model_cls = PawQwen3ForCausalLM
+        # else:
+        #     # --- 标准 Full Attention 模型 (如 Qwen2/3) ---
+        #     print("ℹ️  [System] Loading as Standard (Full Attention) Model.")
+        #     model_cls = AutoModelForCausalLM
+        #     is_sparse = False
     else:
-        # --- 标准 Full Attention 模型 (如 Qwen2/3) ---
-        print("ℹ️  [System] Loading as Standard (Full Attention) Model.")
-        model_cls = AutoModelForCausalLM
-        is_sparse = False
+        if "PawLlama" in arch_name:
+            from sparseattn.training.eval.modeling_flash_llama import (
+                PawLlamaForCausalLM, PawLlamaConfig
+            )
+            AutoModelForCausalLM.register(PawLlamaConfig, PawLlamaForCausalLM)
+            model_cls = PawLlamaForCausalLM
+        elif "PawQwen" in arch_name:
+            from sparseattn.efficiency.model.modeling_flash_qwen_full import (
+                PawQwen3ForCausalLM, PawQwen3Config
+            )
+            AutoModelForCausalLM.register(PawQwen3Config, PawQwen3ForCausalLM)
+            model_cls = PawQwen3ForCausalLM
 
     model = model_cls.from_pretrained(
         model_path,
@@ -109,8 +121,9 @@ def evaluate_efficiency(model, input_ids, gen_len=10, is_sparse=False):
 # -----------------------------------------------------------------------------
 # 3. 批量测试执行器 (修改：截断逻辑)
 # -----------------------------------------------------------------------------
-def run_benchmark_suite(model_path, samples, tokenizer, gen_len=10, max_len=4096):
-    model, is_sparse = load_model(model_path)
+def run_benchmark_suite(model_path, samples, tokenizer, gen_len=10, max_len=4096,
+                        is_sparse=False):
+    model, is_sparse = load_model(model_path, is_sparse)
     results = []
     
     # Warmup
@@ -160,7 +173,7 @@ def main():
     
     data_path = "/data1/lcm_lab/sora/loomeval/benchmarks/General/RULER/data/niah_single_3_262144.jsonl"
     
-    num_samples = 5       # 测试样本数
+    num_samples = 1       # 测试样本数
     gen_len = 1          # 生成长度
     max_input_len = 64 * 1024 # 最大长度限制 (超过此长度将被截断)
     # ===========================================
@@ -182,13 +195,14 @@ def main():
         print("❌ Error: No data loaded.")
         return
 
-    # 2. 运行 Sparse 模型
-    print("🔹" * 20 + " PHASE 1: Benchmarking SPARSE Model " + "🔹" * 20)
-    sparse_results = run_benchmark_suite(sparse_model_path, raw_samples, tokenizer, gen_len, max_input_len)
+    
+    # 2. 运行 Full 模型
+    print("🔸" * 20 + " Benchmarking FULL Model " + "🔸" * 20)
+    full_results = run_benchmark_suite(full_model_path, raw_samples, tokenizer, gen_len, max_input_len, False)
 
-    # 3. 运行 Full 模型
-    print("🔸" * 20 + " PHASE 2: Benchmarking FULL Model " + "🔸" * 20)
-    full_results = run_benchmark_suite(full_model_path, raw_samples, tokenizer, gen_len, max_input_len)
+    # 3. 运行 Sparse 模型
+    print("🔹" * 20 + " Benchmarking SPARSE Model " + "🔹" * 20)
+    sparse_results = run_benchmark_suite(sparse_model_path, raw_samples, tokenizer, gen_len, max_input_len, True)
 
     # 4. 对比与汇总
     print("\n" + "📊" * 15 + " FINAL COMPARISON REPORT " + "📊" * 15)

@@ -838,6 +838,30 @@ class Qwen3Attention(nn.Module):
         v = self.v_proj(hidden_states).view(hidden_shape)
         has_layer_past = past_key_value is not None
         
+        bsz, kv_heads= k.shape[:2]
+        if not has_layer_past:
+            if not self.config.enable_ada_sparsity:
+                z_kv = get_mask(
+                    self.attn_mask_log_alphas,
+                    training=self.training,
+                    threshold_for_deterministic=self.threshold_for_deterministic,
+                )  # (num_key_value_heads,)
+                # Next: expand z_kv to (num_key_value_heads, num_key_value_groups) and then flatten it to (num_heads)
+                z = z_kv.unsqueeze(-1).expand(-1, self.num_key_value_groups).reshape(-1)
+            else:
+                # if unpadded_lengths is not None:
+                #     res = self.mask_allocator(k, unpadded_lengths[0], range_ids, task_ids)
+                # else:
+                #     res = self.mask_allocator(k, None, range_ids, task_ids)
+                
+                z_kv_batch = torch.zeros(bsz, kv_heads, 1, device=q.device)
+                # z_constrast = res['decisions']
+
+                if z_kv_batch.shape[-2] == self.num_key_value_heads:
+                    z_kv_batch = z_kv_batch.repeat_interleave(self.num_key_value_groups, 1)
+        else:
+            # decode
+            z_kv_batch = past_key_value[2]
 
         if has_layer_past:
             past_kv = past_key_value[0]
@@ -875,7 +899,7 @@ class Qwen3Attention(nn.Module):
             kv = past_kv[:, :new_len]
         else:
             past_kv = kv
-        past_key_value = (past_kv, past_len + q.size(1)) if use_cache else None
+        past_key_value = (past_kv, past_len + q.size(1), z_kv_batch) if use_cache else None
              
         if not has_layer_past:
 
@@ -919,9 +943,28 @@ class Qwen3Attention(nn.Module):
                 unpadded_lengths = (cu_seqlens, max_seqlen)
 
                 cu_seqlens, max_seqlen = unpadded_lengths
-                
-                head_mask_type = torch.zeros
-                
+                if self.retrieval_mode == "full" and self.toggle_type == "xattn":
+                    head_mask_type = (1 - z_kv_batch[0, :, 0]).int()
+                elif self.retrieval_mode == "full" and self.toggle_type == "streaming":
+                    head_mask_type = torch.where(
+                        z_kv_batch[0, :, 0] == 1,
+                        torch.tensor(0, dtype=torch.int, device=z_kv_batch.device),
+                        torch.tensor(-1, dtype=torch.int, device=z_kv_batch.device)
+                    )
+                elif self.retrieval_mode == "xattn" and self.toggle_type == "streaming":
+                    head_mask_type = torch.where(
+                        z_kv_batch[0, :, 0] == 1,
+                        torch.tensor(1, dtype=torch.int, device=z_kv_batch.device),
+                        torch.tensor(-1, dtype=torch.int, device=z_kv_batch.device)
+                    )
+                elif self.retrieval_mode == "xattn" and self.toggle_type == "xattn":
+                    head_mask_type = torch.ones_like(z_kv_batch[0, :, 0], dtype=torch.int)
+                elif self.retrieval_mode == "full" and self.toggle_type == "full":
+                    head_mask_type = 1 - torch.ones_like(z_kv_batch[0, :, 0], dtype=torch.int)
+                else:
+                    raise SamplerConditionError(
+                        f"retrieval_mode: {self.retrieval_mode} and toggle_type: {self.toggle_type} is not supported"
+                    )
                 attn_output = Xattention_prefill_dim4(
                     q,
                     k,
