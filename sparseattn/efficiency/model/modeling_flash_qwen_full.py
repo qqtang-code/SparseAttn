@@ -838,7 +838,7 @@ class Qwen3Attention(nn.Module):
         v = self.v_proj(hidden_states).view(hidden_shape)
         has_layer_past = past_key_value is not None
         
-        bsz, kv_heads= k.shape[:2]
+        bsz, _, kv_heads= k.shape[:3]
         if not has_layer_past:
             if not self.config.enable_ada_sparsity:
                 z_kv = get_mask(
@@ -856,7 +856,7 @@ class Qwen3Attention(nn.Module):
                 
                 z_kv_batch = torch.zeros(bsz, kv_heads, 1, device=q.device)
                 # z_constrast = res['decisions']
-
+                # breakpoint()
                 if z_kv_batch.shape[-2] == self.num_key_value_heads:
                     z_kv_batch = z_kv_batch.repeat_interleave(self.num_key_value_groups, 1)
         else:

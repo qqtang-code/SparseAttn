@@ -8,7 +8,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 # -----------------------------------------------------------------------------
 # 1. 统一模型加载器
 # -----------------------------------------------------------------------------
-def load_model(model_path, is_sparse):
+def load_model(model_path, is_streaming):
     print(f"\n📥 [System] Loading model from: {model_path} ...")
     config_path = f"{model_path}/config.json"
     if not os.path.exists(config_path):
@@ -21,8 +21,20 @@ def load_model(model_path, is_sparse):
     arch_name = archs[0] if archs else "Unknown"
     print(f"🏗️  [System] Detected architecture: {arch_name}")
 
-    if is_sparse:
-        # --- 自定义 Sparse 模型注册逻辑 ---
+    if is_streaming:
+        if "PawLlama" in arch_name:
+            from sparseattn.training.eval.modeling_flash_llama import (
+                PawLlamaForCausalLM, PawLlamaConfig
+            )
+            AutoModelForCausalLM.register(PawLlamaConfig, PawLlamaForCausalLM)
+            model_cls = PawLlamaForCausalLM
+        elif "PawQwen" in arch_name:
+            from sparseattn.efficiency.model.modeling_flash_qwen_streaming_decode import (
+                PawQwen3ForCausalLM, PawQwen3Config
+            )
+            AutoModelForCausalLM.register(PawQwen3Config, PawQwen3ForCausalLM)
+            model_cls = PawQwen3ForCausalLM
+    else:
         if "PawLlama" in arch_name:
             from sparseattn.training.eval.modeling_flash_llama import (
                 PawLlamaForCausalLM, PawLlamaConfig
@@ -35,24 +47,6 @@ def load_model(model_path, is_sparse):
             )
             AutoModelForCausalLM.register(PawQwen3Config, PawQwen3ForCausalLM)
             model_cls = PawQwen3ForCausalLM
-        # else:
-        #     # --- 标准 Full Attention 模型 (如 Qwen2/3) ---
-        #     print("ℹ️  [System] Loading as Standard (Full Attention) Model.")
-        #     model_cls = AutoModelForCausalLM
-        #     is_sparse = False
-    else:
-        if "PawLlama" in arch_name:
-            from sparseattn.training.eval.modeling_flash_llama import (
-                PawLlamaForCausalLM, PawLlamaConfig
-            )
-            AutoModelForCausalLM.register(PawLlamaConfig, PawLlamaForCausalLM)
-            model_cls = PawLlamaForCausalLM
-        elif "PawQwen" in arch_name:
-            from sparseattn.efficiency.model.modeling_flash_qwen_full import (
-                PawQwen3ForCausalLM, PawQwen3Config
-            )
-            AutoModelForCausalLM.register(PawQwen3Config, PawQwen3ForCausalLM)
-            model_cls = PawQwen3ForCausalLM
 
     model = model_cls.from_pretrained(
         model_path,
@@ -61,12 +55,12 @@ def load_model(model_path, is_sparse):
         trust_remote_code=True,
     )
     model.eval()
-    return model, is_sparse
+    return model, is_streaming
 
 # -----------------------------------------------------------------------------
 # 2. 核心评测函数
 # -----------------------------------------------------------------------------
-def evaluate_efficiency(model, input_ids, gen_len=10, is_sparse=False):
+def evaluate_efficiency(model, input_ids, gen_len=10, is_streaming=False):
     # 计时器初始化
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
@@ -84,15 +78,6 @@ def evaluate_efficiency(model, input_ids, gen_len=10, is_sparse=False):
     
     past_key_values = outputs.past_key_values
     
-    # 获取 Sparsity (仅 Sparse 模型有)
-    current_sparsity = 0.0
-    if is_sparse:
-        try:
-            sp = getattr(model, "prefill_sparsity", None)
-            if isinstance(sp, torch.Tensor):
-                current_sparsity = sp.item()
-        except:
-            pass
 
     # 准备 Decode
     next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1).unsqueeze(1)
@@ -114,22 +99,22 @@ def evaluate_efficiency(model, input_ids, gen_len=10, is_sparse=False):
     return {
         "prefill_ms": prefill_time_ms,
         "decode_ms_total": decode_time_ms,
-        "decode_ms_per_token": decode_time_ms / gen_len,
-        "sparsity": current_sparsity
+        "decode_ms_per_token": decode_time_ms / gen_len
     }
 
 # -----------------------------------------------------------------------------
 # 3. 批量测试执行器 (修改：截断逻辑)
 # -----------------------------------------------------------------------------
 def run_benchmark_suite(model_path, samples, tokenizer, gen_len=10, max_len=4096,
-                        is_sparse=False):
-    model, is_sparse = load_model(model_path, is_sparse)
+                        is_streaming=False):
+    model, is_streaming = load_model(model_path, is_streaming)
     results = []
     
     # Warmup
     print("🔥 [System] Warming up GPU...")
     dummy = tokenizer.encode("Warmup " * 10, return_tensors="pt").to(model.device)
     evaluate_efficiency(model, dummy, gen_len=2, is_sparse=is_sparse)
+    # breakpoint()
     
     print(f"🏃 [System] Running benchmark on {len(samples)} samples (Max Len: {max_len})...")
     
@@ -141,12 +126,25 @@ def run_benchmark_suite(model_path, samples, tokenizer, gen_len=10, max_len=4096
         note = ""
         # === 截断逻辑 ===
         if seq_len > max_len:
-            input_ids = input_ids[:, :max_len]
-            note = f"✂️ (Truncated {seq_len}->{max_len})"
+            # 策略：保留头部一半配额，保留尾部一半配额，中间切掉
+            # 这样只要 max_input_len >= 200，就绝对能保留前100和后100
+            half_len = max_len // 2
+            
+            # 1. 取前 half_len (包含前100)
+            head_part = input_ids[:, :half_len]
+            
+            # 2. 取后 (max - half) (包含后100)
+            # 注意：用 (max - half) 而不是 half 是为了处理奇数长度的情况
+            tail_part = input_ids[:, -(max_len - half_len):]
+            
+            # 3. 拼接
+            input_ids = torch.cat([head_part, tail_part], dim=1)
+            
+            note = f"✂️ (Mid-Trunc {seq_len} -> {max_len})"
             seq_len = max_len
         # ===============
             
-        res = evaluate_efficiency(model, input_ids, gen_len=gen_len, is_sparse=is_sparse)
+        res = evaluate_efficiency(model, input_ids, gen_len=gen_len, is_streaming=is_streaming)
         res["seq_len"] = seq_len
         results.append(res)
         
@@ -168,20 +166,19 @@ def run_benchmark_suite(model_path, samples, tokenizer, gen_len=10, max_len=4096
 # -----------------------------------------------------------------------------
 def main():
     # ================= 配置区域 =================
-    sparse_model_path = "/data1/lcm_lab/qqt/SparseAttn/sparseattn/checkpoints/1.1router4steps266_full_streaming_64k_qwen3-4b_wfrozen/checkpoint-230"
-    full_model_path   = "/data1/lcm_lab/qqt/SparseAttn/sparseattn/checkpoints/1.1router4steps266_full_streaming_64k_qwen3-4b_wfrozen/checkpoint-200" # Full Attention 模型路径
+    model_path = "/data1/lcm_lab/qqt/SparseAttn/sparseattn/checkpoints/1.1router4steps266_full_streaming_64k_qwen3-4b_wfrozen/checkpoint-230"
     
     data_path = "/data1/lcm_lab/sora/loomeval/benchmarks/General/RULER/data/niah_single_3_262144.jsonl"
     
-    num_samples = 1       # 测试样本数
+    num_samples = 5       # 测试样本数
     gen_len = 1          # 生成长度
-    max_input_len = 64 * 1024 # 最大长度限制 (超过此长度将被截断)
+    max_input_len = 32 * 1024 # 最大长度限制 (超过此长度将被截断)
     # ===========================================
 
     # 1. 准备数据
     print(f"📂 [Init] Reading data from {data_path}")
     # 使用 Sparse 模型的 tokenizer 预处理
-    tokenizer = AutoTokenizer.from_pretrained(sparse_model_path, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     
     raw_samples = []
     with open(data_path, 'r') as f:
@@ -196,24 +193,24 @@ def main():
         return
 
     
-    # 2. 运行 Full 模型
+    # 2. 运行 full_decode 模型
     print("🔸" * 20 + " Benchmarking FULL Model " + "🔸" * 20)
-    full_results = run_benchmark_suite(full_model_path, raw_samples, tokenizer, gen_len, max_input_len, False)
+    full_decode_results = run_benchmark_suite(model_path, raw_samples, tokenizer, gen_len, max_input_len, False)
 
-    # 3. 运行 Sparse 模型
-    print("🔹" * 20 + " Benchmarking SPARSE Model " + "🔹" * 20)
-    sparse_results = run_benchmark_suite(sparse_model_path, raw_samples, tokenizer, gen_len, max_input_len, True)
+    # 3. 运行 streaming_decode 模型
+    print("🔹" * 20 + " Benchmarking STREAMING Model " + "🔹" * 20)
+    streaming_decode_results = run_benchmark_suite(model_path, raw_samples, tokenizer, gen_len, max_input_len, True)
 
     # 4. 对比与汇总
     print("\n" + "📊" * 15 + " FINAL COMPARISON REPORT " + "📊" * 15)
-    print(f"{'ID':<4} | {'Len':<6} | {'Sparse (ms)':<18} | {'Full (ms)':<18} | {'🚀 Speedup (Full/Sparse)':<22}")
+    print(f"{'ID':<4} | {'Len':<6} | {'Full_decode (ms)':<18} | {'Streaming_decode (ms)':<18} | {'🚀 Speedup (Full/Streaming)':<22}")
     print(f"{'':<4} | {'':<6} | {'⚡Prefill':<9} {'⏩Decode':<8} | {'⚡Prefill':<9} {'⏩Decode':<8} | {'⚡Prefill':<9} {'⏩Decode':<8}")
     print("-" * 100)
 
     avg_speedup_prefill = []
     avg_speedup_decode = []
 
-    for i, (res_s, res_f) in enumerate(zip(sparse_results, full_results)):
+    for i, (res_s, res_f) in enumerate(zip(full_decode_results, streaming_decode_results)):
         if res_s is None or res_f is None:
             continue
             
@@ -245,9 +242,6 @@ def main():
         print(f"✨ Average Speedup -> Prefill: \033[1m{sum(avg_speedup_prefill)/len(avg_speedup_prefill):.2f}x\033[0m")
         print(f"✨ Average Speedup -> Decode : \033[1m{sum(avg_speedup_decode)/len(avg_speedup_decode):.2f}x\033[0m")
         
-        # 打印平均稀疏度
-        avg_spa = sum([r['sparsity'] for r in sparse_results if r])/len([r for r in sparse_results if r])
-        print(f"📉 Average Sparse Rate: {avg_spa:.4f}")
     else:
         print("⚠️ No valid samples comparing.")
 

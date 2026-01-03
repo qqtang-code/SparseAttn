@@ -1232,45 +1232,72 @@ class Qwen3Attention(nn.Module):
                     local_num=self.local_blocks,
                 ).transpose(1, 2)  # B, T, H, D
         else:
-            # --- Decode ---
+            # # --- Decode ---
+            # if self.num_key_value_groups > 1:
+            #     kv = kv.repeat_interleave(self.num_key_value_groups, dim=-2)
+            # # z_kv_batch shape: [B, H, 1]
+            # head_mask = z_kv_batch[0, :, 0] 
+            # # print(f"DEBUG: head_mask:{head_mask}")
+            # sparse_head_indices = torch.where(head_mask == 0)[0]
+            # full_head_indices = torch.where(head_mask == 1)[0]
+            
+            # attn_output = torch.empty_like(q)
+            # bsz, q_len, num_heads, head_dim = q.shape
+
+            # if len(sparse_head_indices) > 0:
+            #     q_sparse = q[:, :, sparse_head_indices, :]
+            #     k_sparse = kv[:, :, 0, sparse_head_indices, :] # [B, T, 2, H_sparse, D]
+            #     v_sparse = kv[:, :, 1, sparse_head_indices, :] # [B, T, 2, H_sparse, D]
+
+            #     attn_sparse = flash_attn_func(
+            #         q_sparse, k_sparse, v_sparse,
+            #         window_size=(self.sink_num, self.local_window_size),
+            #         dropout_p=0.0,
+            #         softmax_scale=1.0 / self.norm_factor,
+            #         causal=False,
+            #     )
+            #     attn_output[:, :, sparse_head_indices, :] = attn_sparse
+
+            # if len(full_head_indices) > 0:
+            #     q_full = q[:, :, full_head_indices, :]
+            #     k_full = kv[:, :, 0, full_head_indices, :]
+            #     v_full = kv[:, :, 1, full_head_indices, :]
+                
+            #     attn_full = flash_attn_func(
+            #         q_full, k_full, v_full,
+            #         window_size=(-1, -1),
+            #         dropout_p=0.0,
+            #         softmax_scale=1.0 / self.norm_factor,
+            #         causal=False,
+            #     )
+            #     attn_output[:, :, full_head_indices, :] = attn_full
             if self.num_key_value_groups > 1:
                 kv = kv.repeat_interleave(self.num_key_value_groups, dim=-2)
-            # z_kv_batch shape: [B, H, 1]
-            head_mask = z_kv_batch[0, :, 0] 
-            print(f"DEBUG: head_mask:{head_mask}")
-            sparse_head_indices = torch.where(head_mask == 0)[0]
-            full_head_indices = torch.where(head_mask == 1)[0]
-            
-            attn_output = torch.empty_like(q)
-            bsz, q_len, num_heads, head_dim = q.shape
+            if unpadded_lengths is not None:
+                # varlen, ignore padding tokens, efficient for large batch with many paddings
+                cu_seqlens, max_seqlen = unpadded_lengths
 
-            if len(sparse_head_indices) > 0:
-                q_sparse = q[:, :, sparse_head_indices, :]
-                k_sparse = kv[:, :, 0, sparse_head_indices, :] # [B, T, 2, H_sparse, D]
-                v_sparse = kv[:, :, 1, sparse_head_indices, :] # [B, T, 2, H_sparse, D]
-
-                attn_sparse = flash_attn_func(
-                    q_sparse, k_sparse, v_sparse,
-                    window_size=(self.sink_num, self.local_window_size),
+                attn_output = flash_attn_varlen_kvpacked_func(
+                    q,
+                    kv,
+                    cu_seqlens,
+                    cu_seqlens,
+                    max_seqlen,
+                    max_seqlen,
                     dropout_p=0.0,
                     softmax_scale=1.0 / self.norm_factor,
-                    causal=False,
+                    causal=True,
+                    return_attn_probs=False,
                 )
-                attn_output[:, :, sparse_head_indices, :] = attn_sparse
-
-            if len(full_head_indices) > 0:
-                q_full = q[:, :, full_head_indices, :]
-                k_full = kv[:, :, 0, full_head_indices, :]
-                v_full = kv[:, :, 1, full_head_indices, :]
-                
-                attn_full = flash_attn_func(
-                    q_full, k_full, v_full,
-                    window_size=(-1, -1),
+            else:
+                attn_output = flash_attn_kvpacked_func(
+                    q,
+                    kv,
                     dropout_p=0.0,
                     softmax_scale=1.0 / self.norm_factor,
-                    causal=False,
+                    causal=True,
+                    return_attn_probs=False,
                 )
-                attn_output[:, :, full_head_indices, :] = attn_full
         
         
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()

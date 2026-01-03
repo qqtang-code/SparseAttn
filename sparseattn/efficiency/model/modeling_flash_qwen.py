@@ -19,7 +19,7 @@
 # limitations under the License.
 """PyTorch Qwen3 model."""
 
-from typing import List, Optional, Tuple, Union, Any
+from typing import List, Optional, Tuple, Union, Any, Dict
 
 import torch
 import torch.nn.functional as F
@@ -44,10 +44,10 @@ from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
-from flash_attn import flash_attn_kvpacked_func, flash_attn_varlen_kvpacked_func
+from flash_attn import flash_attn_kvpacked_func, flash_attn_varlen_kvpacked_func, flash_attn_func
 from flash_attn.bert_padding import unpad_input, pad_input
 import math
-
+import time
 try:
     from flash_attn.layers.rotary import apply_rotary_emb_func
 except ImportError:
@@ -1107,6 +1107,7 @@ class Qwen3Attention(nn.Module):
                 
                 z_kv_batch, entropy, pooled_hidden_states = res['sparse_mask'], res['entropy'], res['pooled_hidden_states']
                 z_constrast = res['decisions']
+                # breakpoint()
 
                 if z_kv_batch.shape[-2] == self.num_key_value_heads:
                     z_kv_batch = z_kv_batch.repeat_interleave(self.num_key_value_groups, 1)
@@ -1151,6 +1152,11 @@ class Qwen3Attention(nn.Module):
         else:
             past_kv = kv
         past_key_value = (past_kv, past_len + q.size(1), z_kv_batch) if use_cache else None
+        
+        # 初始化计时变量
+        time_intervals = {
+            'flash_attn_decode_time': 0
+        }
              
         if not has_layer_past:
 
@@ -1232,6 +1238,7 @@ class Qwen3Attention(nn.Module):
         else:
             if self.num_key_value_groups > 1:
                 kv = kv.repeat_interleave(self.num_key_value_groups, dim=-2)
+            start_attn = time.perf_counter()
             if unpadded_lengths is not None:
                 # varlen, ignore padding tokens, efficient for large batch with many paddings
                 cu_seqlens, max_seqlen = unpadded_lengths
@@ -1249,14 +1256,17 @@ class Qwen3Attention(nn.Module):
                     return_attn_probs=False,
                 )
             else:
-                attn_output = flash_attn_kvpacked_func(
+                attn_output = flash_attn_func(
                     q,
-                    kv,
+                    k,
+                    v,
                     dropout_p=0.0,
                     softmax_scale=1.0 / self.norm_factor,
                     causal=True,
                     return_attn_probs=False,
                 )
+            end_attn = time.perf_counter()
+            time_intervals['flash_attn_decode_time'] = end_attn - start_attn
         
         
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
@@ -1268,7 +1278,7 @@ class Qwen3Attention(nn.Module):
         #     print(f"task_ids: {task_ids}, head allocate: {[x.tolist() for x in z_kv_batch]}")
         
         # z: [B, H, 1] -> [B, H] -> [B]
-        return z_kv_batch.squeeze(-1).sum(dim=-1), None, None, None, attn_output, attn_weights, past_key_value
+        return z_kv_batch.squeeze(-1).sum(dim=-1), None, None, None, attn_output, attn_weights, past_key_value, time_intervals
 
 
 class Qwen3DecoderLayer(nn.Module):
@@ -1340,7 +1350,7 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        z_sum, entropy, pooled_hidden_states, z_constrast, hidden_states, self_attn_weights, present_key_value = self.self_attn(
+        z_sum, entropy, pooled_hidden_states, z_constrast, hidden_states, self_attn_weights, present_key_value, time_intervals = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -1361,7 +1371,7 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
-        outputs = (z_sum, entropy, pooled_hidden_states, z_constrast, hidden_states,)
+        outputs = (z_sum, entropy, pooled_hidden_states, z_constrast, hidden_states, time_intervals, )
 
         if output_attentions:
             outputs += (self_attn_weights,)
@@ -1407,6 +1417,7 @@ class BaseModelOutputWithPastAndSparsity(ModelOutput):
     model_sparsity: Optional[torch.FloatTensor] = None
     target_sparsity: Optional[torch.FloatTensor] = None
     sparsity_loss: Optional[torch.FloatTensor] = None
+    time_intervals: Optional[Dict[str, float]] = None
     # Diagnostics
     expected_model_sparsity: Optional[torch.FloatTensor] = None
     lambda1: Optional[torch.FloatTensor] = None
@@ -1488,6 +1499,9 @@ class Qwen3Model(Qwen3PreTrainedModel):
             self.round_masks_for_sparsity(config.suggested_sparsity)
 
         self._erank_cache = {}
+        self.time_intervals = {
+            'flash_attn_decode_time': 0
+        }
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -1712,7 +1726,8 @@ class Qwen3Model(Qwen3PreTrainedModel):
                     task_ids=task_ids,
                 )
 
-            z_layer_sum, entropy, pooled_hidden_states, z_constrast, hidden_states = layer_outputs[0], layer_outputs[1], layer_outputs[2], layer_outputs[3], layer_outputs[4]
+            z_layer_sum, entropy, pooled_hidden_states, z_constrast, hidden_states, time_intervals = layer_outputs[0], layer_outputs[1], layer_outputs[2], layer_outputs[3], layer_outputs[4], layer_outputs[5]
+            self.time_intervals['flash_attn_decode_time'] += time_intervals['flash_attn_decode_time']
 
             z_layer_sum = z_layer_sum.to(hidden_states.device)
             
@@ -1723,10 +1738,10 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 z_sum = z_sum + z_layer_sum
             
             if use_cache:
-                next_decoder_cache += (layer_outputs[6 if output_attentions else 5],)
+                next_decoder_cache += (layer_outputs[7 if output_attentions else 6],)
 
             if output_attentions:
-                all_self_attns += (layer_outputs[5],)
+                all_self_attns += (layer_outputs[6],)
                 
         hidden_states = self.norm(hidden_states)
 
@@ -1755,7 +1770,8 @@ class Qwen3Model(Qwen3PreTrainedModel):
             past_key_values=next_cache,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
-            model_sparsity=model_sparsity
+            model_sparsity=model_sparsity,
+            time_intervals=self.time_intervals
         )
 
 
@@ -1769,6 +1785,7 @@ class CausalLMOutputWithPastAndSparsity(ModelOutput):
     model_sparsity: Optional[torch.FloatTensor] = None
     target_sparsity: Optional[torch.FloatTensor] = None
     sparsity_loss: Optional[torch.FloatTensor] = None
+    time_intervals: Optional[Dict[str, float]] = None
     # Diagnostics
     expected_model_sparsity: Optional[torch.FloatTensor] = None
     lambda1: Optional[torch.FloatTensor] = None
@@ -2067,6 +2084,7 @@ class PawQwen3ForCausalLM(Qwen3PreTrainedModel):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
             model_sparsity=outputs.model_sparsity,
+            time_intervals=outputs.time_intervals
         )
 
     def prepare_inputs_for_generation(

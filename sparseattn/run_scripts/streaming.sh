@@ -123,6 +123,7 @@ echo "num_nodes=${num_nodes} master_addr=${master_addr} master_port=${master_por
 # Environment variables
 export OMP_NUM_THREADS=$num_gpus
 export SWANLAB_API_KEY="t0PmOeLpVom1LRBDAKHaA"
+export SWANLAB_PROJECT="ICML"
 export SWANLAB_LOG_DIR=$out_dir
 export SWANLAB_MODE="cloud"
 export TOKENIZERS_PARALLELISM=true
