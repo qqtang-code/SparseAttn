@@ -40,12 +40,12 @@ TASK_GROUPS = {
     ]
 }
 
-TASK_GROUPS = {
-    "Multi-Document QA": [
-        "hotpotqa_e.jsonl",
-        "2wikimqa_e.jsonl"
-    ],
-}
+# TASK_GROUPS = {
+#     "Multi-Document QA": [
+#         "hotpotqa_e.jsonl",
+#         "2wikimqa_e.jsonl"
+#     ],
+# }
 
 
 # -----------------------------------------------------------------------------

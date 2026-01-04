@@ -34,6 +34,9 @@ def load_model(model_path, is_sparse):
             from sparseattn.efficiency.model.modeling_flash_qwen import (
                 PawQwen3ForCausalLM, PawQwen3Config
             )
+            # from sparseattn.efficiency.model.modeling_flash_qwen_prulong import (
+            #     PawQwen3ForCausalLM, PawQwen3Config
+            # )
             AutoModelForCausalLM.register(PawQwen3Config, PawQwen3ForCausalLM)
             model_cls = PawQwen3ForCausalLM
         # else:
@@ -106,7 +109,7 @@ def evaluate_efficiency(model, input_ids, gen_len=10, is_sparse=False):
         for _ in range(gen_len):
             outputs = model(next_token, past_key_values=past_key_values, use_cache=True)
             past_key_values = outputs.past_key_values
-            next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1).unsqueeze(1)
+            next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1).unsqueeze(1).to(model.device).contiguous()
             
     end_event.record()
     torch.cuda.synchronize()
@@ -189,6 +192,8 @@ def run_benchmark_suite(model_path, samples, tokenizer, gen_len=10, max_len=4096
 def main():
     # ================= 配置区域 =================
     sparse_model_path = "/data1/lcm_lab/qqt/SparseAttn/sparseattn/checkpoints/1.1router4steps266_full_streaming_64k_qwen3-4b_wfrozen/checkpoint-230"
+    # sparse_model_path = "/data2/hf_models/prulong_qwen_3_4b/"
+    # sparse_model_path = ""
     full_model_path   = "/data1/lcm_lab/qqt/SparseAttn/sparseattn/checkpoints/1.1router4steps266_full_streaming_64k_qwen3-4b_wfrozen/checkpoint-200"
     
     data_path = "/data1/lcm_lab/sora/loomeval/benchmarks/General/RULER/data/niah_single_3_262144.jsonl"
@@ -196,7 +201,7 @@ def main():
     num_samples = 5       # 每个长度测试的样本数
     gen_len = 1           # 生成长度
     
-    target_lengths_k = [128]
+    target_lengths_k = [8, 16, 32, 64, 128]
     target_lengths = [k * 1024 for k in target_lengths_k] 
 
     # 1. 准备数据

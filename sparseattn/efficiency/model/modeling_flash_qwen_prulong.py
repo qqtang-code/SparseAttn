@@ -1511,7 +1511,7 @@ class Qwen3Attention(nn.Module):
                     and self.static_kv_mask is None
                 ):
                     self.static_kv_mask = load_kv_mask_from_tsv(
-                        "/workspace/mnt/qqt/project/SparseAttn/sparseattn/checkpoints/12.28steps266_prulong_64k_qwen3-8b_wfrozen/masks_sp0.7.tsv",
+                        "/data2/hf_models/prulong_qwen_3_4b/masks_sp0.7.tsv",
                         device=hidden_states.device,
                         dtype=torch.int32,
                     )
