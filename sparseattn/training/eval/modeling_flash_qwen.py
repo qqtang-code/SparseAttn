@@ -44,7 +44,7 @@ from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
-from flash_attn import flash_attn_kvpacked_func, flash_attn_varlen_kvpacked_func, flash_attn_func
+from flash_attn import flash_attn_kvpacked_func, flash_attn_varlen_kvpacked_func
 from flash_attn.bert_padding import unpad_input, pad_input
 import math
 
@@ -642,7 +642,8 @@ class AttentionRouter(nn.Module):
             nn.Linear(4 * d_feature, d_feature),
         )
         
-        if self.use_softmax: 
+        if self.use_softmax:
+            logger.info("using softmax for attention router")
             self.cls_router_head_agnostic = nn.Sequential( 
                 nn.Linear(d_feature, 4 * d_feature),
                 nn.SiLU(),
@@ -651,10 +652,11 @@ class AttentionRouter(nn.Module):
                 nn.Linear(d_feature, 2),
             )
         else:
+            logger.info("use sigmoid function for attention router")
             self.cls_router_head_agnostic = nn.Sequential( 
-                nn.Linear(d_feature, 2 * d_feature),
+                nn.Linear(d_feature, 4 * d_feature),
                 nn.SiLU(),
-                nn.Linear(2 * d_feature, d_feature),
+                nn.Linear(4 * d_feature, d_feature),
                 nn.SiLU(),
                 nn.Linear(d_feature, 1),
                 nn.LayerNorm([self.num_kv, 1], elementwise_affine=False)
@@ -945,8 +947,6 @@ class Qwen3Attention(nn.Module):
         self.context_window_toggle = context_window_toggle
 
         self.toggle_type = config.toggle_type
-        self.sink_num = config.sink_size
-        self.local_window_size = config.local_window_size
         self.sink_blocks = (config.sink_size + 127) // 128
         self.local_blocks = (config.local_window_size + 127) // 128
         
@@ -1065,7 +1065,7 @@ class Qwen3Attention(nn.Module):
             .transpose(1, 2)
             .contiguous()
         )
-    
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1218,6 +1218,8 @@ class Qwen3Attention(nn.Module):
                     raise SamplerConditionError(
                         f"retrieval_mode: {self.retrieval_mode} and toggle_type: {self.toggle_type} is not supported"
                     )
+                    
+                
                 attn_output = Xattention_prefill_dim4(
                     q,
                     k,
@@ -1232,45 +1234,6 @@ class Qwen3Attention(nn.Module):
                     local_num=self.local_blocks,
                 ).transpose(1, 2)  # B, T, H, D
         else:
-            # # --- Decode ---
-            # if self.num_key_value_groups > 1:
-            #     kv = kv.repeat_interleave(self.num_key_value_groups, dim=-2)
-            # # z_kv_batch shape: [B, H, 1]
-            # head_mask = z_kv_batch[0, :, 0] 
-            # # print(f"DEBUG: head_mask:{head_mask}")
-            # sparse_head_indices = torch.where(head_mask == 0)[0]
-            # full_head_indices = torch.where(head_mask == 1)[0]
-            
-            # attn_output = torch.empty_like(q)
-            # bsz, q_len, num_heads, head_dim = q.shape
-
-            # if len(sparse_head_indices) > 0:
-            #     q_sparse = q[:, :, sparse_head_indices, :]
-            #     k_sparse = kv[:, :, 0, sparse_head_indices, :] # [B, T, 2, H_sparse, D]
-            #     v_sparse = kv[:, :, 1, sparse_head_indices, :] # [B, T, 2, H_sparse, D]
-
-            #     attn_sparse = flash_attn_func(
-            #         q_sparse, k_sparse, v_sparse,
-            #         window_size=(self.sink_num, self.local_window_size),
-            #         dropout_p=0.0,
-            #         softmax_scale=1.0 / self.norm_factor,
-            #         causal=False,
-            #     )
-            #     attn_output[:, :, sparse_head_indices, :] = attn_sparse
-
-            # if len(full_head_indices) > 0:
-            #     q_full = q[:, :, full_head_indices, :]
-            #     k_full = kv[:, :, 0, full_head_indices, :]
-            #     v_full = kv[:, :, 1, full_head_indices, :]
-                
-            #     attn_full = flash_attn_func(
-            #         q_full, k_full, v_full,
-            #         window_size=(-1, -1),
-            #         dropout_p=0.0,
-            #         softmax_scale=1.0 / self.norm_factor,
-            #         causal=False,
-            #     )
-            #     attn_output[:, :, full_head_indices, :] = attn_full
             if self.num_key_value_groups > 1:
                 kv = kv.repeat_interleave(self.num_key_value_groups, dim=-2)
             if unpadded_lengths is not None:
