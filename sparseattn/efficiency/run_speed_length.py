@@ -31,7 +31,7 @@ def load_model(model_path, is_sparse):
             AutoModelForCausalLM.register(PawLlamaConfig, PawLlamaForCausalLM)
             model_cls = PawLlamaForCausalLM
         elif "PawQwen" in arch_name:
-            from sparseattn.efficiency.model.modeling_flash_qwen import (
+            from sparseattn.efficiency.model.modeling_flash_qwen_xattn import (
                 PawQwen3ForCausalLM, PawQwen3Config
             )
             # from sparseattn.efficiency.model.modeling_flash_qwen_prulong import (
@@ -192,7 +192,7 @@ def run_benchmark_suite(model_path, samples, tokenizer, gen_len=10, max_len=4096
 def main():
     # ================= 配置区域 =================
     # sparse_model_path = "/data1/lcm_lab/qqt/SparseAttn/sparseattn/checkpoints/1.1router4steps266_full_streaming_64k_qwen3-4b_wfrozen/checkpoint-230"
-    sparse_model_path = "/data2/hf_models/prulong_qwen_3_4b/"
+    sparse_model_path = "/data1/lcm_lab/qqt/SparseAttn/sparseattn/checkpoints/1.1router4steps266_full_streaming_64k_qwen3-4b_wfrozen/checkpoint-230"
     # sparse_model_path = ""
     full_model_path   = "/data1/lcm_lab/qqt/SparseAttn/sparseattn/checkpoints/1.1router4steps266_full_streaming_64k_qwen3-4b_wfrozen/checkpoint-200"
     
@@ -220,7 +220,7 @@ def main():
         print("❌ Error: No data loaded.")
         return
 
-    all_excel_records = []
+    final_excel_summary = []
 
     # === 外层循环：遍历不同长度 ===
     for target_len in target_lengths:
@@ -270,20 +270,6 @@ def main():
 
             print(f"{i+1:<4} | {len_tok:<6} | {p_s:<9.1f} {d_s:<8.2f} | {p_f:<9.1f} {d_f:<8.2f} | {sp_p_str} {sp_d_str}")
 
-            # === 同时收集 Excel 数据 ===
-            all_excel_records.append({
-                "Target Length (K)": f"{target_len/1024:.0f}K",
-                "Actual Seq Len": len_tok,
-                "Sample ID": i + 1,
-                "Sparse Prefill (ms)": p_s,
-                "Sparse Decode (ms)": d_s,
-                "Full Prefill (ms)": p_f,
-                "Full Decode (ms)": d_f,
-                "Speedup Prefill": speedup_p,
-                "Speedup Decode": speedup_d,
-                "Sparsity": res_s.get('sparsity', 0)
-            })
-
         print("-" * 100)
         
         if avg_speedup_prefill:
@@ -296,14 +282,62 @@ def main():
                 print(f"📉 Average Sparse Rate: {avg_spa:.4f}")
         else:
             print("⚠️ No valid samples comparing.")
+        
+        # 提取数据
+        s_prefills = [r['prefill_ms'] for r in sparse_results[:min_len]]
+        s_decodes  = [r['decode_ms_per_token'] for r in sparse_results[:min_len]]
+        f_prefills = [r['prefill_ms'] for r in full_results[:min_len]]
+        f_decodes  = [r['decode_ms_per_token'] for r in full_results[:min_len]]
+        sparsities = [r.get('sparsity', 0) for r in sparse_results[:min_len]]
 
-    if all_excel_records:
+        # 计算均值
+        avg_s_p = sum(s_prefills) / len(s_prefills)
+        avg_s_d = sum(s_decodes) / len(s_decodes)
+        avg_f_p = sum(f_prefills) / len(f_prefills)
+        avg_f_d = sum(f_decodes) / len(f_decodes)
+        avg_spar = sum(sparsities) / len(sparsities)
+
+        # 计算加速比
+        speedup_p = avg_f_p / avg_s_p if avg_s_p > 0 else 0
+        speedup_d = avg_f_d / avg_s_d if avg_s_d > 0 else 0
+
+        # 4. 构建一行 Excel 数据 (严格对齐图片格式)
+        row_data = {
+            "Length": target_len,                                
+            "Sparse Prefill (ms)": round(avg_s_p, 2),           
+            "Sparse Decode (ms)": round(avg_s_d, 2),            
+            "Full Prefill (ms)": round(avg_f_p, 2),             
+            "Full Decode (ms)": round(avg_f_d, 2),              
+            "Speedup Prefill": round(speedup_p, 2),             
+            "Speedup Decode": round(speedup_d, 2),              
+            "Sparsity": round(avg_spar, 2)                      
+        }
+        
+        final_excel_summary.append(row_data)
+
+    if final_excel_summary:
         ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-        file_name = f"/data1/lcm_lab/qqt/SparseAttn/sparseattn/efficiency/results/benchmark_length_{ts}.xlsx"
-        print(f"\n💾 Saving detailed results to {file_name}...")
-        df = pd.DataFrame(all_excel_records)
+        file_name = f"/data1/lcm_lab/qqt/SparseAttn/sparseattn/efficiency/results/summary_benchmark_{ts}.xlsx"
+        
+        print(f"\n💾 Saving summary table to {file_name}...")
+        
+        # 创建 DataFrame 并指定列顺序 (防止字典乱序)
+        columns_order = [
+            "Length", 
+            "Sparse Prefill (ms)", "Sparse Decode (ms)", 
+            "Full Prefill (ms)", "Full Decode (ms)", 
+            "Speedup Prefill", "Speedup Decode", 
+            "Sparsity"
+        ]
+        
+        df = pd.DataFrame(final_excel_summary)
+        # 重新排序列以确保完全符合图片的视觉顺序
+        df = df[columns_order]
+        
         df.to_excel(file_name, index=False)
-        print("✅ Saved.")
+        print("✅ Excel Saved Successfully (Format matches the image).")
+    else:
+        print("⚠️ No data collected.")
 
 if __name__ == "__main__":
     main()

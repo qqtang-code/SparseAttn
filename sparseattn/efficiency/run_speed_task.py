@@ -75,7 +75,7 @@ def load_model(model_path, is_sparse):
             # from sparseattn.efficiency.model.modeling_flash_qwen import (
             #     PawQwen3ForCausalLM, PawQwen3Config
             # )
-            from sparseattn.efficiency.model.modeling_flash_qwen_prulong import (
+            from sparseattn.efficiency.model.modeling_flash_qwen_xattn import (
                 PawQwen3ForCausalLM, PawQwen3Config
             )
             AutoModelForCausalLM.register(PawQwen3Config, PawQwen3ForCausalLM)
@@ -188,7 +188,8 @@ def run_benchmark_suite(model_path, samples, tokenizer, gen_len=10, max_len=4096
 def main():
     # ================= 配置区域 =================
     # sparse_model_path = "/data1/lcm_lab/qqt/SparseAttn/sparseattn/checkpoints/1.1router4steps266_full_streaming_64k_qwen3-4b_wfrozen/checkpoint-230"
-    sparse_model_path = "/data2/hf_models/prulong_qwen_3_4b/"
+    sparse_model_path = "/data1/lcm_lab/qqt/SparseAttn/sparseattn/checkpoints/1.1router4steps266_full_streaming_64k_qwen3-4b_wfrozen/checkpoint-230"
+    # sparse_model_path = ""
     full_model_path   = "/data1/lcm_lab/qqt/SparseAttn/sparseattn/checkpoints/1.1router4steps266_full_streaming_64k_qwen3-4b_wfrozen/checkpoint-200"
     base_data_dir     = "/data2/public_data/sort_longbench/"
 
